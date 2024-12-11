@@ -9,8 +9,10 @@ use time::{format_description, OffsetDateTime, PrimitiveDateTime, UtcOffset};
 use tokio::time::Instant;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
+use std::fmt;
 
 pub type Clock = Arc<dyn GlobalClock + Send + Sync>;
+
 /// The global [Clock]
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 
@@ -20,10 +22,16 @@ pub fn get_global_clock(tid: &TransactionId) -> Result<Clock> {
         return Ok(rt.clone());
     }
     let clk: Clock = match is_simulation() {
-        true => LocalTime::boxed(tid)?,
-        false => SimulatedTime::boxed(tid)?,
+        false => LocalTime::boxed(tid)?,
+        true => SimulatedTime::boxed(tid)?,
     };
     *CLOCK.lock() = Some(clk.clone());
+    Ok(clk)
+}
+
+/// Gets the current global clock. Creates a new [Clock] if not present.
+pub fn get_unix_clock(tid: &TransactionId) -> Result<Clock> {
+    let clk: Clock = UnixTime::boxed(tid)?;
     Ok(clk)
 }
 
@@ -142,6 +150,47 @@ impl FormatTime for LocalTime {
         format_offset_time(self, w)
     }
 }
+
+/// A struct to serve timestamps as Unix Timestamps.
+/// This matches the times logged by `date +"%s"`.
+struct UnixTime {
+    format: Vec<FormatItem<'static>>,
+    local_offset: UtcOffset,
+}
+impl UnixTime {
+    pub fn new(tid: &TransactionId) -> Result<Self> {
+        let format = format_description::parse("[unix_timestamp]")?;
+        #[allow(clippy::disallowed_methods)]
+        let now = OffsetDateTime::now_utc();
+        let offset = load_local_offset(now, tid)?;
+        Ok(UnixTime {
+            format,
+            local_offset: offset,
+        })
+    }
+    pub fn boxed(tid: &TransactionId) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self::new(tid)?))
+    }
+}
+impl GlobalClock for UnixTime {
+    fn now_str(&self) -> Result<String> {
+        GlobalClock::format_time(self, self.now())
+    }
+    fn now(&self) -> OffsetDateTime {
+        #[allow(clippy::disallowed_methods)]
+        OffsetDateTime::now_utc().to_offset(self.local_offset)
+    }
+    fn format_time(&self, time: OffsetDateTime) -> Result<String> {
+        Ok(time.format(&self.format)?)
+    }
+}
+impl FormatTime for UnixTime {
+    #[inline(always)]
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        format_offset_time(self, w)
+    }
+}
+
 
 /// A struct to serve timestamps using the same format as [LocalTime], but running inside the simulation.
 struct SimulatedTime {

@@ -47,6 +47,8 @@ pub struct Configuration {
     pub energy_cap: Option<Arc<crate::services::invocation::energy_limiter::EnergyCapConfig>>,
     pub status: Arc<StatusConfig>,
     pub influx: Option<Arc<InfluxConfig>>,
+    /// Optional feature to enable fine scheduling of tasks
+    pub finesched: Option<Arc<FineSchedConfig>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -162,7 +164,38 @@ pub struct FunctionLimits {
     pub timeout_sec: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+/// Fine scheduling configuration
+pub struct FineSchedConfig {
+    
+    /// core group configuration to preallocate 
+    pub preallocated_groups: Option<Vec<Vec<u32>>>,
+    pub preallocated_groups_ts: Option<Vec<u64>>,
+
+    /// Boolean to be able to see all options in config  
+    pub allocation_type_rr: bool,
+
+
+    /// "e2e_buckets":  [ [0, 1000],[0,1,2], [1000, 2000],[2,3,4],  [2000, 1000000],[8,9]  ],
+    ///                   [0, 1000] is time of the bucket in ms, [0,1,2] is the gids that would be assigned  
+    pub e2e_buckets: Option<Vec<Vec<i32>>>,
+    pub allocation_type_e2e: bool,
+
+    ///   "static_sel_buckets"         : {
+    ///      "torch_rnn"       : [0, 1, 2, 3],
+    ///      "float_operation" : [4, 5]
+    ///  },
+    ///  "allocation_type_static_sel" : "true",
+    pub static_sel_buckets: Option<HashMap<String, Vec<i32>>>,
+    pub allocation_type_static_sel: bool,
+
+    /// at least two to circumvent the latency of group switch and keep cores warm    
+    pub group_buffer: u32,
+
+    pub bpf_verbose: u8,
+}
+
+#[derive(Debug, Deserialize, Default)]
 /// Internal knobs for how the [crate::services::invocation::InvokerFactory], and types it creates, work
 pub struct InvocationConfig {
     /// number of retries before giving up on an invocation
@@ -181,6 +214,7 @@ pub struct InvocationConfig {
     ///   will bypass concurrency restrictions and be run immediately
     pub bypass_duration_ms: Option<u64>,
     pub mqfq_config: Option<Arc<MqfqConfig>>,
+    pub inflight_invoke_limit: u32,
 }
 
 #[derive(Debug, Deserialize)]

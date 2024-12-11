@@ -5,7 +5,7 @@ use crate::services::influx_updater::InfluxUpdater;
 use crate::services::invocation::energy_limiter::EnergyLimiter;
 use crate::services::invocation::InvokerFactory;
 use crate::services::registration::RegistrationService;
-use crate::services::resources::{cpu::CpuResourceTracker, gpu::GpuResourceTracker};
+use crate::services::resources::{cpugroups::CpuGroupsResourceTracker, cpu::CpuResourceTracker, cpu::CpuResourceTrackerT, gpu::GpuResourceTracker};
 use crate::services::status::status_service::{build_load_avg_signal, StatusService};
 use crate::services::worker_health::WorkerHealthService;
 use crate::worker_api::iluvatar_worker::IluvatarWorkerImpl;
@@ -16,22 +16,61 @@ use iluvatar_library::{bail_error, characteristics_map::CharacteristicsMap};
 use iluvatar_library::{characteristics_map::AgExponential, energy::energy_logging::EnergyLogger};
 use iluvatar_library::{transaction::TransactionId, types::MemSizeMb};
 use iluvatar_rpc::rpc::{CleanResponse, InvokeResponse, StatusResponse};
+
+use iluvatar_finesched::load_bpf_scheduler_async;
+use iluvatar_finesched::PreAllocatedGroups;
+use iluvatar_finesched::SharedMapsSafe;
+
 use std::sync::Arc;
+use std::any::Any;
 
 pub mod worker_config;
 pub use worker_config as config;
+use worker_config::FineSchedConfig;
 pub mod iluvatar_worker;
 pub mod rpc;
 pub mod sim_worker;
 pub mod worker_comm;
 
 pub async fn create_worker(worker_config: WorkerConfig, tid: &TransactionId) -> Result<IluvatarWorkerImpl> {
+    
+    let pa; 
+
+    if let Some(fconfig) = worker_config.finesched.clone() {
+        // create shared map 
+        let sm = Arc::new(SharedMapsSafe::new());
+        // TODO: improve this logic to allow for dynamic group creation
+        let gs = match fconfig.preallocated_groups.clone() {
+            Some(gs) => gs,
+            None => vec![
+                (0..4).into_iter().collect(),
+                (4..8).into_iter().collect(),
+                (8..24).into_iter().collect(),
+                (24..48).into_iter().collect(),
+            ],
+        };
+        pa = Some( Arc::new(PreAllocatedGroups::new( sm.clone(), gs, fconfig.preallocated_groups_ts.clone().unwrap() )) ); // that's it! it should create preallocated
+       
+        load_bpf_scheduler_async( fconfig.bpf_verbose );
+    }else{
+        pa = None;
+    } 
+
     let cmap = Arc::new(CharacteristicsMap::new(AgExponential::new(0.6)));
 
     let factory = IsolationFactory::new(worker_config.clone());
     let load_avg = build_load_avg_signal();
-    let cpu = CpuResourceTracker::new(&worker_config.container_resources.cpu_resource, load_avg.clone(), tid)
-        .or_else(|e| bail_error!(tid=%tid, error=%e, "Failed to make cpu resource tracker"))?;
+
+    let cpu: Arc<dyn CpuResourceTrackerT + Send + Sync> = match worker_config.finesched.clone() {
+        Some(fconfig) => {
+            CpuGroupsResourceTracker::new( fconfig, pa, tid, cmap.clone() )
+                .or_else(|e| bail_error!(tid=%tid, error=%e, "Failed to make finesched cpu resource tracker"))?
+        }
+        None => {
+            CpuResourceTracker::new( &worker_config.container_resources.cpu_resource, load_avg.clone(), tid )
+                .or_else(|e| bail_error!(tid=%tid, error=%e, "Failed to make cpu resource tracker"))?
+        }
+    };
 
     let isos = factory
         .get_isolation_services(tid, true)

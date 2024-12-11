@@ -10,7 +10,7 @@ use crate::services::containers::{
 #[cfg(feature = "power_cap")]
 use crate::services::invocation::energy_limiter::EnergyLimiter;
 use crate::services::invocation::invoke_on_container;
-use crate::services::{registration::RegisteredFunction, resources::cpu::CpuResourceTracker};
+use crate::services::{registration::RegisteredFunction, resources::cpu::CpuResourceTrackerT};
 use crate::worker_api::worker_config::{FunctionLimits, InvocationConfig};
 use anyhow::Result;
 use iluvatar_library::characteristics_map::CharacteristicsMap;
@@ -18,11 +18,12 @@ use iluvatar_library::clock::{get_global_clock, now, Clock};
 use iluvatar_library::{threading::tokio_runtime, threading::EventualItem, transaction::TransactionId, types::Compute};
 use parking_lot::Mutex;
 use std::{
-    sync::{atomic::AtomicU32, Arc},
+    sync::{atomic::AtomicU32, Arc, atomic::Ordering},
     time::Duration,
 };
 use time::OffsetDateTime;
 use tokio::sync::{mpsc::UnboundedSender, Notify};
+use tokio::sync::{Semaphore, TryAcquireError, OwnedSemaphorePermit};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
@@ -36,8 +37,9 @@ pub struct CpuQueueingInvoker {
     cmap: Arc<CharacteristicsMap>,
     clock: Clock,
     running: AtomicU32,
+    inflight: Arc<Semaphore>,
     last_memory_warning: Mutex<Instant>,
-    cpu: Arc<CpuResourceTracker>,
+    cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
     _cpu_thread: std::thread::JoinHandle<()>,
     signal: Notify,
     queue: Arc<dyn InvokerCpuQueuePolicy>,
@@ -57,7 +59,7 @@ impl CpuQueueingInvoker {
         invocation_config: Arc<InvocationConfig>,
         tid: &TransactionId,
         cmap: Arc<CharacteristicsMap>,
-        cpu: Arc<CpuResourceTracker>,
+        cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
         #[cfg(feature = "power_cap")] energy: Arc<EnergyLimiter>,
     ) -> Result<Arc<Self>> {
         let (cpu_handle, cpu_tx) = tokio_runtime(
@@ -68,6 +70,7 @@ impl CpuQueueingInvoker {
             Some(function_config.cpu_max as usize),
         )?;
         let (bypass_thread, bypass_tx, bypass_rx) = Self::bypass_thread();
+        let inflight = Arc::new(Semaphore::new(invocation_config.inflight_invoke_limit as usize));
 
         let svc = Arc::new(CpuQueueingInvoker {
             queue: Self::get_invoker_queue(&invocation_config, &cmap, &cont_manager, tid)?,
@@ -83,11 +86,12 @@ impl CpuQueueingInvoker {
             _cpu_thread: cpu_handle,
             clock: get_global_clock(tid)?,
             running: AtomicU32::new(0),
+            inflight,
             last_memory_warning: Mutex::new(now()),
         });
         cpu_tx.send(svc.clone())?;
         bypass_tx.send(svc.clone())?;
-        debug!(tid=%tid, "Created CpuQueueingInvoker");
+        debug!(tid=%tid, cpu_max=%function_config.cpu_max, "Created CpuQueueingInvoker");
         Ok(svc)
     }
 
@@ -123,16 +127,22 @@ impl CpuQueueingInvoker {
     #[cfg_attr(feature = "full_spans", tracing::instrument(skip(self), fields(tid=%_tid)))]
     async fn monitor_queue(self: Arc<Self>, _tid: TransactionId) {
         while let Some(peek_item) = self.queue.peek_queue() {
-            if let Some(permit) = self.acquire_resources_to_run(&peek_item) {
-                let item = self.queue.pop_queue();
-                if !item.lock() {
-                    continue;
+
+            debug!(tid=%_tid, cpu_running=%self.running(), inflight=?self.inflight, "[monitor_queue] peek loop");
+
+            // not using running because the distance between this point and when it would
+            // incremented is too much! 
+            if let Ok(ipermit) = self.inflight.clone().acquire_owned().await {
+                if let Some(permit) = self.acquire_resources_to_run(&peek_item) {
+                    let item = self.queue.pop_queue();
+                    if !item.lock() {
+                        continue;
+                    }
+
+                    // TODO: continuity of spans here
+                    self.spawn_tokio_worker(self.clone(), item, permit, ipermit);
+                    continue; // skip the last sub 
                 }
-                // TODO: continuity of spans here
-                self.spawn_tokio_worker(self.clone(), item, permit);
-            } else {
-                debug!(tid=%peek_item.tid, "Insufficient resources to run item");
-                break;
             }
         }
     }
@@ -210,10 +220,10 @@ impl CpuQueueingInvoker {
 
     /// Runs the specific invocation inside a new tokio worker thread
     #[cfg_attr(feature = "full_spans", tracing::instrument(skip(self, invoker_svc, item, permit), fields(tid=%item.tid)))]
-    fn spawn_tokio_worker(&self, invoker_svc: Arc<Self>, item: Arc<EnqueuedInvocation>, permit: Box<dyn Drop + Send>) {
+    fn spawn_tokio_worker(&self, invoker_svc: Arc<Self>, item: Arc<EnqueuedInvocation>, permit: Box<dyn Drop + Send>, ipermit: OwnedSemaphorePermit) {
         let _handle = tokio::spawn(async move {
             debug!(tid=%item.tid, "Launching invocation thread for queued item");
-            invoker_svc.invocation_worker_thread(item, permit).await;
+            invoker_svc.invocation_worker_thread(item, permit, ipermit).await;
         });
     }
 
@@ -221,7 +231,7 @@ impl CpuQueueingInvoker {
     /// On success, the results are moved to the pointer and it is signaled
     /// On failure, [Invoker::handle_invocation_error] is called
     #[cfg_attr(feature = "full_spans", tracing::instrument(skip(self, item, permit), fields(tid=%item.tid)))]
-    async fn invocation_worker_thread(&self, item: Arc<EnqueuedInvocation>, permit: Box<dyn Drop + Send>) {
+    async fn invocation_worker_thread(&self, item: Arc<EnqueuedInvocation>, permit: Box<dyn Drop + Send>, ipermit: OwnedSemaphorePermit) {
         match self
             .invoke(
                 &item.registration,
@@ -229,6 +239,7 @@ impl CpuQueueingInvoker {
                 &item.tid,
                 item.queue_insert_time,
                 Some(permit),
+                ipermit
             )
             .await
         {
@@ -322,16 +333,20 @@ impl CpuQueueingInvoker {
         tid: &'a TransactionId,
         queue_insert_time: OffsetDateTime,
         permit: Option<Box<dyn Drop + Send>>,
+        ipermit: OwnedSemaphorePermit
     ) -> Result<(ParsedResult, Duration, Compute, ContainerState)> {
         debug!(tid=%tid, "Internal invocation starting");
         // take run time now because we may have to wait to get a container
         let remove_time = self.clock.now_str()?;
-
         let start = now();
         let ctr_lock = match self.cont_manager.acquire_container(reg, tid, Compute::CPU) {
-            EventualItem::Future(f) => f.await?,
+            EventualItem::Future(f) => {
+                warn!(tid=%tid, inflight=?self.inflight, running=%self.running(), "[ctr_lock] container is to be created, inflight and running count would be different");
+                f.await?
+            },
             EventualItem::Now(n) => n?,
         };
+        self.cpu.notify_cgroup_id( ctr_lock.container.cgroup_id(), tid );
         self.running.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (data, duration, compute_type, state) = invoke_on_container(
             reg,
@@ -346,7 +361,9 @@ impl CpuQueueingInvoker {
         )
         .await?;
         self.running.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.cpu.notify_cgroup_id_done( ctr_lock.container.cgroup_id(), tid );
         drop(permit);
+        drop(ipermit);
         self.signal.notify_waiters();
         Ok((data, duration, compute_type, state))
     }

@@ -6,7 +6,7 @@ use super::{
     },
 };
 use crate::services::invocation::queueing::paella::PaellaGpuQueue;
-use crate::services::resources::{cpu::CpuResourceTracker, gpu::GpuResourceTracker};
+use crate::services::resources::{cpu::CpuResourceTrackerT, gpu::GpuResourceTracker};
 use crate::services::{
     containers::{
         containermanager::ContainerManager,
@@ -127,7 +127,7 @@ pub struct GpuQueueingInvoker {
     running: AtomicU32,
     last_memory_warning: Mutex<Instant>,
     last_gpu_warning: Mutex<Instant>,
-    cpu: Arc<CpuResourceTracker>,
+    cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
     _gpu_thread: std::thread::JoinHandle<()>,
     gpu: Arc<GpuResourceTracker>,
     signal: Notify,
@@ -148,7 +148,7 @@ impl GpuQueueingInvoker {
         invocation_config: Arc<InvocationConfig>,
         tid: &TransactionId,
         cmap: Arc<CharacteristicsMap>,
-        cpu: Arc<CpuResourceTracker>,
+        cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
         gpu: Option<Arc<GpuResourceTracker>>,
         gpu_config: &Option<Arc<GPUResourceConfig>>,
     ) -> Result<Arc<Self>> {

@@ -194,6 +194,10 @@ impl ContainerT for SimulatorContainer {
         *lock = now();
     }
 
+    fn cgroup_id(&self) -> &String {
+        &self.container_id
+    }
+
     fn container_id(&self) -> &String {
         &self.container_id
     }

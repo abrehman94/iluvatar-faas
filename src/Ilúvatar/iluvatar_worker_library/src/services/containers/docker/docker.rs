@@ -209,7 +209,9 @@ impl DockerIsolation {
         debug!(tid=%tid, container_id=%container_id, "Container created");
 
         match self.docker_api.start_container::<String>(container_id, None).await {
-            Ok(_) => (),
+            Ok(_) => {
+                debug!(tid=%tid, container_id=%container_id, "Dockercontainer started");
+            },
             Err(e) => bail_error!(tid=%tid, error=%e, "Error starting container"),
         };
         debug!(tid=%tid, container_id=%container_id, "Container started");
@@ -379,7 +381,16 @@ impl ContainerIsolationService for DockerIsolation {
         _fqdn: &str,
         tid: &TransactionId,
     ) -> Result<()> {
+
         if self.pulled_images.contains(&rf.image_name) {
+            return Ok(());
+        }else{
+
+            // TODO: properly check via cli if it's already pulled 
+            
+            // right now I know the images have been pulled on v-021 
+            // there we don't need to pull again and again for the exps. 
+            self.pulled_images.insert(rf.image_name.clone());
             return Ok(());
         }
 

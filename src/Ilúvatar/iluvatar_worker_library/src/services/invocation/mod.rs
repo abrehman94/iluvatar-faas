@@ -1,7 +1,7 @@
 use self::queueing_dispatcher::QueueingDispatcher;
 use super::containers::containermanager::ContainerManager;
 use super::containers::structs::{Container, ContainerLock};
-use super::resources::{cpu::CpuResourceTracker, gpu::GpuResourceTracker};
+use super::resources::{cpu::CpuResourceTrackerT, gpu::GpuResourceTracker};
 #[cfg(feature = "power_cap")]
 use crate::services::invocation::energy_limiter::EnergyLimiter;
 use crate::services::{
@@ -15,6 +15,7 @@ use iluvatar_library::clock::Clock;
 use iluvatar_library::{characteristics_map::CharacteristicsMap, transaction::TransactionId, types::Compute};
 use parking_lot::Mutex;
 use std::{sync::Arc, time::Duration};
+use std::any::Any;
 use time::OffsetDateTime;
 use tokio::time::Instant;
 use tracing::info;
@@ -58,7 +59,7 @@ pub struct InvokerFactory {
     function_config: Arc<FunctionLimits>,
     invocation_config: Arc<InvocationConfig>,
     cmap: Arc<CharacteristicsMap>,
-    cpu: Arc<CpuResourceTracker>,
+    cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
     gpu_resources: Option<Arc<GpuResourceTracker>>,
     gpu_config: Option<Arc<GPUResourceConfig>>,
     #[cfg(feature = "power_cap")]
@@ -71,7 +72,7 @@ impl InvokerFactory {
         function_config: Arc<FunctionLimits>,
         invocation_config: Arc<InvocationConfig>,
         cmap: Arc<CharacteristicsMap>,
-        cpu: Arc<CpuResourceTracker>,
+        cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
         gpu_resources: Option<Arc<GpuResourceTracker>>,
         gpu_config: Option<Arc<GPUResourceConfig>>,
         #[cfg(feature = "power_cap")] energy: Arc<EnergyLimiter>,
