@@ -1,26 +1,23 @@
 
 use iluvatar_finesched::bpf_intf::consts_MAX_PATH;
-use iluvatar_finesched::SharedMaps;
-use iluvatar_finesched::CMAP;
-use iluvatar_finesched::GMAP;
+use iluvatar_finesched::SharedMapsSafe;
+
 use iluvatar_finesched::default_cpumask;
 use iluvatar_finesched::CgroupChrs;
 use iluvatar_finesched::SchedGroupChrs;
 use iluvatar_finesched::SchedGroupStatus;
 
 fn main() {
-    let mut sm = SharedMaps::new();
-    let cMap: &mut dyn CMAP = &mut sm;
+    let sm = SharedMapsSafe::new();
 
-    cMap.insert("system.init/cgroup1", &CgroupChrs { gid: 3 });
-    let cval = cMap.lookup("system.init/cgroup1");
+    sm.cmap_insert("system.init/cgroup1", &CgroupChrs { gid: 3 });
+    let cval = sm.cmap_lookup("system.init/cgroup1");
     println!("lookedup cval: {:?}", cval);
 
-    let cval = cMap.lookup("system.init/cgroup2");
+    let cval = sm.cmap_lookup("system.init/cgroup2");
     println!("lookedup cval: {:?}", cval);
 
-    let gMap: &mut dyn GMAP = &mut sm;
-    gMap.insert(
+    sm.gmap_insert(
         &1,
         &SchedGroupChrs {
             corebitmask: default_cpumask(),
@@ -33,7 +30,7 @@ fn main() {
         },
     );
 
-    let gval = gMap.lookup(&1);
+    let gval = sm.gmap_lookup(&1);
     println!("lookedup gval: {:?}", gval);
 }
 

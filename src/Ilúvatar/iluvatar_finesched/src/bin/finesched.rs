@@ -1,4 +1,7 @@
 use iluvatar_finesched::load_bpf_scheduler_async;
+use iluvatar_finesched::CGROUP_MAP_PATH;
+use iluvatar_finesched::SCHED_GROUP_MAP_PATH;
+use iluvatar_finesched::rm_pinned_map;
 use clap::Parser;
 
 use std::sync::Arc;
@@ -25,7 +28,10 @@ fn main() {
     println!("loading bpf scheduler for fine scheduling of iluvatar");
 
     println!("verbose level: {}", opts.verbose);
-    
+
+    rm_pinned_map( CGROUP_MAP_PATH );
+    rm_pinned_map( SCHED_GROUP_MAP_PATH );
+
     // ctrl-c handler setup 
     let (shutdown, h) = load_bpf_scheduler_async( opts.verbose ); 
     let shutdown_clone = shutdown.clone();

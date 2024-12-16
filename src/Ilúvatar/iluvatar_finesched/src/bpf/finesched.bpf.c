@@ -19,6 +19,7 @@ char _license[] SEC("license") = "GPL";
 // for exit error dump in user space 
 UEI_DEFINE(uei);
 
+#include "utils.bpf.c"
 #include "cgroup_name_matching.bpf.c"
 
 // task ran out of timeslice, @p is in need of dispatch 
@@ -81,6 +82,16 @@ void BPF_STRUCT_OPS(finesched_exit_task, struct task_struct *p, struct scx_exit_
 // Initialize the scheduling class.
 s32 BPF_STRUCT_OPS_SLEEPABLE(finesched_init) {
   info("[init] initializing the tsksz scheduler");
+  
+  // causing BPF_MAP_TYPE_CGROUP_STORAGE_DEPRECATED, BPF_MAP_TYPE_CGROUP_STORAGE
+  // to be generated both with id 19 in finesched bpf_skel.rs - don't know why? 
+  // dump_gMap(); 
+
+  // let check if we can just read an element from gMap here at all! 
+  SchedGroupID key = 1;
+  SchedGroupChrs_t *val = bpf_map_lookup_elem( &gMap, (const void *)&key );
+  callback_print_gMap_element( NULL, &key, val, NULL );
+
   return 0;
 }
 

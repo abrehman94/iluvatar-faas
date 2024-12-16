@@ -7,7 +7,7 @@ use super::{
 #[cfg(feature = "power_cap")]
 use crate::services::invocation::energy_limiter::EnergyLimiter;
 use crate::services::registration::RegisteredFunction;
-use crate::services::resources::{cpu::CpuResourceTracker, gpu::GpuResourceTracker};
+use crate::services::resources::{cpu::CpuResourceTrackerT, gpu::GpuResourceTracker};
 use crate::services::{containers::containermanager::ContainerManager, invocation::queueing::EnqueueingPolicy};
 use crate::worker_api::worker_config::{FunctionLimits, GPUResourceConfig, InvocationConfig};
 use anyhow::Result;
@@ -83,7 +83,7 @@ impl QueueingDispatcher {
         invocation_config: Arc<InvocationConfig>,
         tid: &TransactionId,
         cmap: Arc<CharacteristicsMap>,
-        cpu: Arc<CpuResourceTracker>,
+        cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
         gpu: Option<Arc<GpuResourceTracker>>,
         gpu_config: &Option<Arc<GPUResourceConfig>>,
         #[cfg(feature = "power_cap")] energy: Arc<EnergyLimiter>,
@@ -125,7 +125,7 @@ impl QueueingDispatcher {
         cont_manager: &Arc<ContainerManager>,
         tid: &TransactionId,
         function_config: &Arc<FunctionLimits>,
-        cpu: &Arc<CpuResourceTracker>,
+        cpu: &Arc<dyn CpuResourceTrackerT + Send + Sync>,
         #[cfg(feature = "power_cap")] energy: &Arc<EnergyLimiter>,
     ) -> Result<Arc<dyn DeviceQueue>> {
         Ok(CpuQueueingInvoker::new(
@@ -146,7 +146,7 @@ impl QueueingDispatcher {
         cont_manager: &Arc<ContainerManager>,
         tid: &TransactionId,
         function_config: &Arc<FunctionLimits>,
-        cpu: &Arc<CpuResourceTracker>,
+        cpu: &Arc<dyn CpuResourceTrackerT + Send + Sync>,
         gpu: &Option<Arc<GpuResourceTracker>>,
         gpu_config: &Option<Arc<GPUResourceConfig>>,
     ) -> Result<Option<Arc<dyn DeviceQueue>>> {

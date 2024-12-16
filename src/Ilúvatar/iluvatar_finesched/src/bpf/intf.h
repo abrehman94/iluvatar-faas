@@ -24,9 +24,20 @@ enum consts {
   MAX_PATH = 100,
 };
 
+// TODO: not sure why scx_utils builder is not 
+// recognizing the definition from vmlinux.h during
+// early build stages
+#ifndef __VMLINUX_H__
+struct cpumask {
+	unsigned long bits[128];
+};
+#endif
+
 ////////////////////////////
 // macros 
+#define debug 1
 #define info(fmt, args...)	do { bpf_printk(fmt, ##args); } while (0)
+#define error(fmt, args...)	do { bpf_printk("[error]"#fmt, ##args); } while (0)
 #define dbg(fmt, args...)	do { if (debug) bpf_printk(fmt, ##args); } while (0)
 #define trace(fmt, args...)	do { if (debug > 1) bpf_printk(fmt, ##args); } while (0)
 
@@ -37,16 +48,16 @@ typedef u32 SchedGroupID;
 // Group Status Structure
 typedef struct SchedGroupStatus {
   char cur_cgroup_prefix[MAX_PATH]; // cgroup prefix of the
+  u32 task_count;
 } SchedGroupStatus_t;
 
 // Group Characteristics Structure
 typedef struct SchedGroupChrs {
 
-  struct bpf_cpumask __kptr *corebitmask; // bitmask for the cores that belong
-                                          // to this group
-  u64 timeslice;
-  u64 dsqid;
-  u32 perf; // the perf setting for the set of cores of this group
+  struct cpumask corebitmask;    // bitmask for the cores that belong
+                                 // to this group
+  u64 timeslice;                 // in ms
+  u32 perf;                      // the perf setting for the set of cores of this group
 
   SchedGroupStatus_t status;
 

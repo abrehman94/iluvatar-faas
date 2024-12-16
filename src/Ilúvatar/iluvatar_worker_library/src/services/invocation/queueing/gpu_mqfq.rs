@@ -5,7 +5,7 @@ use crate::services::containers::{
 };
 use crate::services::invocation::{completion_time_tracker::CompletionTimeTracker, invoke_on_container_2};
 use crate::services::registration::RegisteredFunction;
-use crate::services::resources::cpu::CpuResourceTracker;
+use crate::services::resources::cpu::CpuResourceTrackerT;
 use crate::services::resources::gpu::{GpuResourceTracker, GpuToken};
 use crate::worker_api::worker_config::{GPUResourceConfig, InvocationConfig};
 use anyhow::Result;
@@ -312,7 +312,7 @@ pub struct MQFQ {
     ctrack: Arc<CompletionTimeTracker>,
 
     signal: Notify,
-    cpu: Arc<CpuResourceTracker>,
+    cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
     _thread: std::thread::JoinHandle<()>,
     _mon_thread: Option<tokio::task::JoinHandle<()>>,
     gpu: Arc<GpuResourceTracker>,
@@ -393,7 +393,7 @@ impl MQFQ {
         cont_manager: Arc<ContainerManager>,
         cmap: Arc<CharacteristicsMap>,
         invocation_config: Arc<InvocationConfig>,
-        cpu: Arc<CpuResourceTracker>,
+        cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
         gpu: &Option<Arc<GpuResourceTracker>>,
         gpu_config: &Option<Arc<GPUResourceConfig>>,
         tid: &TransactionId,

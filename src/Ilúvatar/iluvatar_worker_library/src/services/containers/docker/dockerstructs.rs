@@ -12,15 +12,34 @@ use iluvatar_library::{
     transaction::TransactionId,
     types::{Compute, Isolation, MemSizeMb},
     utils::port::Port,
+    utils::execute_cmd,
 };
+
 use parking_lot::{Mutex, RwLock};
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
+lazy_static::lazy_static! {
+    pub static ref DOCKER_INSPECT_TID: TransactionId = "DockerInspectCall".to_string();
+}
+
+fn inspect_container ( container_id: &str, field: &str ) -> String {
+    let pargs = vec!["inspect", "-f", field, container_id];
+    // just an inspect cmd no need for env
+    if let Ok(output) = execute_cmd("/usr/bin/docker", pargs, None, &DOCKER_INSPECT_TID ) {
+        return String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .trim_matches('\'')
+            .to_string();
+    }
+    "".to_string()
+}
+
 #[allow(unused, dyn_drop)]
 pub struct DockerContainer {
     pub container_id: String,
+    pub cgroup_id: String,
     fqdn: String,
     /// the associated function inside the container
     pub function: Arc<RegisteredFunction>,
@@ -56,6 +75,7 @@ impl DockerContainer {
         };
         let r = DockerContainer {
             mem_usage: RwLock::new(function.memory),
+            cgroup_id: inspect_container( &container_id, "'{{.Id}}'" ),
             container_id,
             fqdn: fqdn.to_owned(),
             function: function.clone(),
@@ -68,8 +88,10 @@ impl DockerContainer {
             device: RwLock::new(device),
             drop_on_remove: Mutex::new(vec![]),
         };
+        debug!(tid=%tid, container_id=%r.container_id, cgroup_id=%r.cgroup_id, "struct DockerContainer created" );
         Ok(r)
     }
+
 }
 
 #[tonic::async_trait]
@@ -99,6 +121,10 @@ impl ContainerT for DockerContainer {
     fn touch(&self) {
         let mut lock = self.last_used.write();
         *lock = now();
+    }
+
+    fn cgroup_id(&self) -> &String {
+        &self.cgroup_id
     }
 
     fn container_id(&self) -> &String {

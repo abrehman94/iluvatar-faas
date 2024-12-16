@@ -47,6 +47,8 @@ pub struct Configuration {
     pub energy_cap: Option<Arc<crate::services::invocation::energy_limiter::EnergyCapConfig>>,
     pub status: Arc<StatusConfig>,
     pub influx: Option<Arc<InfluxConfig>>,
+    /// Optional feature to enable fine scheduling of tasks
+    pub finesched: Option<Arc<FineSchedConfig>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -162,7 +164,15 @@ pub struct FunctionLimits {
     pub timeout_sec: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+/// Fine scheduling configuration
+pub struct FineSchedConfig {
+    pub preallocated_groups: Option<Vec<Vec<u32>>>,
+    pub allocation_type_rr: bool,
+    pub bpf_verbose: u8,
+}
+
+#[derive(Debug, Deserialize, Default)]
 /// Internal knobs for how the [crate::services::invocation::InvokerFactory], and types it creates, work
 pub struct InvocationConfig {
     /// number of retries before giving up on an invocation
@@ -181,6 +191,7 @@ pub struct InvocationConfig {
     ///   will bypass concurrency restrictions and be run immediately
     pub bypass_duration_ms: Option<u64>,
     pub mqfq_config: Option<Arc<MqfqConfig>>,
+    pub inflight_invoke_limit: u32,
 }
 
 #[derive(Debug, Deserialize)]

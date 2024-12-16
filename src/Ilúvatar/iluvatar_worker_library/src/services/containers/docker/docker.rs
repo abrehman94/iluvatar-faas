@@ -209,7 +209,9 @@ impl DockerIsolation {
         debug!(tid=%tid, container_id=%container_id, "Container created");
 
         match self.docker_api.start_container::<String>(container_id, None).await {
-            Ok(_) => (),
+            Ok(_) => {
+                debug!(tid=%tid, container_id=%container_id, "Dockercontainer started");
+            },
             Err(e) => bail_error!(tid=%tid, error=%e, "Error starting container"),
         };
         debug!(tid=%tid, container_id=%container_id, "Container started");

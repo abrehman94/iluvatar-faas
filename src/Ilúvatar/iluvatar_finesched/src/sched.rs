@@ -1,5 +1,9 @@
 use crate::bpf_fsched::*;
 use crate::bpf_intf::*;
+use crate::reuse_pinned_map;
+use crate::pin_map;
+use crate::CGROUP_MAP_PATH;
+use crate::SCHED_GROUP_MAP_PATH;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -38,9 +42,20 @@ fn load_bpf_scheduler(verbose: u8, open_object: & mut MaybeUninit<OpenObject>) -
     
     // init any globals for the bpf scheduler here 
     // none needed at the moment - can set cpu later 
+    
+    // reuse the pinned map 
+    let gru = reuse_pinned_map( &mut skel.maps.gMap, SCHED_GROUP_MAP_PATH );
+    let cru = reuse_pinned_map( &mut skel.maps.cMap, CGROUP_MAP_PATH );
 
     // load the scheduler 
     let mut skel = scx_ops_load!(skel, finesched_ops, uei)?;
+
+    if !gru {
+        pin_map( &mut skel.maps.gMap, SCHED_GROUP_MAP_PATH );
+    }
+    if !cru {
+        pin_map( &mut skel.maps.cMap, CGROUP_MAP_PATH );
+    }
 
     // Attach.
     let struct_ops = scx_ops_attach!(skel, finesched_ops)?;
@@ -48,6 +63,7 @@ fn load_bpf_scheduler(verbose: u8, open_object: & mut MaybeUninit<OpenObject>) -
     return Ok((struct_ops,skel));
 }
 
+// TODO: make this function idempoent 
 pub fn load_bpf_scheduler_async(verbose: u8) -> (Arc<AtomicBool>, JoinHandle<()>) {
     
     let launched = Arc::new(AtomicBool::new(false));

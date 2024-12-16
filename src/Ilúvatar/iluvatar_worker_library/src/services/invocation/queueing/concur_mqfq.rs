@@ -5,7 +5,7 @@ use crate::services::containers::structs::ContainerLock;
 use crate::services::invocation::completion_time_tracker::CompletionTimeTracker;
 use crate::services::invocation::invoke_on_container;
 use crate::services::registration::RegisteredFunction;
-use crate::services::resources::cpu::CpuResourceTracker;
+use crate::services::resources::cpu::CpuResourceTrackerT;
 use crate::services::resources::gpu::{GpuResourceTracker, GPU};
 use crate::worker_api::worker_config::{GPUResourceConfig, InvocationConfig};
 use anyhow::Result;
@@ -30,7 +30,7 @@ lazy_static::lazy_static! {
 
 struct Flow {
     mindicator: Arc<Mindicator>,
-    cpu: Arc<CpuResourceTracker>,
+    cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
     gpu: Arc<GpuResourceTracker>,
     ctrack: Arc<CompletionTimeTracker>,
     queue: SharedQueue,
@@ -44,7 +44,7 @@ impl Flow {
     pub fn new(
         queue: &SharedQueue,
         mindicator: &Arc<Mindicator>,
-        cpu: &Arc<CpuResourceTracker>,
+        cpu: &Arc<dyn CpuResourceTrackerT + Send + Sync>,
         gpu: &Arc<GpuResourceTracker>,
         ctrack: &Arc<CompletionTimeTracker>,
         cont_manager: &Arc<ContainerManager>,
@@ -243,7 +243,7 @@ struct FuncQueue {
     cont_manager: Arc<ContainerManager>,
     mindicator: Arc<Mindicator>,
     mindicator_id: usize,
-    cpu: Arc<CpuResourceTracker>,
+    cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
     gpu: Arc<GpuResourceTracker>,
     ctrack: Arc<CompletionTimeTracker>,
     cmap: Arc<CharacteristicsMap>,
@@ -261,7 +261,7 @@ impl FuncQueue {
         q_config: &Arc<MqfqConfig>,
         mindicator: &Arc<Mindicator>,
         mindicator_id: usize,
-        cpu: &Arc<CpuResourceTracker>,
+        cpu: &Arc<dyn CpuResourceTrackerT + Send + Sync>,
         gpu: &Arc<GpuResourceTracker>,
         ctrack: &Arc<CompletionTimeTracker>,
         cmap: &Arc<CharacteristicsMap>,
@@ -419,7 +419,7 @@ pub struct ConcurMqfq {
     /// Use this as a token bucket
     ctrack: Arc<CompletionTimeTracker>,
 
-    cpu: Arc<CpuResourceTracker>,
+    cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
     gpu: Arc<GpuResourceTracker>,
     q_config: Arc<MqfqConfig>,
     mindicator: Arc<Mindicator>,
@@ -433,7 +433,7 @@ impl ConcurMqfq {
         cont_manager: Arc<ContainerManager>,
         cmap: Arc<CharacteristicsMap>,
         invocation_config: Arc<InvocationConfig>,
-        cpu: Arc<CpuResourceTracker>,
+        cpu: Arc<dyn CpuResourceTrackerT + Send + Sync>,
         gpu: &Option<Arc<GpuResourceTracker>>,
         gpu_config: &Option<Arc<GPUResourceConfig>>,
         tid: &TransactionId,

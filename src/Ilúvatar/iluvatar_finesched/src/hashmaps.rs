@@ -20,10 +20,22 @@ use crate::SchedGroupChrs;
 use crate::SchedGroupStatus;
 
 use crate::bpf_intf::consts_MAX_PATH;
+use crate::bpf_intf::cpumask;
 
 static mut open_object: MaybeUninit<OpenObject> = MaybeUninit::<OpenObject>::uninit();
 
-fn reuse_pinned_map<'obj>(map: &mut OpenMapMut<'obj>, path: &str) -> bool {
+pub static CGROUP_MAP_PATH: &str = "/sys/fs/bpf/cMap";
+pub static SCHED_GROUP_MAP_PATH: &str = "/sys/fs/bpf/gMap";
+
+pub fn rm_pinned_map<'obj>(path: &str) -> bool {
+    if Path::new(path).exists() {
+        fs::remove_file(path).expect(format!("failed to remove map {}", path).as_str());
+        return true;
+    }
+    false
+}
+
+pub fn reuse_pinned_map<'obj>(map: &mut OpenMapMut<'obj>, path: &str) -> bool {
     if Path::new(path).exists() {
         assert!(map.reuse_pinned_map("/asdf").is_err());
         map.reuse_pinned_map(path).expect("failed to reuse map");
@@ -32,7 +44,7 @@ fn reuse_pinned_map<'obj>(map: &mut OpenMapMut<'obj>, path: &str) -> bool {
     false
 }
 
-fn pin_map<'obj>(map: &mut MapMut<'obj>, path: &str) {
+pub fn pin_map<'obj>(map: &mut MapMut<'obj>, path: &str) {
     map.pin(path).expect("failed to pin map");
     assert!(Path::new(path).exists());
 }
@@ -67,6 +79,13 @@ pub trait GMAP {
 
 pub struct SharedMaps<'obj> {
     skel: BpfHashmapsSkel<'obj>,
+}
+
+impl Debug for SharedMaps<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BpfHashmapsSkel")
+         .finish()
+    }
 }
 
 impl CMAP for SharedMaps<'_> {
@@ -156,16 +175,16 @@ impl SharedMaps<'_> {
         let mut open_skel = unsafe { skel_builder.open(&mut open_object).unwrap() };
 
         // reuse at this point if available 
-        let cp = reuse_pinned_map( &mut open_skel.maps.cMap, "/sys/fs/bpf/cMap" );
-        let gp = reuse_pinned_map( &mut open_skel.maps.gMap, "/sys/fs/bpf/gMap" );
+        let cp = reuse_pinned_map( &mut open_skel.maps.cMap, CGROUP_MAP_PATH );
+        let gp = reuse_pinned_map( &mut open_skel.maps.gMap, SCHED_GROUP_MAP_PATH );
 
         let mut skel = open_skel.load().unwrap();
         
         if !cp {
-            pin_map(&mut skel.maps.cMap, "/sys/fs/bpf/cMap");
+            pin_map(&mut skel.maps.cMap, CGROUP_MAP_PATH);
         }
         if !gp {
-            pin_map(&mut skel.maps.gMap, "/sys/fs/bpf/gMap");
+            pin_map(&mut skel.maps.gMap, SCHED_GROUP_MAP_PATH);
         }
 
         SharedMaps {
@@ -173,5 +192,8 @@ impl SharedMaps<'_> {
         }
     }
 }
+
+
+
 
 

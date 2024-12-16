@@ -13,10 +13,21 @@ lazy_static::lazy_static! {
   pub static ref CPU_CONCUR_WORKER_TID: TransactionId = "CPUConcurrencyMonitor".to_string();
 }
 
+pub trait CpuResourceTrackerT {
+    fn try_acquire_cores( &self, reg: &Arc<RegisteredFunction>, _tid: &TransactionId, ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::TryAcquireError>;
+    fn notify_cgroup_id( &self, _cgroup_id: &str, _tid: &TransactionId, ){
+        debug!(_cgroup_id=%_cgroup_id, _tid=%_tid, "[finesched] cgroup assigned for the invocation");
+    } 
+    fn notify_cgroup_id_done( &self, _cgroup_id: &str, _tid: &TransactionId, ){
+        debug!(_cgroup_id=%_cgroup_id, _tid=%_tid, "[finesched] cgroup assigned for the invocation is done");
+    } 
+}
+
 /// An invoker that scales concurrency based on system load
 /// Prioritizes based on container availability
 /// Increases concurrency by 1 every [crate::worker_api::worker_config::ComputeResourceConfig::concurrency_update_check_ms]
 /// If system load is above [crate::worker_api::worker_config::ComputeResourceConfig::max_load], then the concurrency is reduced by half the distance to [crate::worker_api::worker_config::ComputeResourceConfig::max_oversubscribe] rounded up
+#[derive(Debug)]
 pub struct CpuResourceTracker {
     _load_thread: Option<tokio::task::JoinHandle<()>>,
     concurrency_semaphore: Option<Arc<Semaphore>>,
@@ -29,6 +40,7 @@ pub struct CpuResourceTracker {
 }
 
 impl CpuResourceTracker {
+
     pub fn new(config: &Arc<CPUResourceConfig>, load_avg: LoadAvg, tid: &TransactionId) -> Result<Arc<Self>> {
         let mut max_concur = 0;
         let available_cores = match config.count {
@@ -78,22 +90,6 @@ impl CpuResourceTracker {
         Ok(svc)
     }
 
-    /// Return a permit for the function to run on its registered number of cores
-    /// If the semaphore is [None], then no permits are being tracked
-    pub fn try_acquire_cores(
-        &self,
-        reg: &Arc<RegisteredFunction>,
-        _tid: &TransactionId,
-    ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::TryAcquireError> {
-        if let Some(sem) = &self.concurrency_semaphore {
-            return match sem.clone().try_acquire_many_owned(reg.cpus) {
-                Ok(p) => Ok(Some(p)),
-                Err(e) => Err(e),
-            };
-        }
-        Ok(None)
-    }
-
     #[cfg_attr(feature = "full_spans", tracing::instrument(skip(svc), fields(tid=%tid)))]
     async fn monitor_load(svc: Arc<CpuResourceTracker>, tid: TransactionId) {
         let norm_load = *svc.load_avg.read() / svc.cores;
@@ -122,4 +118,25 @@ impl CpuResourceTracker {
         }
         info!(tid=%tid, concurrency=*svc.current_concur.lock(), load=norm_load, "Current concurrency");
     }
+
+}
+
+impl CpuResourceTrackerT for CpuResourceTracker {
+
+    /// Return a permit for the function to run on its registered number of cores
+    /// If the semaphore is [None], then no permits are being tracked
+    fn try_acquire_cores(
+        &self,
+        reg: &Arc<RegisteredFunction>,
+        _tid: &TransactionId,
+    ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::TryAcquireError> {
+        if let Some(sem) = &self.concurrency_semaphore {
+            return match sem.clone().try_acquire_many_owned(reg.cpus) {
+                Ok(p) => Ok(Some(p)),
+                Err(e) => Err(e),
+            };
+        }
+        Ok(None)
+    }
+
 }
