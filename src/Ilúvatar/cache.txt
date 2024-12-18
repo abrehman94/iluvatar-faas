@@ -1,0 +1,35 @@
+
+    cpu: &Arc<dyn Any + Send + Sync>,
+
+    cpu: Option<Arc<CpuResourceTracker>>,
+    cpugroups: Option<Arc<CpuGroupsResourceTracker<'a>>>,
+
+        // type cast cpu - to either cpu or cpugroups 
+        let cpugroups = match cpu.downcast::<CpuGroupsResourceTracker>() {
+            Ok(c) => Some(c),
+            Err(e) => None,
+        };
+        let cpu = match cpu.downcast::<CpuResourceTracker>() {
+            Ok(c) => Some(c),
+            Err(e) => None,
+        };
+
+        self.cpu.iter().for_each(|cpu|{
+            match cpu.try_acquire_cores(&item.registration, &item.tid) {
+                Ok(c) => ret.push(c),
+                Err(e) => {
+                    match e {
+                        tokio::sync::TryAcquireError::Closed => {
+                            error!(tid=%item.tid, "CPU Resource Monitor `try_acquire_cores` returned a closed error!")
+                        }
+                        tokio::sync::TryAcquireError::NoPermits => (),
+                    };
+                }
+            };
+        });
+
+        if ret.len() == 0 {
+            return None;
+        }
+
+
