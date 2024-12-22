@@ -62,9 +62,34 @@ void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
 s32 BPF_STRUCT_OPS(finesched_init_task, struct task_struct *p, struct scx_init_task_args *args) {
     info("[init_task] initializing task %d - %s", p->pid, p->comm);
 
-    const char *cgrp_path;
-    if (p->cgroups->dfl_cgrp && (cgrp_path = format_cgrp_path(p->cgroups->dfl_cgrp))){
-      info("[init_task][cgroup][name] task %d - %s cgroup %s", p->pid, p->comm, cgrp_path);
+    char *cgrp_path;
+    // if (p->cgroups->dfl_cgrp && (cgrp_path = format_cgrp_path(p->cgroups->dfl_cgrp))){
+    //   info("[init_task][cgroup][name] task %d - %s cgroup %s", p->pid, p->comm, cgrp_path);
+    // }
+    cgrp_path = get_task_schedcgroup_path( p );
+    if ( cgrp_path ) {
+      info("[init_task][schedcgroup][cgroup][name] task %d - %s cgroup %s ", 
+           p->pid, 
+           p->comm, 
+           cgrp_path
+       );
+    }
+    char *stripped = get_last_node( cgrp_path, MAX_PATH );
+    if ( stripped ) {
+      info("[init_task][schedcgroup][cgroup][name] task %d - %s cgroup-stripped %s ", 
+           p->pid, 
+           p->comm, 
+           stripped
+       );
+    }
+  
+    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs( stripped, MAX_PATH );
+    if ( cgrp_chrs ){
+        info("[init_task][schedcgroup][cgroup][name][found][cmap] task %d - %s cgroup-stripped %s ", 
+             p->pid, 
+             p->comm, 
+             stripped
+        );
     }
 
     return 0;
@@ -85,13 +110,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(finesched_init) {
   
   // causing BPF_MAP_TYPE_CGROUP_STORAGE_DEPRECATED, BPF_MAP_TYPE_CGROUP_STORAGE
   // to be generated both with id 19 in finesched bpf_skel.rs - don't know why? 
-  // dump_gMap(); 
+  dump_gMap(); 
 
   // let check if we can just read an element from gMap here at all! 
-  SchedGroupID key = 1;
-  SchedGroupChrs_t *val = bpf_map_lookup_elem( &gMap, (const void *)&key );
-  callback_print_gMap_element( NULL, &key, val, NULL );
-
+  // SchedGroupID key = 1;
+  // SchedGroupChrs_t *val = bpf_map_lookup_elem( &gMap, (const void *)&key );
+  // callback_print_gMap_element( NULL, &key, val, NULL );
   return 0;
 }
 

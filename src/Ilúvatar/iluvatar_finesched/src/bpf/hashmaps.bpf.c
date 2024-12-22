@@ -27,6 +27,21 @@ struct {
 	       sizeof(CgroupChrs_t)); // value: cgroup characteristics
 } cMap SEC(".maps");
 
+static CgroupChrs_t * __noinline get_cgroup_chrs( const char *name, u32 max_len ) {
+
+    if (!name || max_len > MAX_PATH) {
+        dbg("[cmap][get_cgroup_chrs] invalid args: %s %u", name, max_len);
+        return NULL;
+    }
+
+    CgroupChrs_t *cgrp_chrs = bpf_map_lookup_elem( &cMap, name );
+    if ( !cgrp_chrs ) {
+        dbg("[cmap][get_cgroup_chrs] cgroup %s not found in cMap", name);
+    }
+
+    return cgrp_chrs;
+}
+
 #ifndef __LICENSE_H
 #define __LICENSE_H
 char _license[] SEC("license") = "GPL";

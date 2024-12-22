@@ -22,6 +22,13 @@ struct {
 	__uint(max_entries, 1);
 } str_bufs SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, 2*MAX_PATH);
+	__uint(max_entries, 1);
+} ln_bufs SEC(".maps");
+
 // create a cgroup path for the given cgroup
 static char *format_cgrp_path(struct cgroup *cgrp)
 {
@@ -69,6 +76,67 @@ static char *format_cgrp_path(struct cgroup *cgrp)
 	return path;
 }
 
+static __always_inline char * get_task_schedcgroup_path(struct task_struct *p)
+{
+    struct cgroup *cgrp;
+    char *path = NULL;
+
+    bpf_rcu_read_lock();
+      // cgroups->dfl_cgrp is the cgroup-id 1 
+      // we need cgroups->subsys[sched] cgroup 
+      if( p->sched_task_group && 
+          p->sched_task_group->css.cgroup 
+         ){
+          path = format_cgrp_path( p->sched_task_group->css.cgroup );
+      } 
+    bpf_rcu_read_unlock();
+
+    return path;
+}
+
+static char * __noinline get_last_node(char *path, u32 max_len) {
+    // path is of the form a/b/ - there is always a trailing /
+    if (!path || max_len > MAX_PATH) {
+        return NULL;
+    }
+   
+	u32 zero = 0;
+    u32 llast = 0;
+    u32 last = 0;
+    u32 i;
+    u32 id_s;
+    char *next = NULL;
+	char *ln_buf = bpf_map_lookup_elem(&ln_bufs, &zero);
+  
+    bpf_for(i, 0, max_len) {
+        next = &path[i];
+        if ( next ){
+          info("[debug] i: %d - last: %d - llast: %d - %c ", 
+               i, last, llast, *next
+          );
+
+          if ( *next == '/') {
+              llast = last;
+              last = i + 1;
+          }
+        }
+    }
+
+    if (last > 1) {
+      path[last-1] = '\0';
+    }
+     
+    bpf_for(i, 0, max_len) {
+        next = &ln_buf[i];
+        if (next) {
+            *next = path[i+llast];
+            id_s += 1;
+        }
+    }
+
+    return ln_buf;
+}
+
 bool __noinline match_prefix(const char *prefix, const char *str, u32 max_len)
 {
 	u32 c, zero = 0;
@@ -112,5 +180,7 @@ bool __noinline match_prefix(const char *prefix, const char *str, u32 max_len)
 	}
 	return false;
 }
+
+
 
 
