@@ -21,7 +21,12 @@ typedef unsigned long long u64;
 // Constants and Fixed Parameters  
 enum consts {
   MAX_MAP_ENTRIES = 1024,
-  MAX_PATH = 100,
+  MAX_PATH        = 100,
+  MAX_CPUS        = 48,
+
+  NSEC_PER_USEC   = 1000ULL,
+  NSEC_PER_MSEC   = (1000ULL * NSEC_PER_USEC),
+  NSEC_PER_SEC    = (1000ULL * NSEC_PER_MSEC),
 };
 
 // TODO: not sure why scx_utils builder is not 
@@ -72,5 +77,6 @@ typedef struct CgroupStatus {
 typedef struct CgroupChrs {
   SchedGroupID gid;
 } CgroupChrs_t;
+
 
 #endif // __INTF_H

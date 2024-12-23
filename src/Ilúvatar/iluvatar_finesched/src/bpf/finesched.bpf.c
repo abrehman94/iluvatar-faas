@@ -19,16 +19,24 @@ char _license[] SEC("license") = "GPL";
 // for exit error dump in user space 
 UEI_DEFINE(uei);
 
-#include "utils.bpf.c"
 #include "cgroup_name_matching.bpf.c"
+#include "utils.bpf.c"
+
+u32 rr_cpu = 0;
+u32 tsk_per_cpu = 1; // first is the corner case  
+u32 tsk_sw_cnt = 0;
 
 // task ran out of timeslice, @p is in need of dispatch 
 // select the cpu for it and scx_bpf_dispatch( SCX_DSQ_LOCAL )
 // cpu would be selected by the cpu returned
 s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags) {
-    info("[select_cpu] task %d - %s", p->pid, p->comm);
-    scx_bpf_dispatch( p, SCX_DSQ_LOCAL, 1000000, 0 );
-    return prev_cpu;
+    info("[callback][select_cpu] prev_cpu %d task %d - %s", prev_cpu, p->pid, p->comm);
+    scx_bpf_dispatch( p, SCX_DSQ_LOCAL, 80*NSEC_PER_MSEC, 0 );
+
+    if( (tsk_sw_cnt = (tsk_sw_cnt + 1) % tsk_per_cpu) == 0 ) {
+      rr_cpu = (rr_cpu + 1) % MAX_CPUS;
+    }
+    return rr_cpu;
 }
 
 // enqueue the task @p, it was dispatched in the select_cpu() call
@@ -43,13 +51,17 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 //    cannot target specific CPU using SCX_DSQ_LOCAL_ON 
 //  Better to use select_cpu() to target specific CPUs 
 void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
-    info("[enqueue] task %d - %s", p->pid, p->comm);
+    u32 cpu = bpf_get_smp_processor_id();
+
+    info("[callback][enqueue] cpu %d task %d - %s", cpu, p->pid, p->comm);
+    scx_bpf_dispatch( p, SCX_DSQ_GLOBAL, 80*NSEC_PER_MSEC, 0 );
 }
 
 // local DSQ of cpu is empty, give it something or it will go idle
 //    can consume multiple tasks from custom DSQs into local DSQ 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
     // info("[dispatch] on %d", cpu);
+    scx_bpf_consume( SCX_DSQ_GLOBAL );
 }
 
 // Task @p is being created. 
@@ -58,39 +70,12 @@ void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
 //      fork(true: fork, false: transition path) 
 //      cgroup(that task is joining)
 //  even tasks that don't belong to schedext class come here, but they don't
-//  can timeout issue 
+//  have scx as sched class, so they don't come into other callbacks 
 s32 BPF_STRUCT_OPS(finesched_init_task, struct task_struct *p, struct scx_init_task_args *args) {
+
     info("[init_task] initializing task %d - %s", p->pid, p->comm);
 
-    char *cgrp_path;
-    // if (p->cgroups->dfl_cgrp && (cgrp_path = format_cgrp_path(p->cgroups->dfl_cgrp))){
-    //   info("[init_task][cgroup][name] task %d - %s cgroup %s", p->pid, p->comm, cgrp_path);
-    // }
-    cgrp_path = get_task_schedcgroup_path( p );
-    if ( cgrp_path ) {
-      info("[init_task][schedcgroup][cgroup][name] task %d - %s cgroup %s ", 
-           p->pid, 
-           p->comm, 
-           cgrp_path
-       );
-    }
-    char *stripped = get_last_node( cgrp_path, MAX_PATH );
-    if ( stripped ) {
-      info("[init_task][schedcgroup][cgroup][name] task %d - %s cgroup-stripped %s ", 
-           p->pid, 
-           p->comm, 
-           stripped
-       );
-    }
-  
-    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs( stripped, MAX_PATH );
-    if ( cgrp_chrs ){
-        info("[init_task][schedcgroup][cgroup][name][found][cmap] task %d - %s cgroup-stripped %s ", 
-             p->pid, 
-             p->comm, 
-             stripped
-        );
-    }
+    switch_to_scx_cmap_checked( p );
 
     return 0;
 }

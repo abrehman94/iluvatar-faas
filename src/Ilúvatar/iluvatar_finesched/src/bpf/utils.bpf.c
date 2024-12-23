@@ -1,6 +1,12 @@
 #ifndef __UTILS_F
 #define __UTILS_F
 
+////////////////////////////
+// Custom Kfuncs Declarations 
+void scx_bpf_switch_to_scx(struct task_struct *p) __ksym;
+
+////////////////////////////
+// Map Dumping Functions  
 static long callback_print_cMap_element(struct bpf_map *map, char *cgroup_name, CgroupChrs_t *val, void *data) {
     if ( cgroup_name == NULL ) {
         return 1;
@@ -34,6 +40,40 @@ static inline void dump_gMap(){
     bpf_for(key, 0, MAX_MAP_ENTRIES) {
         SchedGroupChrs_t *val = bpf_map_lookup_elem( &gMap, (const void *)&key );
         callback_print_gMap_element( NULL, &key, val, NULL );
+    }
+}
+
+
+
+////////////////////////////
+// Scheduling Logic Helpers   
+
+static void __noinline switch_to_scx_cmap_checked( struct task_struct *p ){
+    char *cgrp_path;
+    cgrp_path = get_task_schedcgroup_path( p );
+    if ( cgrp_path ) {
+        dbg("[init_task][switch_to_scx] got cgroup path task %d - %s cgroup %s ", 
+             p->pid, 
+             p->comm, 
+             cgrp_path
+        );
+    }
+    char *stripped = get_last_node( cgrp_path, MAX_PATH );
+    if ( stripped ) {
+        dbg("[init_task][switch_to_scx] stripped last node cgroup name task %d - %s cgroup %s ", 
+             p->pid, 
+             p->comm, 
+             stripped
+        );
+    }
+    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs( stripped, MAX_PATH );
+    if ( cgrp_chrs ){
+        scx_bpf_switch_to_scx( p );
+        info("[init_task][switch_to_scx] switched to scx task %d - %s cgroup %s ", 
+             p->pid, 
+             p->comm, 
+             stripped
+        );
     }
 }
 
