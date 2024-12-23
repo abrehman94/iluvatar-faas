@@ -31,7 +31,11 @@ u32 tsk_sw_cnt = 0;
 // cpu would be selected by the cpu returned
 s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags) {
     info("[callback][select_cpu] prev_cpu %d task %d - %s", prev_cpu, p->pid, p->comm);
-    scx_bpf_dispatch( p, SCX_DSQ_LOCAL, 80*NSEC_PER_MSEC, 0 );
+
+    if( (tsk_sw_cnt = (tsk_sw_cnt + 1) % tsk_per_cpu) == 0 ) {
+      rr_cpu = (rr_cpu + 1) % MAX_CPUS;
+    }
+    scx_bpf_dispatch( p, SCX_DSQ_LOCAL_ON | rr_cpu, 80*NSEC_PER_MSEC, 0 );
 
     if( (tsk_sw_cnt = (tsk_sw_cnt + 1) % tsk_per_cpu) == 0 ) {
       rr_cpu = (rr_cpu + 1) % MAX_CPUS;
