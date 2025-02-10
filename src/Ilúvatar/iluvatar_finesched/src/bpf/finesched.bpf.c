@@ -17,12 +17,14 @@ char _license[] SEC("license") = "GPL";
 //////////////////////////////
 // Global Data for bpf scheduler  
 
+bool cpu_boost_config = false;
 u32 enqueue_config = SCHED_CONFIG_PRIO_DSQ;
 
 SchedGroupChrs_t empty_sched_chrs = {0};
 
 private(FINESCHED) struct bpf_cpumask __kptr *cores_inact_grp_mask;
 u8 cores_inact_grp[] = { 0, 1, 2, 3,  4, 5, 6, 7,  8, 9, 10, 11 };
+//u8 cores_inact_grp[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 };
 
 private(FINESCHED) struct bpf_cpumask __kptr *cpumask_node0;
 u8 cores_node0[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 };
@@ -151,8 +153,10 @@ static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer) {
 
         poll_update_pid_gid_cache();
     }
-
-    boost_cpus();
+    
+    if( cpu_boost_config ){
+        boost_cpus();
+    }
 
     /* Re-arm the timer */
     err = bpf_timer_start(timer, HEARTBEAT_INTERVAL, 0);
@@ -212,6 +216,8 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
         return cpu;
     }
 
+    return prev_cpu;
+
 out_no_dispatch:
     info("[warn][select_cpu] no schedcgroup found for task %d - %s", p->pid, p->comm);
     return prev_cpu;
@@ -261,17 +267,7 @@ out_no_dispatch:
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
     // info("[dispatch] on %d", cpu);
 
-    scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
-
-    scx_bpf_consume(SCX_DSQ_GLOBAL);
-    scx_bpf_consume(DSQ_INACTIVE_GRPS_N1);
-
-    if (cores_inact_grp_mask && bpf_cpumask_test_cpu(cpu, cores_inact_grp_mask)) {
-        if (scx_bpf_consume(DSQ_INACTIVE_GRPS_N0)) {
-            info("[info][dispatch] consumed a task from inactive groups DSQ on cpu %d", cpu);
-        }
-    }
-
+    // scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
     struct cpu_ctx *cctx = try_lookup_cpu_ctx(cpu);
     if (!cctx) {
         error("[dispatch] cctx not found for cpu %d ", cpu);
@@ -281,6 +277,20 @@ void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
     if (cctx->prio_dsqid != -1 && cctx->prio_dsqid != 0) {
         if (scx_bpf_consume(cctx->prio_dsqid)) {
             info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
+        }else if ( (s32)(cctx->prio_dsqid -1) >= DSQ_PRIO_GRPS_START && scx_bpf_consume(cctx->prio_dsqid - 1) ) {
+            info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
+        }else if ( (s32)(cctx->prio_dsqid -2) >= DSQ_PRIO_GRPS_START && scx_bpf_consume(cctx->prio_dsqid - 2) ) {
+            info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
+        }else if ( (s32)(cctx->prio_dsqid -3) >= DSQ_PRIO_GRPS_START && scx_bpf_consume(cctx->prio_dsqid - 3) ) {
+            info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
+        }
+    }
+
+    scx_bpf_consume(SCX_DSQ_GLOBAL);
+    scx_bpf_consume(DSQ_INACTIVE_GRPS_N1);
+    if (cores_inact_grp_mask && bpf_cpumask_test_cpu(cpu, cores_inact_grp_mask)) {
+        if (scx_bpf_consume(DSQ_INACTIVE_GRPS_N0)) {
+            info("[info][dispatch] consumed a task from inactive groups DSQ on cpu %d", cpu);
         }
     }
 }

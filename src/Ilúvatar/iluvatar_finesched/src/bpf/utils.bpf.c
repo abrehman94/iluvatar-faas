@@ -477,7 +477,7 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
 
     SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(cgrp_chrs->gid);
     if (sched_chrs == NULL) {
-        error("[enqueue_prio_dsq] no sched_chrs found for task %d - %s", p->pid, p->comm);
+        error("[enqueue_prio_dsq] no sched_chrs found for task %d - %s gid: %d ", p->pid, p->comm, cgrp_chrs->gid);
         goto out_no_enqueue;
     }
     
@@ -497,8 +497,11 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
     
     // first time task is enqueued it's prioritized based on actual time it
     // came in - factor of 1000 further emphasizes the difference
-    if (tctx->invoke_time == 0) {
+    if (tctx->invoke_time != cgrp_chrs->invoke_ts) {
         tctx->invoke_time = cgrp_chrs->invoke_ts;
+        // Bug: using vtime from invoke_ts causes myocytes within a second to
+        // overlap 
+        //tctx->vtime = cgrp_chrs->invoke_ts; // with an extra gap for 1000 units
         tctx->vtime = bpf_ktime_get_ns() * 1000; // with an extra gap for 1000 units
     }
     
