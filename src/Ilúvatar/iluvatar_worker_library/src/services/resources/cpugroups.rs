@@ -29,6 +29,8 @@ lazy_static::lazy_static! {
   pub static ref CPU_GROUP_WORKER_TID: TransactionId = "CPUGroupMonitor".to_string();
 }
 
+const INVOKE_GAP: u64 = 1000; // 1 second
+
 fn fqdn_to_name(fqdn: &str) -> String {
     let n = fqdn.split(".").nth(0).unwrap();
     let n = &n[0..n.len()-2];
@@ -266,7 +268,9 @@ impl CpuResourceTrackerT for CpuGroupsResourceTracker {
         };
 
         debug!(tid=%_tid, _cgroup_id=%_cgroup_id, "[finesched] marking cgroup_id for given tid in cmap (cgroup_id,gid) as done(-1)");
-        self.pgs.update_cgroup_chrs( -1, 0, _cgroup_id );
+        let ts = self.unix_clock.now_str().unwrap();
+        let tsp = ts.parse::<u64>().unwrap_or( 0 ) + INVOKE_GAP;
+        self.pgs.update_cgroup_chrs( gid, tsp, _cgroup_id );
         self.return_group(gid);
         self.tid_gid_map.remove( _tid );
     }
