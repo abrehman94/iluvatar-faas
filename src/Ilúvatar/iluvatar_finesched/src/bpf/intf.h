@@ -74,11 +74,12 @@ struct cpumask {
 // Group Related Definitions 
 typedef s32 SchedGroupID;
 
-// Group Status Structure
-typedef struct SchedGroupStatus {
-  char cur_cgroup_prefix[MAX_PATH]; // cgroup prefix of the
-  u32 task_count;
-} SchedGroupStatus_t;
+enum QEnqPrioType {
+  QEnqPrioUndef = 0,
+  QEnqPrioArrival,
+  QEnqPrioSRPT,
+  QEnqPrioINOVC,
+};
 
 // Group Characteristics Structure
 typedef struct SchedGroupChrs {
@@ -86,9 +87,9 @@ typedef struct SchedGroupChrs {
   struct cpumask corebitmask;    // bitmask for the cores that belong
                                  // to this group
   u64 timeslice;                 // in ms
+  u32 fifo;                      // single queue should be fifo or not
+  u32 prio;                      // enqueue priority type:  
   u32 perf;                      // the perf setting for the set of cores of this group
-
-  SchedGroupStatus_t status;
 
 } SchedGroupChrs_t;
 
