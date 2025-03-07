@@ -6,7 +6,6 @@ use crate::GMAP;
 
 use crate::CgroupChrs;
 use crate::SchedGroupChrs;
-use crate::SchedGroupStatus;
 use crate::SchedGroupID;
 
 // an arc reference can be shared among multiple threads 

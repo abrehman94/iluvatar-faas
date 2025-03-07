@@ -20,6 +20,8 @@ use iluvatar_rpc::rpc::{CleanResponse, InvokeResponse, StatusResponse};
 use iluvatar_finesched::load_bpf_scheduler_async;
 use iluvatar_finesched::PreAllocatedGroups;
 use iluvatar_finesched::SharedMapsSafe;
+use iluvatar_finesched::PreallocGroupsConfig;
+use iluvatar_finesched::SchedGroup;
 
 use std::sync::Arc;
 use std::any::Any;
@@ -42,14 +44,18 @@ pub async fn create_worker(worker_config: WorkerConfig, tid: &TransactionId) -> 
         // TODO: improve this logic to allow for dynamic group creation
         let gs = match fconfig.preallocated_groups.clone() {
             Some(gs) => gs,
-            None => vec![
-                (0..4).into_iter().collect(),
-                (4..8).into_iter().collect(),
-                (8..24).into_iter().collect(),
-                (24..48).into_iter().collect(),
-            ],
+            None => PreallocGroupsConfig{
+                groups: vec![
+                    SchedGroup{
+                        cores: vec![0,1,2,3],
+                        ts: 20,
+                        fifo: 0,
+                        prio: "arrival".to_string()
+                    }
+                ]
+            },
         };
-        pa = Some( Arc::new(PreAllocatedGroups::new( sm.clone(), gs, fconfig.preallocated_groups_ts.clone().unwrap() )) ); // that's it! it should create preallocated
+        pa = Some( Arc::new( PreAllocatedGroups::new( sm.clone(), gs ) ) ); // that's it! it should create preallocated
        
         load_bpf_scheduler_async( fconfig.bpf_verbose );
     }else{

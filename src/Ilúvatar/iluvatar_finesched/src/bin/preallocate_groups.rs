@@ -5,9 +5,10 @@ use iluvatar_finesched::SharedMapsSafe;
 use iluvatar_finesched::GMAP;
 use iluvatar_finesched::default_cpumask;
 use iluvatar_finesched::SchedGroupChrs;
-use iluvatar_finesched::SchedGroupStatus;
 use iluvatar_finesched::SchedGroupID;
 use iluvatar_finesched::PreAllocatedGroups;
+use iluvatar_finesched::PreallocGroupsConfig;
+use iluvatar_finesched::SchedGroup;
 
 fn main() {
     
@@ -15,14 +16,18 @@ fn main() {
     let sm = Arc::new(SharedMapsSafe::new());
 
     // victor machines: [0-24), [24-48)
-    let gs: Vec<Vec<u32>> = vec![
-        (0..4).into_iter().collect(),
-        (4..8).into_iter().collect(),
-        (8..24).into_iter().collect(),
-        (24..48).into_iter().collect(),
-    ];
-    let ts: Vec<u64> = vec![100, 200, 300, 400];
-    let pa = PreAllocatedGroups::new( sm.clone(), gs, ts ); // that's it! it should create preallocated
+    let gs = PreallocGroupsConfig{
+        groups: vec![
+            SchedGroup{
+                cores: vec![0,1,2,3],
+                ts: 20,
+                fifo: 0,
+                prio: "arrival".to_string()
+            }
+        ]
+    };
+
+    let pa = PreAllocatedGroups::new( sm.clone(), gs ); // that's it! it should create preallocated
                                                         // groups in shared map 
                                                         
     // let's verify it's created! 

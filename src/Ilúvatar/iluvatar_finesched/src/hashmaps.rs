@@ -17,7 +17,6 @@ use libbpf_rs::MapCore;
 
 use crate::CgroupChrs;
 use crate::SchedGroupChrs;
-use crate::SchedGroupStatus;
 use crate::SchedGroupID;
 
 use crate::bpf_intf::consts_MAX_PATH;

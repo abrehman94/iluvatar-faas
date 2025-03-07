@@ -35,7 +35,6 @@ pub use bpf_skel::bpf_fsched;
 pub mod bpf_intf;
 pub use bpf_intf::CgroupChrs;
 pub use bpf_intf::SchedGroupChrs;
-pub use bpf_intf::SchedGroupStatus;
 pub use bpf_intf::SchedGroupID;
 pub use bpf_intf::consts_RESERVED_GID_SWITCH_BACK;
 
@@ -44,6 +43,9 @@ pub use sched::load_bpf_scheduler_async;
 
 mod groups;
 pub use groups::PreAllocatedGroups;
+pub use groups::PreallocGroupsConfig;
+pub use groups::SchedGroup;
 
 mod utils;
 pub use utils::default_cpumask;
+

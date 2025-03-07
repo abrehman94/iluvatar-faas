@@ -73,8 +73,8 @@ impl CpuGroupsResourceTracker {
         debug!( tid=%tid, total_group_count=%pgs.total_groups(), "[finesched] preallocated groups" );
         let gsem = Arc::new(Semaphore::new(pgs.total_groups()*group_buffer as usize));
         let gu = DashMap::new();
-        pgs.groups().iter().for_each(|ent| {
-            gu.insert(*ent.key(), 0);
+        (0..pgs.total_groups()).for_each(|i| {
+            gu.insert(i as SchedGroupID, 0);
         });
         gu.insert(consts_RESERVED_GID_SWITCH_BACK as SchedGroupID, 0);
 

@@ -10,6 +10,9 @@ use iluvatar_library::{
     types::{ComputeEnum, MemSizeMb},
     utils::port_utils::Port,
 };
+
+use iluvatar_finesched::PreallocGroupsConfig;
+
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -164,17 +167,17 @@ pub struct FunctionLimits {
     pub timeout_sec: u64,
 }
 
+
+
 #[derive(Debug, Deserialize, Default)]
 /// Fine scheduling configuration
 pub struct FineSchedConfig {
     
     /// core group configuration to preallocate 
-    pub preallocated_groups: Option<Vec<Vec<u32>>>,
-    pub preallocated_groups_ts: Option<Vec<u64>>,
+    pub preallocated_groups: Option<PreallocGroupsConfig>,
 
     /// Boolean to be able to see all options in config  
     pub allocation_type_rr: bool,
-
 
     /// "e2e_buckets":  [ [0, 1000],[0,1,2], [1000, 2000],[2,3,4],  [2000, 1000000],[8,9]  ],
     ///                   [0, 1000] is time of the bucket in ms, [0,1,2] is the gids that would be assigned  

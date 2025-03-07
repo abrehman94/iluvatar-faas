@@ -5,7 +5,6 @@ use iluvatar_finesched::SharedMapsSafe;
 use iluvatar_finesched::default_cpumask;
 use iluvatar_finesched::CgroupChrs;
 use iluvatar_finesched::SchedGroupChrs;
-use iluvatar_finesched::SchedGroupStatus;
 
 fn main() {
     let sm = SharedMapsSafe::new();
@@ -23,11 +22,9 @@ fn main() {
             id          : 1,
             corebitmask : default_cpumask(),
             timeslice   : 1,
+            fifo        : 0,
+            prio        : 1, 
             perf        : 3,
-            status      : SchedGroupStatus {
-                cur_cgroup_prefix: [0; consts_MAX_PATH as usize],
-                task_count: 0,
-            },
         },
     );
 
