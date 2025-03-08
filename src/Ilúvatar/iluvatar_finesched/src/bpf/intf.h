@@ -78,7 +78,7 @@ enum QEnqPrioType {
   QEnqPrioUndef = 0,
   QEnqPrioArrival,
   QEnqPrioSRPT,
-  QEnqPrioINOVC,
+  QEnqPrioINVOC,
 };
 
 // Group Characteristics Structure
@@ -101,8 +101,9 @@ typedef struct CgroupStatus {
 
 typedef struct CgroupChrs {
   SchedGroupID gid;
-  u64 invoke_ts;                 // timestamp of the invocation 
+  u64 invoke_ts;                 //  invocation 
+  u64 arrival_ts;                //  arrival 
+  u64 workerdur;                 //  execution time  
 } CgroupChrs_t;
-
 
 #endif // __INTF_H

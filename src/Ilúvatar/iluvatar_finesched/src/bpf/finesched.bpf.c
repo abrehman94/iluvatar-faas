@@ -64,6 +64,7 @@ struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
 struct task_ctx {
    
     bool active_q;
+    bool running;
 
     // invoke time from CgroupChrs_t
     u64 invoke_time; 
@@ -75,6 +76,9 @@ struct task_ctx {
 	u64 act_time;
 
 	u64 vtime;
+
+	u64 ts_start;
+    u64 tconsumed;
 };
 
 
@@ -300,6 +304,30 @@ void BPF_STRUCT_OPS(finesched_set_cpumask, struct task_struct *p, const struct c
          p->comm, cpumask);
 }
 
+void BPF_STRUCT_OPS(finesched_running, struct task_struct *p) {
+
+    struct task_ctx *tctx;
+    tctx = try_lookup_task_ctx( p );
+    stats_task_start( tctx );
+
+}
+
+void BPF_STRUCT_OPS(finesched_stopping, struct task_struct *p, bool runnable) {
+
+    struct task_ctx *tctx;
+    tctx = try_lookup_task_ctx( p );
+    stats_task_stop( tctx );
+
+}
+
+void BPF_STRUCT_OPS(finesched_quiescent, struct task_struct *p, u64 deq_flags) {
+
+    struct task_ctx *tctx;
+    tctx = try_lookup_task_ctx( p );
+    stats_task_stop( tctx );
+
+}
+
 // Task @p is being created.
 //    called when task is being forked
 //    args has
@@ -383,6 +411,9 @@ SCX_OPS_DEFINE(finesched_ops,
        .enqueue     = (void *)finesched_enqueue,
        .dispatch    = (void *)finesched_dispatch,
        .set_cpumask = (void *)finesched_set_cpumask,
+       .running     = (void *)finesched_running,
+       .stopping    = (void *)finesched_stopping,
+       .quiescent   = (void *)finesched_quiescent,
        .init_task   = (void *)finesched_init_task,
        .exit_task   = (void *)finesched_exit_task,
        .init        = (void *)finesched_init,

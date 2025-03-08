@@ -494,24 +494,47 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
     }
 
     tctx->active_q = true;
-    
-    // first time task is enqueued it's prioritized based on actual time it
-    // came in - factor of 1000 further emphasizes the difference
-    if (tctx->invoke_time != cgrp_chrs->invoke_ts) {
-        tctx->invoke_time = cgrp_chrs->invoke_ts;
-        // Bug: using vtime from invoke_ts causes myocytes within a second to
-        // overlap 
-        //tctx->vtime = cgrp_chrs->invoke_ts; // with an extra gap for 1000 units
-        tctx->vtime = bpf_ktime_get_ns() * 1000; // with an extra gap for 1000 units
-    }
-    
-    // each time it's enqueued we move forward in vtime 
-    tctx->vtime += 1;
-    u64 vtime = tctx->vtime;
+  
 
     int dsqid = DSQ_PRIO_GRPS_START + sched_chrs->id;
 
-    scx_bpf_dispatch_vtime(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, vtime, 0);
+    // TODO
+      // sched_chrs->fifo
+      // sched_chrs->prio
+
+    // info( "[enqueue_prio_dsq][sched_chrs] fifo: %d prio: %d",
+    //      sched_chrs->fifo, sched_chrs->prio );
+
+    info( "[enqueue_prio_dsq][task_stats] consumed: %d",
+         tctx->tconsumed );
+    tctx->tconsumed = 0;
+
+    u64 vtime = 0;
+
+    if (sched_chrs->fifo) {
+        scx_bpf_dispatch(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, 0);
+    } else if (sched_chrs->prio == QEnqPrioINVOC) {
+        // first time task is enqueued it's prioritized based on actual time it
+        // came in - factor of 1000 further emphasizes the difference
+        if (tctx->invoke_time != cgrp_chrs->invoke_ts) {
+            tctx->invoke_time = cgrp_chrs->invoke_ts;
+            // Bug: using vtime from invoke_ts causes myocytes within a second to
+            // overlap 
+            //tctx->vtime = cgrp_chrs->invoke_ts; // with an extra gap for 1000 units
+            tctx->vtime = bpf_ktime_get_ns() * 1000; // with an extra gap for 1000 units
+        }
+
+        // each time it's enqueued we move forward in vtime 
+        tctx->vtime += 1;
+
+        vtime = tctx->vtime;
+        scx_bpf_dispatch_vtime(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, vtime, 0);
+    } else {
+        scx_bpf_dispatch(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, 0);
+        error("[enqueue_prio_dsq][sched_chrs] bad priority forcing fifo: %d prio: %d", sched_chrs->fifo,
+              sched_chrs->prio);
+    }
+
     info("[enqueue_prio_dsq] dispatched task %d - %s to dsq %d invoke_time: %lld act_time: %lld "
          "vtime: %lld ts: %lld",
          p->pid, p->comm, dsqid, tctx->invoke_time, tctx->act_time, vtime, sched_chrs->timeslice);
@@ -574,6 +597,27 @@ static void __noinline boost_cpus() {
     }
 }
 
+////////
+// stats capturing 
+
+
+static void __always_inline stats_task_start( struct task_ctx *tctx ) {
+    if ( tctx ) {
+        if( !tctx->running ){
+          tctx->ts_start = bpf_ktime_get_ns();
+          tctx->running = true;
+        }
+    }
+}
+
+static void __always_inline stats_task_stop( struct task_ctx *tctx ) {
+    if( tctx ) {
+        if( tctx->running ){
+          tctx->tconsumed += bpf_ktime_get_ns() - tctx->ts_start;
+          tctx->running = false;
+        }
+    }
+}
 
 #endif // __UTILS_F
 
