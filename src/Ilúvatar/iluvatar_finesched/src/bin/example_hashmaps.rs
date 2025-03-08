@@ -11,7 +11,7 @@ fn main() {
     let mut sm = SharedMaps::new();
     let cMap: &mut dyn CMAP = &mut sm;
 
-    cMap.insert("system.init/cgroup1", &CgroupChrs { gid: 3, invoke_ts: 0 });
+    cMap.insert("system.init/cgroup1", &CgroupChrs { gid: 3, invoke_ts: 0, arrival_ts: 0, workerdur: 0 });
     let cval = cMap.lookup("system.init/cgroup1");
     println!("lookedup cval: {:?}", cval);
 

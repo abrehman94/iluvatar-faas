@@ -289,7 +289,8 @@ impl CpuResourceTrackerT for CpuGroupsResourceTracker {
                 } else if self.config.allocation_type_static_sel {
                     gid = self.get_available_group_fqdn_based( reg.fqdn.as_str() );
                 } else {
-                    error!(tid=%_tid, "[finesched] No allocation type specified in config");
+                    // error!(tid=%_tid, "[finesched] No allocation type specified in config");
+                    gid = Some(0);
                 }
                 if let Some(gid) = gid {
                     self.tid_gid_map.insert( _tid.clone(), gid );

@@ -173,7 +173,14 @@ pub struct FunctionLimits {
 /// Fine scheduling configuration
 pub struct FineSchedConfig {
     
-    /// core group configuration to preallocate 
+    /// PreallocGroupsConfig 
+    ///     schedgroup
+    ///         sched domain - single queue 
+    ///             fifo 
+    ///             prio queue 
+    ///                 arrival
+    ///                 srpt
+    ///                 invoc
     pub preallocated_groups: Option<PreallocGroupsConfig>,
 
     /// Boolean to be able to see all options in config  

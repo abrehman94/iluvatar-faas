@@ -9,7 +9,7 @@ use iluvatar_finesched::SchedGroupChrs;
 fn main() {
     let sm = SharedMapsSafe::new();
 
-    sm.cmap_insert("system.init/cgroup1", &CgroupChrs { gid: 3, invoke_ts: 0 });
+    sm.cmap_insert("system.init/cgroup1", &CgroupChrs { gid: 3, invoke_ts: 0, arrival_ts: 0, workerdur: 0 });
     let cval = sm.cmap_lookup("system.init/cgroup1");
     println!("lookedup cval: {:?}", cval);
 
