@@ -243,7 +243,7 @@ impl CpuGroupsResourceTracker {
 
 impl CpuResourceTrackerT for CpuGroupsResourceTracker {
 
-    fn notify_cgroup_id( &self, _cgroup_id: &str, _tid: &TransactionId, ) {
+    fn notify_cgroup_id( &self, _cgroup_id: &str, _tid: &TransactionId, fqdn: &str ) {
         let gid = match self.tid_gid_map.get( _tid ) {
             Some(ent) => *ent.value(),
             None => {
@@ -254,8 +254,11 @@ impl CpuResourceTrackerT for CpuGroupsResourceTracker {
         let ts = self.unix_clock.now_str().unwrap();
         let tsp = ts.parse::<u64>().unwrap_or( 0 );
         debug!(gid=%gid, tid=%_tid, _cgroup_id=%_cgroup_id, ts=%ts, tsp=%tsp, "[finesched] inserting cgroup_id for given tid into cmap (cgroup_id,gid)");
-
-        self.pgs.update_cgroup_chrs( gid, tsp, _cgroup_id );
+        let dur = self.cmap.get_exec_time( fqdn );
+        let dur = (dur*1000.0) as u64;
+        
+        // TODO: lookup arrival time and push 
+        self.pgs.update_cgroup_chrs( gid, tsp, dur, 0, _cgroup_id );
     }
 
     fn notify_cgroup_id_done( &self, _cgroup_id: &str, _tid: &TransactionId, ) {
@@ -268,9 +271,6 @@ impl CpuResourceTrackerT for CpuGroupsResourceTracker {
         };
 
         debug!(tid=%_tid, _cgroup_id=%_cgroup_id, "[finesched] marking cgroup_id for given tid in cmap (cgroup_id,gid) as done(-1)");
-        let ts = self.unix_clock.now_str().unwrap();
-        let tsp = ts.parse::<u64>().unwrap_or( 0 ) + INVOKE_GAP;
-        self.pgs.update_cgroup_chrs( gid, tsp, _cgroup_id );
         self.return_group(gid);
         self.tid_gid_map.remove( _tid );
     }

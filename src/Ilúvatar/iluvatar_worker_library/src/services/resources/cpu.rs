@@ -15,7 +15,7 @@ lazy_static::lazy_static! {
 
 pub trait CpuResourceTrackerT {
     fn try_acquire_cores( &self, reg: &Arc<RegisteredFunction>, _tid: &TransactionId, ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::TryAcquireError>;
-    fn notify_cgroup_id( &self, _cgroup_id: &str, _tid: &TransactionId, ){
+    fn notify_cgroup_id( &self, _cgroup_id: &str, _tid: &TransactionId, fqdn: &str ){
         debug!(_cgroup_id=%_cgroup_id, _tid=%_tid, "[finesched] cgroup assigned for the invocation");
     } 
     fn notify_cgroup_id_done( &self, _cgroup_id: &str, _tid: &TransactionId, ){

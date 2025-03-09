@@ -346,7 +346,7 @@ impl CpuQueueingInvoker {
             },
             EventualItem::Now(n) => n?,
         };
-        self.cpu.notify_cgroup_id( ctr_lock.container.cgroup_id(), tid );
+        self.cpu.notify_cgroup_id( ctr_lock.container.cgroup_id(), tid, reg.fqdn.as_str() );
         self.running.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (data, duration, compute_type, state) = invoke_on_container(
             reg,

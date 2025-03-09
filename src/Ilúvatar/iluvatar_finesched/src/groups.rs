@@ -49,6 +49,7 @@ fn enqprio_name_to_val(prio: &str) -> u32 {
     match prio {
         "arrival" => QEnqPrioType_QEnqPrioArrival,
         "srpt" => QEnqPrioType_QEnqPrioSRPT,
+        "shrtdur" => QEnqPrioType_QEnqPrioSHRTDUR,
         "invoc" => QEnqPrioType_QEnqPrioINVOC,
         _ => QEnqPrioType_QEnqPrioUndef,
     }
@@ -85,13 +86,13 @@ impl PreAllocatedGroups {
         }
     }
 
-    pub fn update_cgroup_chrs(&self, gid: i32, ts: u64, cgroup_id: &str) {
+    pub fn update_cgroup_chrs(&self, gid: i32, ts: u64, dur: u64, arriv: u64, cgroup_id: &str) {
         // update cMap cgroup_id -> gid 
         let cval = CgroupChrs {
             gid,
             invoke_ts: ts,
-            arrival_ts: 0, 
-            workerdur: 0,
+            arrival_ts: arriv, 
+            workerdur: dur,
         };
         self.cid_map.insert(cgroup_id.to_string(), cval);
         self.sm.cmap_insert(cgroup_id, &cval);
