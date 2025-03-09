@@ -78,6 +78,7 @@ enum QEnqPrioType {
   QEnqPrioUndef = 0,
   QEnqPrioArrival,
   QEnqPrioSRPT,
+  QEnqPrioSHRTDUR,
   QEnqPrioINVOC,
 };
 
