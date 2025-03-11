@@ -50,6 +50,8 @@ fn enqprio_name_to_val(prio: &str) -> u32 {
         "arrival" => QEnqPrioType_QEnqPrioArrival,
         "srpt" => QEnqPrioType_QEnqPrioSRPT,
         "shrtdur" => QEnqPrioType_QEnqPrioSHRTDUR,
+        "shrtduruw" => QEnqPrioType_QEnqPrioSHRTDURUW,
+        "plain" => QEnqPrioType_QEnqPrioPLAIN,
         "invoc" => QEnqPrioType_QEnqPrioINVOC,
         _ => QEnqPrioType_QEnqPrioUndef,
     }

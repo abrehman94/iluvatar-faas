@@ -455,9 +455,22 @@ out_no_alloc:
     return -1;
 }
 
+static u64 __always_inline prio_plain_tconsumed(u64 cvtime, u64 tconsumed) {
+    u64 vtime = cvtime + tconsumed;
+    return vtime;
+}
+
 static u64 __always_inline prio_invoke_time(u64 cvtime, u64 invoke, u64 tconsumed) {
     invoke = invoke == 0 ? 10 : invoke;
     u64 vtime = cvtime + (tconsumed * invoke) / NSEC_PER_MSEC;
+    return vtime;
+}
+
+static u64 __always_inline prio_short_duration_unweighted(u64 cvtime, u64 dur, u64 tconsumed ) {
+    // tconsumed is in ns and workerdur is also in ms
+    // 1000000000*1000000 - therefore we dividd by 1000000000 - to get back into ms
+    dur = dur == 0 ? 10 : dur;
+    u64 vtime = cvtime +  dur*NSEC_PER_USEC;
     return vtime;
 }
 
@@ -559,6 +572,16 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
 
             tctx->vtime = prio_short_duration( tctx->vtime, cgrp_chrs->workerdur, tctx->tconsumed );
             info("[enqueue_prio_dsq][shrtdur] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur, tctx->vtime);
+
+        } else if (sched_chrs->prio == QEnqPrioSHRTDURUW) {
+
+            tctx->vtime = prio_short_duration_unweighted( tctx->vtime, cgrp_chrs->workerdur, tctx->tconsumed );
+            info("[enqueue_prio_dsq][shrtduruw] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur, tctx->vtime);
+
+        } else if (sched_chrs->prio == QEnqPrioPLAIN) {
+
+            tctx->vtime = prio_plain_tconsumed( tctx->vtime, tctx->tconsumed );
+            info("[enqueue_prio_dsq][plain] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur, tctx->vtime);
 
         } else {
             error("[enqueue_prio_dsq][sched_chrs] bad priority sched_chrs->prio: %d", sched_chrs->prio);

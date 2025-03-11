@@ -79,7 +79,9 @@ enum QEnqPrioType {
   QEnqPrioArrival,
   QEnqPrioSRPT,
   QEnqPrioSHRTDUR,
+  QEnqPrioSHRTDURUW,
   QEnqPrioINVOC,
+  QEnqPrioPLAIN,
 };
 
 // Group Characteristics Structure
