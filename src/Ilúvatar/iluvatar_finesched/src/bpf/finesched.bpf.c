@@ -38,6 +38,17 @@ u8 cores_node1[] = { 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38,
 struct cpu_ctx {
 	u64 prio_dsqid;
     u64 last_vtime;
+
+    // idle time tracking 
+    u64 idle_start;
+    u64 idle_time;
+
+    
+    // utilization collection  
+    u64 last_calc_time;
+    u64 prev_idle_time;
+    u64 util;
+    u64 avg_util;
 };
 
 struct {
@@ -146,9 +157,10 @@ struct {
  * Heartbeat scheduler timer callback.
  */
 static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer) {
+    s32 cpu = bpf_get_smp_processor_id();
     int err = 0;
 
-    info("[callback][timer] heartbeat timer fired");
+    info("[callback][timer] heartbeat timer fired on cpu %d", cpu);
 
     if (enqueue_config == SCHED_CONFIG_PRIO_DSQ) {
 
@@ -158,7 +170,9 @@ static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer) {
 
         poll_update_pid_gid_cache();
     }
-    
+   
+    stats_update_global();
+
     if( cpu_boost_config ){
         boost_cpus();
     }
@@ -360,6 +374,29 @@ void BPF_STRUCT_OPS(finesched_exit_task, struct task_struct *p, struct scx_exit_
     info("[exit_task] exiting task %d - %s", p->pid, p->comm);
 }
 
+// CPU is entering idle state if idle is true. 
+void BPF_STRUCT_OPS(finesched_update_idle, s32 cpu, bool idle)
+{
+    struct cpu_ctx *cctx = try_lookup_cpu_ctx(cpu);
+    if (!cctx) {
+        error("[update_idle] cctx not found for cpu %d ", cpu);
+        return;
+    }
+
+    if (idle) {
+        cctx->idle_start = bpf_ktime_get_ns();
+    } else {
+        u64 old_clk = cctx->idle_start;
+        if (old_clk != 0) {
+            u64 duration = bpf_ktime_get_ns() - old_clk;
+            bool ret = __sync_bool_compare_and_swap(&cctx->idle_start, old_clk, 0);
+            if (ret) {
+                cctx->idle_time += duration;
+            }
+        }
+    }
+}
+
 // Initialize the scheduling class.
 s32 BPF_STRUCT_OPS_SLEEPABLE(finesched_init)
 {
@@ -415,6 +452,7 @@ SCX_OPS_DEFINE(finesched_ops,
        .running     = (void *)finesched_running,
        .stopping    = (void *)finesched_stopping,
        .quiescent   = (void *)finesched_quiescent,
+       .update_idle = (void *)finesched_update_idle,
        .init_task   = (void *)finesched_init_task,
        .exit_task   = (void *)finesched_exit_task,
        .init        = (void *)finesched_init,

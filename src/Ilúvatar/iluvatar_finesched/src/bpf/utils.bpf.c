@@ -680,6 +680,77 @@ static void __always_inline stats_task_stop( struct task_ctx *tctx ) {
     }
 }
 
+// Credits to Changwoo author of scx_lavd 
+static u64 calc_avg(u64 old_val, u64 new_val)
+{
+	/*
+	 * Calculate the exponential weighted moving average (EWMA).
+	 *  - EWMA = (0.75 * old) + (0.25 * new)
+	 */
+	return (old_val - (old_val >> 2)) + (new_val >> 2);
+}
+
+static void __always_inline stats_update_percpu_util(struct cpu_ctx *c) {
+    u64 now = bpf_ktime_get_ns();
+    if (!c) {
+        return;
+    }
+
+
+    // update idle time
+    u64 old_clk = c->idle_start;
+    if (old_clk != 0) {
+        bool ret = __sync_bool_compare_and_swap(&c->idle_start, old_clk, now);
+        if (ret) {
+            c->idle_time += now - old_clk;
+        }
+    }
+
+    u64 idle_dur = c->idle_time - c->prev_idle_time;
+    c->prev_idle_time = c->idle_time;
+
+    u64 wclk = now - c->last_calc_time;
+    c->last_calc_time = now;
+
+    u64 compute = wclk - idle_dur;
+    u64 util; 
+    util = (compute * MAX_CPU_UTIL) / wclk;
+    if( util > MAX_CPU_UTIL){
+        // drop bad reading it happens during init only
+        return;
+    }
+    c->util = util;
+    c->avg_util = calc_avg( c->avg_util, c->util );
+}
+
+static void __noinline stats_update_global() {
+
+    s32 cpu;
+    u64 util = 0;
+    u64 autil = 0;
+    struct cpu_ctx *cctx = NULL;
+
+    bpf_for(cpu, 0, MAX_CPUS) {
+        // TODO: it causes contention across cores! every 200ms
+        // maybe use a lockless structure to accumulate stuff 
+          // that would have to write to shared memory on each call 
+          // this is just asking for every 200ms 
+        // trace dump is delayed because of it but the numbers are 
+        // still every 200ms 
+
+        cctx = try_lookup_cpu_ctx(cpu);
+        if (cctx) {
+            stats_update_percpu_util( cctx );
+            util += cctx->util;
+            autil += cctx->avg_util;
+        }
+    }
+
+    util /= 48;
+    autil /= 48;
+    info("[stats][cpu] across 48 cores util: %llu avg util: %llu", util, autil);
+}
+
 #endif // __UTILS_F
 
 

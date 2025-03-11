@@ -30,12 +30,14 @@ enum consts {
     MAX_PATH = 100,
     MAX_CPUS = 48,
 
+    MAX_CPU_UTIL = 1000, // 100.0%
+
     NSEC_PER_USEC = 1000ULL,
     NSEC_PER_MSEC = (1000ULL * NSEC_PER_USEC),
     NSEC_PER_SEC  = (1000ULL * NSEC_PER_MSEC),
 
-    // HEARTBEAT_INTERVAL = 200*NSEC_PER_MSEC,
-    HEARTBEAT_INTERVAL = 100 * NSEC_PER_MSEC,
+    HEARTBEAT_INTERVAL = 200*NSEC_PER_MSEC,
+    // HEARTBEAT_INTERVAL = 100 * NSEC_PER_MSEC,
 
     DSQ_INACTIVE_GRPS_N0 = 0x10, // custom DSQ on numa node 0 - custom DSQs can
                                  // be allocated on any node, if no node is
