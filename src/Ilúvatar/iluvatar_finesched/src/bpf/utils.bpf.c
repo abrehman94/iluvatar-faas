@@ -281,6 +281,7 @@ static s32 __noinline create_priority_dsqs() {
     int count;
     count = bpf_for_each_map_elem(&gMap, &callback_gmap_create_dsqs_iter, &count, 0); 
     info("[dsqs][gmap] iterated total of %d elements to create priority dsqs", count );
+    prio_dsq_count = count;
 
     return 0; 
 }
@@ -793,11 +794,44 @@ static void __always_inline stats_update_percpu_util(struct cpu_ctx *c) {
     c->avg_util = calc_avg( c->avg_util, c->util );
 }
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(key_size, sizeof(u32));
+	/* double size because verifier can't follow length calculation */
+	__uint(value_size, sizeof(u64) * DSQ_MAX_COUNT);
+	__uint(max_entries, 1);
+} dom_util_bufs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(key_size, sizeof(u32));
+	/* double size because verifier can't follow length calculation */
+	__uint(value_size, sizeof(u64) * DSQ_MAX_COUNT);
+	__uint(max_entries, 1);
+} dom_autil_bufs SEC(".maps");
+
+__always_inline void * get_dom_buf( struct bpf_map * map ){
+	u32 zero = 0;
+	void * buff = bpf_map_lookup_elem( map, &zero );
+    return buff;
+}
+
 static void __noinline stats_update_global() {
     s32 cpu;
+    u64 dsqid = 0;
     u64 util = 0;
     u64 autil = 0;
+    
+    u64* dom_util = get_dom_buf( &dom_util_bufs );
+    u64* dom_autil = get_dom_buf( &dom_autil_bufs );
+    if( !dom_util || !dom_autil ){
+        return;
+    }
+
+    SchedGroupID gid = 0;
     struct cpu_ctx *cctx = NULL;
+    SchedGroupStats_t * stats = NULL;
+    SchedGroupChrs_t * chrs = NULL;
 
     bpf_for(cpu, 0, MAX_CPUS) {
         // TODO: it causes contention across cores! every 200ms
@@ -812,6 +846,29 @@ static void __noinline stats_update_global() {
             stats_update_percpu_util( cctx );
             util += cctx->util;
             autil += cctx->avg_util;
+
+            dsqid = cctx->prio_dsqid;
+            if( dsqid != 0 ){
+                gid = dsqid - DSQ_PRIO_GRPS_START;
+            }
+            if( 0 <= gid && gid < DSQ_MAX_COUNT ){
+                dom_util[gid] += cctx->util;
+                dom_autil[gid] += cctx->avg_util;
+            }
+        }
+    }
+
+    bpf_for(gid, 0, prio_dsq_count) {
+        stats = get_schedgroup_stats( gid );
+        chrs = get_schedgroup_chrs( gid );
+        if( chrs && stats && 0 <= gid && gid < DSQ_MAX_COUNT ) {
+            dom_util[gid] /= chrs->core_count;
+            stats->util = dom_util[gid] ;
+
+            dom_autil[gid] /= chrs->core_count;
+            stats->avg_util = dom_autil[gid] ;
+
+            info( "[stats][dev] found stats for gid: %llu util: %llu autil: %llu", gid, stats->util, stats->avg_util );
         }
     }
 

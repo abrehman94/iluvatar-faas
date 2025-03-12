@@ -19,6 +19,7 @@ char _license[] SEC("license") = "GPL";
 
 bool cpu_boost_config = false;
 u32 enqueue_config = SCHED_CONFIG_PRIO_DSQ;
+u64 prio_dsq_count = 0;
 
 SchedGroupChrs_t empty_sched_chrs = {0};
 
@@ -170,7 +171,7 @@ static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer) {
     }
    
     stats_update_global();
-    capture_stats_for_gmap();
+    //capture_stats_for_gmap();
 
     if( cpu_boost_config ){
         boost_cpus();

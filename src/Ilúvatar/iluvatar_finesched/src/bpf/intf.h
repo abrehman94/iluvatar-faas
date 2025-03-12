@@ -46,7 +46,8 @@ enum consts {
                                  // for specific cores
     DSQ_INACTIVE_GRPS_N1 = 0x11, // for all cores
     DSQ_PRIO_GRPS_START  = 0x200, // starting id for prio dsqs for the sched
-                                  // grps  
+                                  // grps
+    DSQ_MAX_COUNT        = 0x20,
 
     INACTIVE_GRPS_TS = (10 * NSEC_PER_MSEC),
 
@@ -98,6 +99,7 @@ typedef struct SchedGroupChrs {
   SchedGroupID id;
   struct cpumask corebitmask;    // bitmask for the cores that belong
                                  // to this group
+  u64 core_count;                // number of cores in the group
   u64 timeslice;                 // in ms
   u32 fifo;                      // single queue should be fifo or not
   u32 prio;                      // enqueue priority type:  
