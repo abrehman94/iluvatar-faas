@@ -36,13 +36,12 @@ u8 cores_node1[] = { 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38,
  * Per-CPU context.
  */
 struct cpu_ctx {
-	u64 prio_dsqid;
+	u64 prio_dsqid; // implicitly the sched domain this cpu belongs to  
     u64 last_vtime;
 
     // idle time tracking 
     u64 idle_start;
     u64 idle_time;
-
     
     // utilization collection  
     u64 last_calc_time;
@@ -61,12 +60,11 @@ struct {
 /*
  * Return a CPU context.
  */
-struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
+__always_inline struct cpu_ctx * try_lookup_cpu_ctx(s32 cpu)
 {
 	const u32 idx = 0;
 	return bpf_map_lookup_percpu_elem(&cpu_ctx_stor, &idx, cpu);
 }
-
 
 /*
  * Per-task local storage.
@@ -172,6 +170,7 @@ static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer) {
     }
    
     stats_update_global();
+    capture_stats_for_gmap();
 
     if( cpu_boost_config ){
         boost_cpus();

@@ -6,6 +6,16 @@
 #include "intf.h"
 #include <bpf/bpf_helpers.h>
 
+// the control plane and the bpf scheduler.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_MAP_ENTRIES);
+	__uint(key_size, sizeof(SchedGroupID)); // key: Scheduling Group ID
+	__uint(value_size,
+	       sizeof(SchedGroupStats_t)); // value: Characteristics of
+		// the scheduling group
+} gStats SEC(".maps");
+
 // Group Characteristics shared map between
 // the control plane and the bpf scheduler.
 struct {

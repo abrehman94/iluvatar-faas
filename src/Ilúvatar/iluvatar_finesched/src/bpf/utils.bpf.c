@@ -150,6 +150,33 @@ static s32 __noinline populate_cpu_to_dsq() {
 
 
 ////////////////////////////
+// Map Lookup   
+
+static SchedGroupStats_t * __noinline get_schedgroup_stats( SchedGroupID gid ) {
+    if ( gid > MAX_MAP_ENTRIES) {
+        goto out_not_found;
+    }
+
+    SchedGroupStats_t lsched_stats;
+    SchedGroupStats_t *sched_stats = bpf_map_lookup_elem( &gStats, &gid );
+    if ( !sched_stats ) {
+        memset(&lsched_stats, 0, sizeof(SchedGroupStats_t));
+        bpf_map_update_elem(&gStats, (const void *)&gid, &lsched_stats, BPF_ANY);
+    }
+    sched_stats = bpf_map_lookup_elem( &gStats, &gid );
+    if ( !sched_stats ) {
+        goto out_not_found;
+    }
+
+    return sched_stats;
+
+out_not_found: 
+    dbg("[warn][gmap][get_schedgroup_stats] not found for gid: %u", gid);
+    return NULL;
+}
+
+
+////////////////////////////
 // Map Dumping Functions  
 static long callback_print_cMap_element(struct bpf_map *map, char *cgroup_name, CgroupChrs_t *val, void *data) {
     if ( cgroup_name == NULL ) {
@@ -313,7 +340,6 @@ out_no_chrs:
     info("[warn][schedgroup] no schedcgroup chrs found for task %d - %s", p->pid, p->comm);
     return NULL;
 }
-
 
 static SchedGroupChrs_t * __noinline get_schedchrs_cached( struct task_struct *p ) {
 
@@ -612,7 +638,6 @@ out_no_enqueue:
 }
 
 static long __noinline callback_gmap_kick_cpus_iter(struct bpf_map *map, const void *key, void *val, void *ctx) {
-
     if (!key || !val) {
         return 1;
     }
@@ -646,6 +671,52 @@ static void __noinline kick_prio_dsq_cpus() {
     info("[dsqs][gmap] iterated total of %d elements to kick cpus", count);
 }
 
+static long __noinline callback_gmap_capture_stats_cpus_iter(struct bpf_map *map, const void *key,
+                                                             void *val, void *ctx) {
+
+    if (!key || !val) {
+        return 1;
+    }
+
+    SchedGroupID *gid = (SchedGroupID *)key;
+    SchedGroupChrs_t *chrs = (SchedGroupChrs_t *)val;
+    SchedGroupStats_t *sched_stats = get_schedgroup_stats(*gid);
+    if (!sched_stats) {
+        return 1;
+    }
+
+    sched_stats->dsqlen = scx_bpf_dsq_nr_queued(DSQ_PRIO_GRPS_START + *gid);
+
+    // cpu_mask has more bits then cpu_max therefore it would be
+    // costly to use bit_iterator helpers here
+    s32 cpu;
+    s32 cpucount = 0;
+    struct cpu_ctx *cctx = NULL;
+    bpf_for(cpu, 0, MAX_CPUS) {
+        cctx = try_lookup_cpu_ctx(cpu);
+        if( !cctx ){
+            break;
+        }
+        if (bpf_cpumask_test_cpu(cpu, &chrs->corebitmask)) {
+            sched_stats->util += cctx->util;
+            sched_stats->avg_util += cctx->avg_util;
+            cpucount += 1;
+        }
+    }
+    if (cpucount > 0) {
+        sched_stats->util /= cpucount;
+        sched_stats->avg_util /= cpucount;
+        info("[stats][gstats] sched domain %d util: %llu avg util: %llu", *gid, sched_stats->util, sched_stats->avg_util);
+    }
+
+    return 0;
+}
+
+static void __noinline capture_stats_for_gmap() {
+    int count;
+    count = bpf_for_each_map_elem(&gMap, &callback_gmap_capture_stats_cpus_iter, &count, 0);
+    info("[dsqs][gmap][gStats] iterated total of %d elements to capture stats", count);
+}
 
 static void __noinline boost_cpus() {
     u32 cpu;
@@ -696,7 +767,6 @@ static void __always_inline stats_update_percpu_util(struct cpu_ctx *c) {
         return;
     }
 
-
     // update idle time
     u64 old_clk = c->idle_start;
     if (old_clk != 0) {
@@ -724,7 +794,6 @@ static void __always_inline stats_update_percpu_util(struct cpu_ctx *c) {
 }
 
 static void __noinline stats_update_global() {
-
     s32 cpu;
     u64 util = 0;
     u64 autil = 0;

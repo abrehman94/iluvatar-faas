@@ -86,6 +86,13 @@ enum QEnqPrioType {
   QEnqPrioPLAIN,
 };
 
+// Group Statistics Structure
+typedef struct SchedGroupStats {
+    u64 util;
+    u64 avg_util;
+    u64 dsqlen;
+} SchedGroupStats_t;
+
 // Group Characteristics Structure
 typedef struct SchedGroupChrs {
   SchedGroupID id;
