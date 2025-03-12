@@ -24,6 +24,7 @@ fn main() {
         &SchedGroupChrs {
             id          : 1,
             corebitmask : default_cpumask(),
+            core_count  : 1 as u64,
             timeslice   : 1,
             fifo        : 0,
             prio        : 1, 

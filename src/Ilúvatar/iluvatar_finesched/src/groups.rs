@@ -72,6 +72,7 @@ impl PreAllocatedGroups {
             let sg = SchedGroupChrs {
                 id          : *gid,
                 corebitmask : vec_to_cpumask(&group.cores),
+                core_count  : group.cores.len() as u64,
                 timeslice   : group.ts, // in ms
                 fifo        : group.fifo,                        
                 prio        : enqprio_name_to_val( &group.prio ),
