@@ -80,7 +80,8 @@ typedef s32 SchedGroupID;
 enum QEnqPrioType {
   QEnqPrioUndef = 0,
   QEnqPrioArrival,
-  QEnqPrioSRPT,
+  QEnqPrioSRPTover,
+  QEnqPrioSRPTreset,
   QEnqPrioSHRTDUR,
   QEnqPrioSHRTDURUW,
   QEnqPrioINVOC,

@@ -510,21 +510,33 @@ static u64 __always_inline prio_short_duration(u64 cvtime, u64 dur, u64 tconsume
 }
 
 u64 win_sched_bound = 0;
-
-static u64 __always_inline prio_short_first(u64 cvtime, u64 dur, u64 tconsumed ) {
-    u64 vtime;  
-
+static u64 __always_inline prio_short_first_reset(u64 cvtime, u64 dur, u64 tconsumed ) {
     if ( win_sched_bound < dur ){
         win_sched_bound = dur;
     }
-  
+    
+    // it's not really srpt - since every new task starts from the window 
+    // they are all equally prioritized 
     if ( cvtime < tconsumed ) {
-        vtime = (win_sched_bound * NSEC_PER_MSEC);
+        cvtime = (win_sched_bound * NSEC_PER_MSEC);
     } else {
-        vtime -= tconsumed;
+        cvtime -= tconsumed;
     }
 
-    return vtime;
+    return cvtime;
+}
+
+static u64 __always_inline prio_short_first_over(u64 cvtime, u64 tconsumed ) {
+    // we deliberately leave the vtime close to zero 
+    // when a new task would be created it's given twice 
+    // the latency associated with it's group 
+    if ( cvtime > tconsumed ) {
+        cvtime -= tconsumed;
+    }else{
+        cvtime = 0;
+    }
+
+    return cvtime;
 }
 
 //////
@@ -579,7 +591,11 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
     int dsqid = DSQ_PRIO_GRPS_START + sched_chrs->id;
 
     if (tctx->vtime == 0) {
-        tctx->vtime = cctx->last_vtime;
+        if( sched_chrs->prio == QEnqPrioSRPTover ){
+            tctx->vtime = cgrp_chrs->workerdur * 2 * NSEC_PER_MSEC;
+        } else {
+            tctx->vtime = cctx->last_vtime;
+        }
     }
 
     if (sched_chrs->fifo) {
@@ -590,10 +606,15 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
             tctx->vtime = prio_invoke_time( tctx->vtime, cgrp_chrs->invoke_ts, tctx->tconsumed );
             info("[enqueue_prio_dsq][invok] hist dur: %d vtime: %llu ", cgrp_chrs->invoke_ts, tctx->vtime);
 
-        } else if (sched_chrs->prio == QEnqPrioSRPT) {
+        } else if (sched_chrs->prio == QEnqPrioSRPTreset) {
 
-            tctx->vtime = prio_short_first( tctx->vtime, cgrp_chrs->workerdur, tctx->tconsumed );
-            info("[enqueue_prio_dsq][srpt] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur, tctx->vtime);
+            tctx->vtime = prio_short_first_reset( tctx->vtime, cgrp_chrs->workerdur, tctx->tconsumed );
+            info("[enqueue_prio_dsq][srptreset] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur, tctx->vtime);
+
+        } else if (sched_chrs->prio == QEnqPrioSRPTover) {
+
+            tctx->vtime = prio_short_first_over( tctx->vtime, tctx->tconsumed );
+            info("[enqueue_prio_dsq][srptover] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur, tctx->vtime);
 
         } else if (sched_chrs->prio == QEnqPrioSHRTDUR) {
 

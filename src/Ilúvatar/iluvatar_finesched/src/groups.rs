@@ -48,7 +48,8 @@ unsafe impl Sync for PreAllocatedGroups {}
 fn enqprio_name_to_val(prio: &str) -> u32 {
     match prio {
         "arrival" => QEnqPrioType_QEnqPrioArrival,
-        "srpt" => QEnqPrioType_QEnqPrioSRPT,
+        "srptover" => QEnqPrioType_QEnqPrioSRPTover,
+        "srptreset" => QEnqPrioType_QEnqPrioSRPTreset,
         "shrtdur" => QEnqPrioType_QEnqPrioSHRTDUR,
         "shrtduruw" => QEnqPrioType_QEnqPrioSHRTDURUW,
         "plain" => QEnqPrioType_QEnqPrioPLAIN,
