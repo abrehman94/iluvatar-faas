@@ -149,8 +149,8 @@ fn map_from_benchmark(
         if func.prewarms.is_none() {
             let prewarms = compute_prewarms(func, default_prewarms, max_prewarms);
             func.prewarms = Some(prewarms);
-            total_prewarms += prewarms;
         }
+        total_prewarms += func.prewarms.unwrap_or(0);
         match &func.chosen_name {
             None => info!("not filling out sim_invoke_data"),
             Some(name) => {
