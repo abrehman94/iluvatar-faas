@@ -24,7 +24,7 @@ use iluvatar_finesched::SharedMapsSafe;
 use iluvatar_finesched::SchedGroupID;
 use iluvatar_finesched::consts_RESERVED_GID_SWITCH_BACK;
 use iluvatar_library::clock::{get_unix_clock, Clock};
-use crate::services::resources::fineloadbalancing::{LoadBalancingPolicyT, RoundRobin, SharedData};
+use crate::services::resources::fineloadbalancing::{LoadBalancingPolicyTRef, RoundRobin, LWLInvoc, SharedData};
 
 lazy_static::lazy_static! {
   pub static ref CPU_GROUP_WORKER_TID: TransactionId = "CPUGroupMonitor".to_string();
@@ -52,7 +52,7 @@ pub struct CpuGroupsResourceTracker {
     mapgidstats: Arc<DashMap<SchedGroupID, u32>>, 
     
     /// fqdn -> gid 
-    lbpolicy: Arc<dyn LoadBalancingPolicyT + Sync + Send>,
+    lbpolicy: LoadBalancingPolicyTRef,
 
     /// limit on total gid assignments 
     concur_limit: Arc<Semaphore>,  
@@ -85,10 +85,14 @@ impl CpuGroupsResourceTracker {
             mapgidstats.clone() 
         );
 
-        let dispatch_policy = match config.dispatchpolicy.as_str() {
+        let dispatch_policy: LoadBalancingPolicyTRef = match config.dispatchpolicy.to_lowercase().as_str() {
             "roundrobin" => {
                 debug!( tid=%tid, "[finesched] using roundrobin dispatch policy" );
                 Arc::new( RoundRobin::new(0, shareddata) )
+            },
+            "lwlinvoc" => {
+                debug!( tid=%tid, "[finesched] using LWLInvoc dispatch policy" );
+                Arc::new( LWLInvoc::new(shareddata) )
             },
             _ => {
                 error!( tid=%tid, "[finesched] no dispatch policy configured using roundrobin dispatch policy" );

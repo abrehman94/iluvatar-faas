@@ -21,6 +21,8 @@ pub trait LoadBalancingPolicyT {
     fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId, );
 }
 
+pub type LoadBalancingPolicyTRef = Arc<dyn LoadBalancingPolicyT + Sync + Send>;
+
 pub struct SharedData {
     config: Arc<FineSchedConfig>,
     pgs: Arc<PreAllocatedGroups>,
@@ -79,6 +81,49 @@ impl LoadBalancingPolicyT for RoundRobin {
     }
     fn invoke_complete( &self, cgroup_id: &str, tid: &TransactionId ) {
     }
+}
+
+////////////////////////////////////
+/// Least Work Left - Invocation Based -  Load Balancing Policy
+
+pub struct LWLInvoc {
+    shareddata: SharedData,
+}
+
+impl LWLInvoc {
+    pub fn new( shareddata: SharedData ) -> Self {
+        LWLInvoc {
+            shareddata
+        }
+    }
+}
+
+impl LoadBalancingPolicyT for LWLInvoc {
+
+    fn invoke( &self, _cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
+        let mut gid: Option<SchedGroupID> = None;  
+        let mut min_count = u32::MAX;
+        
+        // directly iterating over self.shareddata.mapgidstats produces random order 
+        // due to the randomized hashing of dashmap
+        // we want to prefer lower numbered domains over higher numbered domains
+        for lgid in 0..self.shareddata.pgs.total_groups() {
+            let lgid = lgid as SchedGroupID;
+            let lcount = self.shareddata.mapgidstats.get(&lgid).unwrap();
+
+            if *lcount == 0 {
+                gid = Some(lgid);
+                break;
+            } else if *lcount < min_count {
+                min_count = *lcount;
+                gid = Some(lgid);
+            }
+        }
+
+        gid
+    }
+
+    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId ) {}
 }
 
 /*
