@@ -28,7 +28,6 @@ use std::any::Any;
 
 pub mod worker_config;
 pub use worker_config as config;
-use worker_config::FineSchedConfig;
 pub mod iluvatar_worker;
 pub mod rpc;
 pub mod sim_worker;
@@ -39,24 +38,8 @@ pub async fn create_worker(worker_config: WorkerConfig, tid: &TransactionId) -> 
     let pa; 
 
     if let Some(fconfig) = worker_config.finesched.clone() {
-        // create shared map 
         let sm = Arc::new(SharedMapsSafe::new());
-        // TODO: improve this logic to allow for dynamic group creation
-        let gs = match fconfig.preallocated_groups.clone() {
-            Some(gs) => gs,
-            None => PreallocGroupsConfig{
-                groups: vec![
-                    SchedGroup{
-                        cores: vec![0,1,2,3],
-                        ts: 20,
-                        fifo: 0,
-                        prio: "arrival".to_string()
-                    }
-                ]
-            },
-        };
-        pa = Some( Arc::new( PreAllocatedGroups::new( sm.clone(), gs ) ) ); // that's it! it should create preallocated
-       
+        pa = Some( Arc::new( PreAllocatedGroups::new( sm.clone(), fconfig.preallocated_groups.clone() ) ) ); 
         load_bpf_scheduler_async( fconfig.bpf_verbose );
     }else{
         pa = None;
@@ -69,7 +52,7 @@ pub async fn create_worker(worker_config: WorkerConfig, tid: &TransactionId) -> 
 
     let cpu: Arc<dyn CpuResourceTrackerT + Send + Sync> = match worker_config.finesched.clone() {
         Some(fconfig) => {
-            CpuGroupsResourceTracker::new( fconfig, pa, tid, cmap.clone() )
+            CpuGroupsResourceTracker::new( fconfig, pa.unwrap(), tid, cmap.clone() )
                 .or_else(|e| bail_error!(tid=%tid, error=%e, "Failed to make finesched cpu resource tracker"))?
         }
         None => {

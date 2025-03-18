@@ -181,27 +181,26 @@ pub struct FineSchedConfig {
     ///                 arrival
     ///                 srpt
     ///                 invoc
-    pub preallocated_groups: Option<PreallocGroupsConfig>,
+    pub preallocated_groups: PreallocGroupsConfig,
+    
+    /// Dispatch policy fqdn -> schedgroup
+    ///   roundrobin, staticselect, sizebucketassign, leastworkleft, 
+    ///   roundrobin-gr, staticselect-gr, sizebucketassign-gr, leastworkleft-gr, 
+    pub dispatchpolicy: String,
 
-    /// Boolean to be able to see all options in config  
-    pub allocation_type_rr: bool,
-
-    /// "e2e_buckets":  [ [0, 1000],[0,1,2], [1000, 2000],[2,3,4],  [2000, 1000000],[8,9]  ],
-    ///                   [0, 1000] is time of the bucket in ms, [0,1,2] is the gids that would be assigned  
-    pub e2e_buckets: Option<Vec<Vec<i32>>>,
-    pub allocation_type_e2e: bool,
+    /// "e2e_buckets":  [  ],
+    pub e2e_buckets: Vec<i32>,
 
     ///   "static_sel_buckets"         : {
     ///      "torch_rnn"       : [0, 1, 2, 3],
     ///      "float_operation" : [4, 5]
     ///  },
-    ///  "allocation_type_static_sel" : "true",
-    pub static_sel_buckets: Option<HashMap<String, Vec<i32>>>,
-    pub allocation_type_static_sel: bool,
+    pub static_sel_buckets: HashMap<String, Vec<i32>>,
 
     /// at least two to circumvent the latency of group switch and keep cores warm    
-    pub group_buffer: u32,
-
+    pub concur_limit: u32,
+    
+    /// verbose logs from bpf skeleton load 
     pub bpf_verbose: u8,
 }
 
