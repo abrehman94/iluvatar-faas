@@ -126,100 +126,49 @@ impl LoadBalancingPolicyT for LWLInvoc {
     fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId ) {}
 }
 
-/*
 
+////////////////////////////////////
+/// Size Interval Task Assignment -  Load Balancing Policy
 
-    // TODO: create a more sophisticated logic 
-    // very basic logic to return first available group
-    fn get_available_group_rr(&self) -> Option<SchedGroupID> {
-        let gbuf = self.group_buffer;
-        let gid = self.mapgidstats.iter().filter(|entry| {
-            *entry.value() < gbuf 
-        }).map(|entry| {
-            *entry.key()
-        }).next();
-        
-        self.acquire_group( gid )
+pub struct SITA {
+    shareddata: SharedData,
+}
+
+impl SITA {
+    pub fn new( shareddata: SharedData ) -> Self {
+        SITA {
+            shareddata
+        }
     }
+}
 
+impl LoadBalancingPolicyT for SITA {
 
-    // TODO: clean up the code to make better abstraction for the policy itself  
-    fn get_available_group_e2e(&self, fqdn: &str) -> Option<SchedGroupID> {
-        let gbuf = self.group_buffer;
-        let dur = self.cmap.get_exec_time( fqdn );
-        let dur = (dur*1000.0) as i32;
-        let e2e_buckets = self.e2e_buckets.clone().unwrap();
-        let mapgidstats = self.mapgidstats.clone();
-
-        debug!(dur=%dur, fqdn=%fqdn, "[finesched] trying to acquire group id");
-
-        let gid = e2e_buckets.iter().filter_map( |entry| {
-                let k = entry.key();
-                let gids = entry.value();
-                let start = k.0;
-                let end = k.1;
-
-                if start <= dur && dur < end {
-                    for gid in gids {
-                        if let Some(v) = mapgidstats.get( gid ) {
-                            if *v < gbuf {
-                                return Some(*gid);
-                            }
-                        }
-                    }
-                }  
-                
-                None
-        } ).next();
-
-        self.acquire_group( gid )
-    }
-
-
-
-    // "fqdn":"torch_rnn-0.0.1"
-    // torch_rnn -> [1, ..]
-    // float_operation -> [2, ..]
-    fn get_available_group_fqdn_based(&self, fqdn: &str) -> Option<SchedGroupID> {
-        let gbuf = self.group_buffer;
-        let fname = &fqdn_to_name(fqdn);
-        let mapgidstats = self.mapgidstats.clone();
-        let static_sel_buckets = self.static_sel_buckets.clone().unwrap();
-
-        let mut gid = static_sel_buckets.iter().filter_map( |entry| {
-                let k = entry.key();
-                let gids = entry.value();
-
-                if k == fname {
-                    for gid in gids {
-
-                        if let Some(v) = mapgidstats.get( gid ) {
-                            if *v < gbuf {
-                                return Some(*gid);
-                            }
-                        }
-                    }
-                }  
-
-                None
-        } ).next();
+    fn invoke( &self, _cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
+        let mut gid: Option<SchedGroupID> = None;  
+        let mut min_count = u32::MAX;
         
-        // in case fqdn is not found in static_sel_buckets
-        if let None = gid {
-            if let Some(v) = mapgidstats.get( &0 ) {
-                if *v < gbuf {
-                    gid = Some(0);
-                }
+        // directly iterating over self.shareddata.mapgidstats produces random order 
+        // due to the randomized hashing of dashmap
+        // we want to prefer lower numbered domains over higher numbered domains
+        for lgid in 0..self.shareddata.pgs.total_groups() {
+            let lgid = lgid as SchedGroupID;
+            let lcount = self.shareddata.mapgidstats.get(&lgid).unwrap();
+
+            if *lcount == 0 {
+                gid = Some(lgid);
+                break;
+            } else if *lcount < min_count {
+                min_count = *lcount;
+                gid = Some(lgid);
             }
         }
 
-        debug!(fname=%fname, fqdn=%fqdn, gid=?gid, "[finesched] trying to acquire group id");
-
-        self.acquire_group(gid)
+        gid
     }
 
+    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId ) {}
+}
 
-
- */
 
 
