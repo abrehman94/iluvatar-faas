@@ -185,7 +185,6 @@ pub struct FineSchedConfig {
     
     /// Dispatch policy fqdn -> schedgroup
     ///   roundrobin, staticselect, sizebucketassign, leastworkleft, 
-    ///   roundrobin-gr, staticselect-gr, sizebucketassign-gr, leastworkleft-gr, 
     pub dispatchpolicy: String,
 
     /// "e2e_buckets":  [  ],

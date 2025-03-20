@@ -53,6 +53,25 @@ impl SharedData {
 }
 
 ////////////////////////////////////
+/// No Load Balancing Policy Just Domain 0
+
+pub struct DomZero {}
+
+impl DomZero {
+    pub fn new() -> Self {
+        DomZero {}
+    }
+}
+
+impl LoadBalancingPolicyT for DomZero {
+    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, fqdn: &str ) -> Option<SchedGroupID> {
+        return Some(0) 
+    }
+    fn invoke_complete( &self, cgroup_id: &str, tid: &TransactionId ) {
+    }
+}
+
+////////////////////////////////////
 /// Round Robin Load Balancing Policy
 
 pub struct RoundRobin {
@@ -169,6 +188,84 @@ impl LoadBalancingPolicyT for SITA {
 
     fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId ) {}
 }
+
+////////////////////////////////////
+/// MQFQ - produce a set of domain ids 
+
+pub struct MQFQ {
+    shareddata: SharedData,
+    tranks: u32, // total ranks
+    c: f64, // log_c -- 1.3 for row 0.8 
+    g: u32, // tightness bound uptil next rank - g >= 1 
+    grs: Vec<Vec<u32>>, // counter for each rank within each sched domain 
+                         
+}
+
+// impl MQFQ {
+//     pub fn new( shareddata: SharedData ) -> Self {
+//         MQFQ {
+//             shareddata,
+//             c
+//         }
+//     }
+//     
+//     /// dur in ms to rank 
+//     fn get_rank( &self, dur: f64 ) -> f64 {
+//         // ceil( log_c( dur ) )
+//         0.0 
+//     }
+//     
+//     /// min counter for a given rank across all domains
+//     fn min_counter( &self, rank: u32 ) -> u32 {
+//         0
+//     }
+// 
+//     /// set of domains that satisfy the tight bound  
+//     /// G
+//     fn get_safe_domains( &self, min_count: u32, rank: u32 ){
+//     }
+// 
+//     pub fn set_of_domains(&self, _cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ) -> Vec<SchedGroupID> {
+//         let mut gids: Vec<SchedGroupID> = Vec::new();
+//         let mut min_count = u32::MAX;
+//         
+//         // directly iterating over self.shareddata.mapgidstats produces random order 
+//         // due to the randomized hashing of dashmap
+//         // we want to prefer lower numbered domains over higher numbered domains
+//         for lgid in 0..self.shareddata.pgs.total_groups() {
+//             let lgid = lgid as SchedGroupID;
+//             let lcount = self.shareddata.mapgidstats.get(&lgid).unwrap();
+// 
+//             if *lcount == 0 {
+//                 gids.push(lgid);
+//             } else if *lcount < min_count {
+//                 min_count = *lcount;
+//                 gids.clear();
+//                 gids.push(lgid);
+//             }
+//         }
+// 
+//         gids
+//     }
+// }
+// 
+// 
+// #[cfg(test)]
+// mod testsfineloadbalancing {
+//     use super::*;
+//     use libm::log2;
+// 
+//     #[test]
+//     fn basic_logc_test() {
+//         let y = log2( 4.0 );
+//         print!( "y = {} \n", y );
+//         assert_eq!( 1.0, 2.0 );
+//     }
+// }
+
+
+
+
 
 
 
