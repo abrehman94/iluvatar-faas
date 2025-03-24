@@ -331,7 +331,7 @@ pub async fn worker_register(
             version.to_owned(),
             image,
             memory,
-            10,  // number of cores
+            1,  // number of cores
             1,   // number of parallel invokes
             tid.clone(),
             isolation,
