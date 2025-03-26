@@ -116,7 +116,16 @@ impl DockerIsolation {
         entrypoint: Option<Vec<String>>,
     ) -> Result<()> {
         let mut host_config = host_config.unwrap_or_default();
-        host_config.cpu_shares = Some((cpus * 1024) as i64);
+        host_config.cpu_shares = Some((1024) as i64); // it only decides priority at times
+                                                      // of contention, there is no setting
+                                                      // for period and quota 
+                                                      // Ref: Documentation/ABI/removed/sysfs-kernel-uids
+                                                      //      Documentation/scheduler/sched-design-CFS.rst
+                                                             
+        host_config.cpu_period = Some((100 * 1024) as i64); // 100 ms  
+        host_config.cpu_quota = Some((cpus * 100 * 1024) as i64); // 100 ms of quota is worth one
+                                                                  // CPU   
+                                                             
         host_config.memory = Some(mem_limit_mb * 1024 * 1024);
         let exposed_ports: Option<HashMap<String, HashMap<(), ()>>> = match ports.as_ref() {
             Some(p) => {
