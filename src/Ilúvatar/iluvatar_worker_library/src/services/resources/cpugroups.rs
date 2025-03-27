@@ -24,7 +24,7 @@ use iluvatar_finesched::SharedMapsSafe;
 use iluvatar_finesched::SchedGroupID;
 use iluvatar_finesched::consts_RESERVED_GID_SWITCH_BACK;
 use iluvatar_library::clock::{get_unix_clock, Clock};
-use crate::services::resources::fineloadbalancing::{LoadBalancingPolicyTRef, RoundRobin, LWLInvoc, DomZero, SharedData};
+use crate::services::resources::fineloadbalancing::{LoadBalancingPolicyTRef, RoundRobin, RoundRobinRL, LWLInvoc, DomZero, SharedData};
 
 lazy_static::lazy_static! {
   pub static ref CPU_GROUP_WORKER_TID: TransactionId = "CPUGroupMonitor".to_string();
@@ -88,6 +88,10 @@ impl CpuGroupsResourceTracker {
             "roundrobin" => {
                 debug!( tid=%tid, "[finesched] using roundrobin dispatch policy" );
                 Arc::new( RoundRobin::new(0, shareddata) )
+            },
+            "roundrobinrl" => {
+                debug!( tid=%tid, "[finesched] using roundrobin dispatch policy" );
+                Arc::new( RoundRobinRL::new(0, shareddata) )
             },
             "lwlinvoc" => {
                 debug!( tid=%tid, "[finesched] using LWLInvoc dispatch policy" );

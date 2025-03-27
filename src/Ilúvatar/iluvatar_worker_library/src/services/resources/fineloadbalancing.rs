@@ -103,6 +103,44 @@ impl LoadBalancingPolicyT for RoundRobin {
 }
 
 ////////////////////////////////////
+/// Round Robin Remember Last Load Balancing Policy
+
+pub struct RoundRobinRL {
+    shareddata: SharedData,
+    lastgid: DashMap<String, SchedGroupID>,
+    nextgid: AtomicI32,
+}
+
+impl RoundRobinRL {
+    pub fn new(starting_gid: SchedGroupID, shareddata: SharedData) -> Self {
+        RoundRobinRL {
+            nextgid: AtomicI32::new(starting_gid),
+            shareddata,
+            lastgid: DashMap::new(),
+        }
+    }
+}
+
+impl LoadBalancingPolicyT for RoundRobinRL {
+    fn invoke( &self, cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
+        let lgid = self.lastgid.get(cgroup_id);
+        if lgid.is_none() {
+            let mut gid = self.nextgid.fetch_add( 1, Ordering::Relaxed );
+            let tgroups = self.shareddata.pgs.total_groups() as i32;
+            if gid >= tgroups {
+                gid = 0;
+                self.nextgid.store( 1, Ordering::Relaxed );
+            }
+            self.lastgid.insert(cgroup_id.to_string(), gid);
+            return Some(gid); 
+        } else {
+            return Some(*lgid.unwrap());
+        }
+    }
+    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId ) {}
+}
+
+////////////////////////////////////
 /// Least Work Left - Invocation Based -  Load Balancing Policy
 
 pub struct LWLInvoc {
