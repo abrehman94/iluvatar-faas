@@ -2,6 +2,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use tracing::{debug, error, info};
+
 use crate::worker_api::worker_config::FineSchedConfig;
 
 use iluvatar_library::transaction::TransactionId;
@@ -13,7 +15,9 @@ use iluvatar_finesched::SchedGroupID;
 use iluvatar_finesched::consts_RESERVED_GID_SWITCH_BACK;
 use iluvatar_library::clock::{get_unix_clock, Clock};
 
+use std::collections::HashMap;
 use dashmap::DashMap;
+use regex::Regex;
 
 /// dynamic trait cannot have static functions to allow for dynamic dispatch
 pub trait LoadBalancingPolicyT {
@@ -138,6 +142,49 @@ impl LoadBalancingPolicyT for RoundRobinRL {
         }
     }
     fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId ) {}
+}
+
+////////////////////////////////////
+/// Static Select Load Balancing Policy
+
+pub struct StaticSelect {
+    shareddata: SharedData,
+    static_sel_buckets: HashMap<String, i32>,
+}
+
+impl StaticSelect {
+    pub fn new(shareddata: SharedData, static_sel_buckets: HashMap<String, i32>) -> Self {
+        StaticSelect {
+            shareddata,
+            static_sel_buckets,
+        }
+    }
+}
+
+fn match_pattern( pattern: &str, line: &str ) -> bool {
+    let pattern = format!( r"{}.*", pattern );
+    let re = Regex::new( pattern.as_str() ).unwrap();
+    re.is_match( line )
+}
+
+impl LoadBalancingPolicyT for StaticSelect {
+    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, fqdn: &str ) -> Option<SchedGroupID> {
+        debug!( fqdn=%fqdn, cgroup_id=%cgroup_id, tid=%tid,  "[finesched] static select dispatch policy" );
+        let tgroups = self.shareddata.pgs.total_groups() as i32;
+        for (func,gid) in self.static_sel_buckets.iter() {
+            // "fqdn":"lin_pack-0.1",
+            // "func":"lin_pack",
+            if match_pattern( func, fqdn ) {
+                if *gid >= tgroups {
+                    error!( "[finesched] static select dispatch policy - gid out of range" );
+                    return Some(0);
+                }
+                return Some(*gid);
+            }
+        } 
+        return Some(0) 
+    }
+    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId ) {}
 }
 
 ////////////////////////////////////

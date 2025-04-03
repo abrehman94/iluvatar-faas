@@ -194,7 +194,7 @@ pub struct FineSchedConfig {
     ///      "torch_rnn"       : [0, 1, 2, 3],
     ///      "float_operation" : [4, 5]
     ///  },
-    pub static_sel_buckets: HashMap<String, Vec<i32>>,
+    pub static_sel_buckets: HashMap<String, i32>,
 
     /// at least two to circumvent the latency of group switch and keep cores warm    
     pub concur_limit: u32,
