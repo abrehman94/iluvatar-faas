@@ -73,9 +73,10 @@ __always_inline struct cpu_ctx * try_lookup_cpu_ctx(s32 cpu)
  * This contain all the per-task information used internally by the BPF code.
  */
 struct task_ctx {
-   
     bool active_q;
     bool running;
+
+    u64 cgroup_tskcnt_prio; 
 
     // invoke time from CgroupChrs_t
     u64 invoke_time; 
@@ -91,7 +92,6 @@ struct task_ctx {
 	u64 ts_start;
     u64 tconsumed;
 };
-
 
 /* Map that contains task-local storage. */
 struct {
@@ -110,6 +110,49 @@ struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
 					(struct task_struct *)p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
 }
 
+
+/*
+ * Per-cgroup local storage.
+ *
+ * This contain all the per-cgroup information used internally by the BPF code.
+ */
+typedef struct cgroup_ctx {
+	bool init;
+	u64 task_count;
+    // can save actual cgroup structure reference as well 
+    // it's better to use cgroup storage for that purpose
+} cgroup_ctx_t;
+
+/* Map that contains task-local storage. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_MAP_ENTRIES);
+	__uint(key_size, sizeof(char) * MAX_PATH);     // key: cgroup name
+	__uint(value_size, sizeof(cgroup_ctx_t)); // value: context 
+} cgroup_ctx_stor SEC(".maps");
+
+
+static cgroup_ctx_t * __noinline try_lookup_cgroup_ctx( const char *name, u32 max_len ) {
+    long err; 
+
+    if (!name || max_len > MAX_PATH) {
+        dbg("[cmap][get_cgroup_ctx] invalid args: %s %u", name, max_len);
+        return NULL;
+    }
+
+    cgroup_ctx_t *cgrp_ctx = bpf_map_lookup_elem( &cgroup_ctx_stor, name );
+    if ( !cgrp_ctx ) {
+        cgroup_ctx_t cgrp_ctx;
+        memset( &cgrp_ctx, 0, sizeof(cgroup_ctx_t) );
+
+        err = bpf_map_update_elem(&cgroup_ctx_stor, (const void *)name, (const void *)&cgrp_ctx, BPF_ANY);
+        if ( err < 0 ) {
+            return NULL;
+        }
+    }
+
+    return cgrp_ctx;
+}
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -337,6 +380,7 @@ void BPF_STRUCT_OPS(finesched_stopping, struct task_struct *p, bool runnable) {
 
 void BPF_STRUCT_OPS(finesched_quiescent, struct task_struct *p, u64 deq_flags) {
 
+    info("[quiescent_task] sleeping task %d - %s", p->pid, p->comm);
     struct task_ctx *tctx;
     tctx = try_lookup_task_ctx( p );
     stats_task_stop( tctx );
@@ -372,6 +416,7 @@ s32 BPF_STRUCT_OPS(finesched_init_task, struct task_struct *p, struct scx_init_t
 void BPF_STRUCT_OPS(finesched_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
 {
     info("[exit_task] exiting task %d - %s", p->pid, p->comm);
+    cgroup_ctx_stop_task( p );
 }
 
 // CPU is entering idle state if idle is true. 

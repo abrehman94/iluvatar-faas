@@ -33,8 +33,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_MAP_ENTRIES);
 	__uint(key_size, sizeof(char) * MAX_PATH); // key: cgroup name
-	__uint(value_size,
-	       sizeof(CgroupChrs_t)); // value: cgroup characteristics
+	__uint(value_size, sizeof(CgroupChrs_t));  // value: cgroup characteristics
 } cMap SEC(".maps");
 
 static CgroupChrs_t * __noinline get_cgroup_chrs( const char *name, u32 max_len ) {

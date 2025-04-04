@@ -323,6 +323,23 @@ out_no_chrs:
     return NULL;
 }
 
+static cgroup_ctx_t * __noinline get_cgroup_ctx_for_p( struct task_struct *p ) {
+
+    char *cg_name = get_schedcgroup_name( p );
+    if ( cg_name == NULL ) {
+        goto out_no_ctx;
+    }
+    cgroup_ctx_t *cgrp_ctx = try_lookup_cgroup_ctx( cg_name, MAX_PATH );
+    if ( cgrp_ctx == NULL ) {
+        goto out_no_ctx;
+    }
+    return cgrp_ctx;
+
+out_no_ctx:
+    info("[warn][cgroup_ctx] no cgroup_ctx found for task %d - %s", p->pid, p->comm);
+    return NULL;
+}
+
 static SchedGroupChrs_t * __noinline get_schedchrs( struct task_struct *p ) {
 
     CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p( p );
@@ -356,6 +373,50 @@ static SchedGroupChrs_t * __noinline get_schedchrs_cached( struct task_struct *p
     return chrs;
 }
 
+
+static void __noinline cgroup_ctx_new_task( struct task_struct *p ) {
+
+    cgroup_ctx_t * cgrp_ctx = get_cgroup_ctx_for_p( p );
+    if ( cgrp_ctx == NULL ) {
+        return;
+    }
+
+    struct task_ctx *tctx = try_lookup_task_ctx( p );
+    if (!tctx) {
+        error("[cgroup_ctx_new_task] task context not found for task %d - %s", p->pid, p->comm);
+        return;
+    }
+
+    if( ! cgrp_ctx->init ){
+        cgrp_ctx->init = true;
+        cgrp_ctx->task_count = 1;
+        tctx->cgroup_tskcnt_prio = 0;
+    }else{
+        cgrp_ctx->task_count++;
+        tctx->cgroup_tskcnt_prio = 1;
+    } 
+    info("[cgroup_ctx_new_task] task %d - %s cgrp_init: %d cgrp_task_count: %d cgrp_prio: %d", 
+         p->pid, 
+         p->comm,
+         cgrp_ctx->init, 
+         cgrp_ctx->task_count, 
+         tctx->cgroup_tskcnt_prio
+    );
+}
+
+static void __noinline cgroup_ctx_stop_task( struct task_struct *p ) {
+    cgroup_ctx_t * cgrp_ctx = get_cgroup_ctx_for_p( p );
+    if ( cgrp_ctx == NULL ) {
+        return;
+    }
+
+    if( ! cgrp_ctx->init ){
+        error("[cgroup_ctx_stop_task] cgroup_ctx_new_task was missed for task %d - %s", p->pid, p->comm);
+    }else{
+        cgrp_ctx->task_count--;
+    } 
+}
+
 static void __noinline update_caches( struct task_struct *p ) {
     
     pid_t pid = p->pid;
@@ -380,6 +441,9 @@ static void __noinline update_caches( struct task_struct *p ) {
     bpf_map_update_elem(&pid_chrs_cache, (const void *)&pid, chrs, BPF_ANY);
     info("[caches] cached pid %d - gid %d ", pid, chrs->id);
     //dump_cpumask(&chrs->corebitmask);
+
+
+
 }
 
 static long __noinline callback_pid_chrs_cache_iter(struct bpf_map *map, const void *key, void *val, void *ctx) {
@@ -422,6 +486,7 @@ static void __noinline switch_to_scx_is_docker( struct task_struct *p ) {
 
         scx_bpf_switch_to_scx( p );
         update_caches( p );
+        cgroup_ctx_new_task( p );
 
         info("[switch_to_scx] switched to scx docker cgroup task %d - %s ", 
              p->pid, 
@@ -558,6 +623,13 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
         return -1;
     }
 
+    cgroup_ctx_t *cgrp_ctx;
+    cgrp_ctx = get_cgroup_ctx_for_p(p);
+    if (!cgrp_ctx) {
+        error("[enqueue_prio_dsq] cgroup context not found for task %d - %s", p->pid, p->comm);
+        return -1;
+    }
+
     // We can directly use the slow get_schedchrs instead of the cached
     // because enqueue is no longer on the critical path in prio dsq design.
     // besides the assumption is tasks would be longer in ms - so it really
@@ -638,11 +710,10 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
         scx_bpf_dispatch_vtime(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, tctx->vtime, 0);
     }
 
-    info("[enqueue_prio_dsq] dispatched task %d - %s to dsq %d invoke_time: %lld act_time: %lld "
-         "vtime: %lld ts: %lld",
-         p->pid, p->comm, dsqid, tctx->invoke_time, tctx->act_time, tctx->vtime, sched_chrs->timeslice);
-
-    info("[enqueue_prio_dsq][task_stats] consumed: %d", tctx->tconsumed);
+    info("[enqueue_prio_dsq][task_stats] task %d - %s to dsq %d invo_t: %lld act_t: %lld "
+         "vtime: %lld ts: %lld tconsum: %d cgrp_init: %d cgrp_task_count: %d cgrp_prio: %d",
+         p->pid, p->comm, dsqid, tctx->invoke_time, tctx->act_time, tctx->vtime, sched_chrs->timeslice,
+         tctx->tconsumed, cgrp_ctx->init, cgrp_ctx->task_count, tctx->cgroup_tskcnt_prio);
     tctx->tconsumed = 0;
 
     if (cctx->last_vtime < tctx->vtime) {
