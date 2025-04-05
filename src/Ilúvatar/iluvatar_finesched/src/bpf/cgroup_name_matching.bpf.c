@@ -25,7 +25,7 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(key_size, sizeof(u32));
-	__uint(value_size, 2*MAX_PATH);
+	__uint(value_size, MAX_PATH);
 	__uint(max_entries, 1);
 } ln_bufs SEC(".maps");
 
@@ -34,6 +34,9 @@ static char *format_cgrp_path(struct cgroup *cgrp)
 {
 	u32 zero = 0;
 	char *path = bpf_map_lookup_elem(&cgrp_path_bufs, &zero);
+    if( path ){
+        memset(path, 0, 2*MAX_PATH);
+    }
 	u32 len = 0, level, max_level;
 
 	if (!path) {
@@ -113,6 +116,9 @@ static char * __noinline get_last_node(char *path, u32 max_len) {
     u32 id_s;
     char *next = NULL;
 	char *ln_buf = bpf_map_lookup_elem(&ln_bufs, &zero);
+    if( ln_buf ){
+      memset(ln_buf, 0, max_len);
+    }
   
     bpf_for(i, 0, max_len) {
         next = &path[i];

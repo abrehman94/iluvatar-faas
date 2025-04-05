@@ -152,6 +152,48 @@ static s32 __noinline populate_cpu_to_dsq() {
 ////////////////////////////
 // Map Lookup   
 
+static SchedGroupChrs_t * __noinline get_schedgroup_chrs( SchedGroupID gid ) {
+
+    if ( gid > MAX_MAP_ENTRIES) {
+        goto out_not_found;
+    }
+
+    SchedGroupChrs_t *sched_chrs = bpf_map_lookup_elem( &gMap, &gid );
+    if ( !sched_chrs ) {
+        goto out_not_found;
+    }
+
+    return sched_chrs;
+
+out_not_found: 
+    dbg("[warn][gmap][get_schedgroup_chrs] not found for gid: %u", gid);
+    return NULL;
+}
+
+static CgroupChrs_t * __noinline get_cgroup_chrs( const char *name, u32 max_len ) {
+    if (!name || max_len > MAX_PATH) {
+        dbg("[cmap][get_cgroup_chrs] invalid args: %s %u", name, max_len);
+        return NULL;
+    }
+
+    CgroupChrs_t *cgrp_chrs;
+    u32 cpu = bpf_get_smp_processor_id();
+
+    cgrp_chrs = bpf_map_lookup_elem( &cMap, name );
+    if ( !cgrp_chrs ) {
+        dbg("[cmap][get_cgroup_chrs] cgroup %s not found in cMap ", name);
+        cgrp_chrs = bpf_map_lookup_percpu_elem( &cMapLast, name, cpu );
+        if ( !cgrp_chrs ) {
+          dbg("[cmap][get_cgroup_chrs] cgroup %s not found in cMapLast ", name);
+        }
+    }else{
+        dbg("[cmap][get_cgroup_chrs] cgroup %s is found in cMap ", name);
+        bpf_map_update_elem(&cMapLast, (const void *)name, cgrp_chrs, BPF_ANY);
+    }
+
+    return cgrp_chrs;
+}
+
 static SchedGroupStats_t * __noinline get_schedgroup_stats( SchedGroupID gid ) {
     if ( gid > MAX_MAP_ENTRIES) {
         goto out_not_found;
@@ -310,7 +352,7 @@ static SchedGroupChrs_t * __noinline get_cgroup_chrs_for_p( struct task_struct *
 
     char *cg_name = get_schedcgroup_name( p );
     if ( cg_name == NULL ) {
-        goto out_no_chrs;
+        goto out_bad_name;
     }
     CgroupChrs_t *cgrp_chrs = get_cgroup_chrs( cg_name, MAX_PATH );
     if ( cgrp_chrs == NULL ) {
@@ -318,8 +360,11 @@ static SchedGroupChrs_t * __noinline get_cgroup_chrs_for_p( struct task_struct *
     }
     return cgrp_chrs;
 
+out_bad_name:
+    info("[warn][cgroup_chrs] no cg_name found for task %d - %s", p->pid, p->comm);
+    return NULL;
 out_no_chrs:
-    info("[warn][cgroup_chrs] no cgroup_chrs found for task %d - %s", p->pid, p->comm);
+    info("[warn][cgroup_chrs] no cgroup_chrs found for task %d - %s cgname: %s", p->pid, p->comm, cg_name);
     return NULL;
 }
 
@@ -547,6 +592,11 @@ out_no_alloc:
     return -1;
 }
 
+#define PRIO_TASKCOUNT_FACTOR (100*NSEC_PER_MSEC) 
+static u64 __always_inline prio_taskcount_tconsumed(u64 cvtime, u64 tconsumed, u64 cgroup_tskcnt_prio) {
+    return cvtime + ((1-cgroup_tskcnt_prio)*PRIO_TASKCOUNT_FACTOR + tconsumed);
+}
+
 static u64 __always_inline prio_plain_tconsumed(u64 cvtime, u64 tconsumed) {
     u64 vtime = cvtime + tconsumed;
     return vtime;
@@ -702,6 +752,11 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
 
             tctx->vtime = prio_plain_tconsumed( tctx->vtime, tctx->tconsumed );
             info("[enqueue_prio_dsq][plain] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur, tctx->vtime);
+
+        } else if (sched_chrs->prio == QEnqPrioTaskCount) {
+
+            tctx->vtime = prio_taskcount_tconsumed( tctx->vtime, tctx->tconsumed, tctx->cgroup_tskcnt_prio );
+            info("[enqueue_prio_dsq][taskcount] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur, tctx->vtime);
 
         } else {
             error("[enqueue_prio_dsq][sched_chrs] bad priority sched_chrs->prio: %d", sched_chrs->prio);

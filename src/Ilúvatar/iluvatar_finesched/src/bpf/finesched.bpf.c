@@ -33,6 +33,17 @@ u8 cores_node0[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 1
 private(FINESCHED) struct bpf_cpumask __kptr *cpumask_node1;
 u8 cores_node1[] = { 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47 };
 
+
+// cgroup characteristics shared map copy  
+// to avoid missed lookup when user is writing  
+// while bpf side is trying to read. 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__uint(max_entries, MAX_MAP_ENTRIES);
+	__uint(key_size, sizeof(char) * MAX_PATH); // key: cgroup name
+	__uint(value_size, sizeof(CgroupChrs_t));  // value: cgroup characteristics
+} cMapLast SEC(".maps");
+
 /*
  * Per-CPU context.
  */

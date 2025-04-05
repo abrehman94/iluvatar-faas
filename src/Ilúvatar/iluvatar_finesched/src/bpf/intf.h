@@ -86,6 +86,7 @@ enum QEnqPrioType {
   QEnqPrioSHRTDURUW,
   QEnqPrioINVOC,
   QEnqPrioPLAIN,
+  QEnqPrioTaskCount,
 };
 
 // Group Statistics Structure

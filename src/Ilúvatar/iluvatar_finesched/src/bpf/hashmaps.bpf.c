@@ -36,39 +36,6 @@ struct {
 	__uint(value_size, sizeof(CgroupChrs_t));  // value: cgroup characteristics
 } cMap SEC(".maps");
 
-static CgroupChrs_t * __noinline get_cgroup_chrs( const char *name, u32 max_len ) {
-
-    if (!name || max_len > MAX_PATH) {
-        dbg("[cmap][get_cgroup_chrs] invalid args: %s %u", name, max_len);
-        return NULL;
-    }
-
-    CgroupChrs_t *cgrp_chrs = bpf_map_lookup_elem( &cMap, name );
-    if ( !cgrp_chrs ) {
-        dbg("[cmap][get_cgroup_chrs] cgroup %s not found in cMap", name);
-    }
-
-    return cgrp_chrs;
-}
-
-static SchedGroupChrs_t * __noinline get_schedgroup_chrs( SchedGroupID gid ) {
-
-    if ( gid > MAX_MAP_ENTRIES) {
-        goto out_not_found;
-    }
-
-    SchedGroupChrs_t *sched_chrs = bpf_map_lookup_elem( &gMap, &gid );
-    if ( !sched_chrs ) {
-        goto out_not_found;
-    }
-
-    return sched_chrs;
-
-out_not_found: 
-    dbg("[warn][gmap][get_schedgroup_chrs] not found for gid: %u", gid);
-    return NULL;
-}
-
 
 #ifndef __LICENSE_H
 #define __LICENSE_H
