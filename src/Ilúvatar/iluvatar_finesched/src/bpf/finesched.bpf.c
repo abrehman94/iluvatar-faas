@@ -349,6 +349,7 @@ void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
 
     if (cctx->prio_dsqid != -1 && cctx->prio_dsqid != 0) {
         if (scx_bpf_consume(cctx->prio_dsqid)) {
+            scx_bpf_consume(cctx->prio_dsqid); // two consumes 
             info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
         }else if ( (s32)(cctx->prio_dsqid -1) >= DSQ_PRIO_GRPS_START && scx_bpf_consume(cctx->prio_dsqid - 1) ) {
             info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
