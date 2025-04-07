@@ -1,16 +1,22 @@
 use crate::trace::prepare_function_args;
 use crate::utils::*;
-use anyhow::Result;
+use anyhow::{anyhow,Result};
 use clap::Parser;
 use iluvatar_controller_library::server::controller_comm::ControllerAPIFactory;
-use iluvatar_library::clock::{get_global_clock, now};
+use iluvatar_library::clock::{get_global_clock, now, Clock};
 use iluvatar_library::tokio_utils::{build_tokio_runtime, TokioRuntime};
 use iluvatar_library::types::{CommunicationMethod, Compute, Isolation, MemSizeMb, ResourceTimings};
 use iluvatar_library::utils::config::args_to_json;
 use iluvatar_library::{transaction::gen_tid, utils::port_utils::Port};
+use iluvatar_library::transaction::TransactionId;
+use iluvatar_worker_library::worker_api::worker_comm::WorkerAPIFactory;
+use std::sync::Arc;
+
+use iluvatar_controller_library::services::ControllerAPI;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use std::{collections::HashMap, path::Path};
+use async_std::task;
 use tracing::{error, info};
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -81,6 +87,10 @@ pub struct BenchmarkArgs {
     #[arg(long, default_value = "10")]
     /// Number of times to run function _after_ each cold start, expecting them to be warm (could vary because of load balancer)
     warm_iters: u32,
+    #[arg(long, default_value = "1")]
+    /// Number of concurrent warm invocations to make, default is to make one warm invocation at a
+    /// time.
+    warm_concur: u32,
     #[arg(long, default_value = "0")]
     /// Duration in minutes that each function will be run for, being invoked in a closed loop.
     /// An alternative to cold/warm-iters.
@@ -131,6 +141,7 @@ pub fn benchmark_functions(args: BenchmarkArgs) -> Result<()> {
             args.out_folder.clone(),
             args.cold_iters,
             args.warm_iters,
+            args.warm_concur,
         )),
     }
 }
@@ -142,6 +153,7 @@ pub async fn benchmark_controller(
     out_folder: String,
     cold_repeats: u32,
     warm_repeats: u32,
+    warm_concur: u32,
 ) -> Result<()> {
     let factory = ControllerAPIFactory::boxed();
     let mut full_data = BenchmarkStore::new();
@@ -153,42 +165,37 @@ pub async fn benchmark_controller(
         let api = factory
             .get_controller_api(&host, port, CommunicationMethod::RPC, &reg_tid)
             .await?;
-        for iter in 0..cold_repeats {
-            let name = format!("{}-bench-{}", function.name, iter);
-            let version = format!("0.0.{}", iter);
-            let _reg_dur =
-                match crate::utils::controller_register(&name, &version, &function.image_name, 512, None, api.clone())
-                    .await
-                {
-                    Ok(d) => d,
-                    Err(e) => {
-                        error!("{}", e);
-                        continue;
-                    }
-                };
-
-            'inner: for _ in 0..warm_repeats {
-                match crate::utils::controller_invoke(&name, &version, None, clock.clone(), api.clone()).await {
-                    Ok(invoke_result) => {
-                        if invoke_result.controller_response.success {
-                            let func_exec_us = invoke_result.function_output.body.latency * 1000000.0;
-                            let invoke_lat = invoke_result.client_latency_us as f64;
-                            let compute = Compute::from_bits_truncate(invoke_result.controller_response.compute);
-                            let resource_entry = match func_data.resource_data.get_mut(&compute.try_into()?) {
-                                Some(r) => r,
-                                None => func_data.resource_data.entry(compute.try_into()?).or_default(),
-                            };
-                            if invoke_result.function_output.body.cold {
-                                resource_entry
-                                    .cold_results_sec
-                                    .push(invoke_result.function_output.body.latency);
-                                resource_entry.cold_over_results_us.push(invoke_lat - func_exec_us);
-                                resource_entry
-                                    .cold_worker_duration_us
-                                    .push(invoke_result.client_latency_us);
-                                resource_entry
-                                    .cold_invoke_duration_us
-                                    .push(invoke_result.controller_response.duration_us as u128);
+        async fn invoke(
+            name: String,
+            version: String,
+            json_args: Option<String>,
+            clock: Clock,
+            api: ControllerAPI,
+        ) -> Result<CompletedControllerInvocation> {
+            crate::utils::controller_invoke(name.as_str(), version.as_str(), json_args, clock, api.clone()).await
+        }
+        fn parse_result( r: Result<CompletedControllerInvocation>, func_data: &mut FunctionStore) -> Result<()> {
+            match r {
+                Ok(invoke_result) => {
+                    if invoke_result.controller_response.success {
+                        let func_exec_us = invoke_result.function_output.body.latency * 1000000.0;
+                        let invoke_lat = invoke_result.client_latency_us as f64;
+                        let compute = Compute::from_bits_truncate(invoke_result.controller_response.compute);
+                        let resource_entry = match func_data.resource_data.get_mut(&compute.try_into()?) {
+                            Some(r) => r,
+                            None => func_data.resource_data.entry(compute.try_into()?).or_default(),
+                        };
+                        if invoke_result.function_output.body.cold {
+                            resource_entry
+                                .cold_results_sec
+                                .push(invoke_result.function_output.body.latency);
+                            resource_entry.cold_over_results_us.push(invoke_lat - func_exec_us);
+                            resource_entry
+                                .cold_worker_duration_us
+                                .push(invoke_result.client_latency_us);
+                            resource_entry
+                                .cold_invoke_duration_us
+                                .push(invoke_result.controller_response.duration_us as u128);
                             } else {
                                 resource_entry
                                     .warm_results_sec
@@ -200,12 +207,54 @@ pub async fn benchmark_controller(
                                 resource_entry
                                     .warm_invoke_duration_us
                                     .push(invoke_result.controller_response.duration_us as u128);
-                            }
                         }
+                        return Ok(());
                     }
-                    Err(e) => {
-                        error!("{}", e);
-                        break 'inner;
+                    return Err(anyhow!("function invocation failed"));
+                }
+                Err(e) => {
+                    error!("{}", e);
+                    return Err(e);
+                }
+            }
+        }
+        for iter in 0..cold_repeats {
+            // register separately for each concurrent invocation 
+            let name = format!("{}-bench-{}", function.name, iter);
+            let mut versions = vec![];
+            for i in 0..warm_concur {
+                versions.push(format!("0.{}.{}", i, iter));
+            }
+
+            for version in versions.iter(){
+                let _reg_dur =
+                    match crate::utils::controller_register(&name, &version, &function.image_name, 512, None, api.clone())
+                    .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            error!("{}", e);
+                            continue;
+                        }
+                    };
+            }
+
+            'inner: for _ in 0..warm_repeats {
+                let mut handles = vec![];
+                // repeat for warm concurrent times 
+                for i in 0..warm_concur {
+                    handles.push( task::spawn(
+                            invoke(name.clone(), versions[i as usize].clone(), None, clock.clone(), api.clone() )
+                    ));
+                }
+                for handle in handles {
+                    let r = handle.await;
+                    match parse_result(r, &mut func_data) {
+                        Ok(_r) => {}
+                        Err(e) => {
+                            error!("Invocation error: {}", e);
+                            break 'inner;
+                        }
                     }
                 }
             }
@@ -233,6 +282,7 @@ pub fn benchmark_worker(
     let factory = iluvatar_worker_library::worker_api::worker_comm::WorkerAPIFactory::boxed();
     let clock = get_global_clock(&gen_tid())?;
     let mut cold_repeats = args.cold_iters;
+    let warm_concur = args.warm_concur;
 
     for function in &functions {
         match args.runtime {
@@ -261,52 +311,90 @@ pub fn benchmark_worker(
             }
             None => "{\"name\":\"TESTING\"}".to_string(),
         };
+        async fn invoke(
+            name: String,
+            version: String,
+            host: String,
+            port: Port,
+            tid: TransactionId,
+            args: Option<String>,
+            clock: Clock,
+            factory: Arc<WorkerAPIFactory>,
+            comm_method: Option<CommunicationMethod>,
+        ) -> Result<CompletedWorkerInvocation> {
+            worker_invoke(
+                name.as_str(),
+                version.as_str(),
+                host.as_str(),
+                port,
+                &tid,
+                args,
+                clock,
+                &factory,
+                comm_method,
+            ).await
+        }
+
         for supported_compute in compute {
             info!("{} {:?}", &function.name, supported_compute);
 
             for iter in 0..cold_repeats {
                 let name = format!("{}.{:?}.{}", &function.name, supported_compute, iter);
-                let version = iter.to_string();
-                let (_s, _reg_dur, _tid) = match threaded_rt.block_on(worker_register(
-                    name.clone(),
-                    &version,
-                    function.image_name.clone(),
-                    memory,
-                    args.host.clone(),
-                    args.port,
-                    &factory,
-                    None,
-                    isolation,
-                    supported_compute,
-                    None,
-                )) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("{:?}", e);
-                        continue;
-                    }
-                };
+                let mut versions = vec![];
+                for i in 0..warm_concur {
+                    versions.push(format!("0.{}.{}", i, iter));
+                }
+                for version in versions.iter(){
+                    let (_s, _reg_dur, _tid) = match threaded_rt.block_on(worker_register(
+                            name.clone(),
+                            &version,
+                            function.image_name.clone(),
+                            memory,
+                            args.host.clone(),
+                            args.port,
+                            &factory,
+                            None,
+                            isolation,
+                            supported_compute,
+                            None,
+                    )) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("{:?}", e);
+                            continue;
+                        }
+                    };
+                }
 
                 match args.runtime {
                     0 => {
                         for _ in 0..args.warm_iters + 1 {
-                            match threaded_rt.block_on(worker_invoke(
-                                &name,
-                                &version,
-                                &args.host,
-                                args.port,
-                                &gen_tid(),
-                                Some(func_args.clone()),
-                                clock.clone(),
-                                &factory,
-                                None,
-                            )) {
-                                Ok(r) => invokes.push(r),
-                                Err(e) => {
-                                    error!("Invocation error: {}", e);
-                                    continue;
-                                }
-                            };
+                            let mut handles = vec![];
+                            for i in 0..warm_concur {
+                                handles.push(threaded_rt.spawn(
+                                        invoke(
+                                            name.clone(),
+                                            versions[i as usize].clone(),
+                                            args.host.clone(),
+                                            args.port,
+                                            gen_tid(),
+                                            Some(func_args.clone()),
+                                            clock.clone(),
+                                            factory.clone(),
+                                            None,
+                                        )
+                                ));
+                            }
+                            for handle in handles {
+                                let r = threaded_rt.block_on(handle)?;
+                                match r {
+                                    Ok(r) => invokes.push(r),
+                                    Err(e) => {
+                                        error!("Invocation error: {}", e);
+                                        continue;
+                                    }
+                                };
+                            }
                         }
                     }
                     duration_sec => {
@@ -315,7 +403,7 @@ pub fn benchmark_worker(
                         while start.elapsed() < timeout {
                             match threaded_rt.block_on(worker_invoke(
                                 &name,
-                                &version,
+                                &versions[0],
                                 &args.host,
                                 args.port,
                                 &gen_tid(),
