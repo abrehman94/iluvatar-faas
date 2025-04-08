@@ -335,6 +335,7 @@ impl CpuQueueingInvoker {
         permit: Option<Box<dyn Drop + Send>>,
         ipermit: OwnedSemaphorePermit
     ) -> Result<(ParsedResult, Duration, Compute, ContainerState)> {
+        self.cpu.block_container_acquire( tid, reg.fqdn.as_str() ).await;
         debug!(tid=%tid, "Internal invocation starting");
         // take run time now because we may have to wait to get a container
         let remove_time = self.clock.now_str()?;

@@ -190,6 +190,14 @@ pub struct FineSchedConfig {
     /// "e2e_buckets":  [  ],
     pub e2e_buckets: Vec<i32>,
 
+
+
+    /// "static_sel_conc_limit"         : {
+    ///      "torch_rnn"       : 0,
+    ///      "float_operation" : 1 
+    ///  },
+    pub static_sel_conc_limit: HashMap<String, i32>,
+
     ///   "static_sel_buckets"         : {
     ///      "torch_rnn"       : [0, 1, 2, 3],
     ///      "float_operation" : [4, 5]

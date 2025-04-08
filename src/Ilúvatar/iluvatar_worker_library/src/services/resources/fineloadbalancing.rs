@@ -2,6 +2,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use tokio::sync::Notify;
+use tokio::task;
+use tokio::runtime::Handle;
+
+use async_trait::async_trait;
+
 use tracing::{debug, error, info};
 
 use crate::worker_api::worker_config::FineSchedConfig;
@@ -15,14 +21,20 @@ use iluvatar_finesched::SchedGroupID;
 use iluvatar_finesched::consts_RESERVED_GID_SWITCH_BACK;
 use iluvatar_library::clock::{get_unix_clock, Clock};
 
+use crate::services::resources::cpugroups::GidStats;
+
 use std::collections::HashMap;
 use dashmap::DashMap;
 use regex::Regex;
 
 /// dynamic trait cannot have static functions to allow for dynamic dispatch
+#[async_trait]
 pub trait LoadBalancingPolicyT {
+    async fn block_container_acquire( &self, _tid: &TransactionId, fqdn: &str ){
+        debug!( _tid=%_tid, fqdn=%fqdn, "[finesched] default handler block container acquire in LoadBalancingPolicyT");
+    }
     fn invoke( &self, _cgroup_id: &str, _tid: &TransactionId, fqdn: &str, ) -> Option<SchedGroupID>;
-    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId, );
+    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId, ){}
 }
 
 pub type LoadBalancingPolicyTRef = Arc<dyn LoadBalancingPolicyT + Sync + Send>;
@@ -35,7 +47,7 @@ pub struct SharedData {
     /// tid -> gid 
     maptidstats: Arc<DashMap<TransactionId, SchedGroupID>>,  
     /// gid -> count 
-    mapgidstats: Arc<DashMap<SchedGroupID, u32>>, 
+    mapgidstats: GidStats, 
 }
 
 impl SharedData {
@@ -44,7 +56,7 @@ impl SharedData {
             pgs: Arc<PreAllocatedGroups>,
             cmap: Arc<CharacteristicsMap>,
             maptidstats: Arc<DashMap<TransactionId, SchedGroupID>>,
-            mapgidstats: Arc<DashMap<SchedGroupID, u32>>,
+            mapgidstats: GidStats,
         ) -> Self {
         SharedData {
             config,
@@ -70,8 +82,6 @@ impl DomZero {
 impl LoadBalancingPolicyT for DomZero {
     fn invoke( &self, cgroup_id: &str, tid: &TransactionId, fqdn: &str ) -> Option<SchedGroupID> {
         return Some(0) 
-    }
-    fn invoke_complete( &self, cgroup_id: &str, tid: &TransactionId ) {
     }
 }
 
@@ -101,8 +111,6 @@ impl LoadBalancingPolicyT for RoundRobin {
             self.nextgid.store( 1, Ordering::Relaxed );
         }
         return Some(gid) 
-    }
-    fn invoke_complete( &self, cgroup_id: &str, tid: &TransactionId ) {
     }
 }
 
@@ -141,7 +149,6 @@ impl LoadBalancingPolicyT for RoundRobinRL {
             return Some(*lgid.unwrap());
         }
     }
-    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId ) {}
 }
 
 ////////////////////////////////////
@@ -168,8 +175,8 @@ fn match_pattern( pattern: &str, line: &str ) -> bool {
 }
 
 impl LoadBalancingPolicyT for StaticSelect {
-    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, fqdn: &str ) -> Option<SchedGroupID> {
-        debug!( fqdn=%fqdn, cgroup_id=%cgroup_id, tid=%tid,  "[finesched] static select dispatch policy" );
+    fn invoke( &self, _cgroup_id: &str, tid: &TransactionId, fqdn: &str ) -> Option<SchedGroupID> {
+        debug!( fqdn=%fqdn, cgroup_id=%_cgroup_id, tid=%tid,  "[finesched] static select dispatch policy" );
         let tgroups = self.shareddata.pgs.total_groups() as i32;
         for (func,gid) in self.static_sel_buckets.iter() {
             // "fqdn":"lin_pack-0.1",
@@ -184,7 +191,102 @@ impl LoadBalancingPolicyT for StaticSelect {
         } 
         return Some(0) 
     }
-    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId ) {}
+}
+
+////////////////////////////////////
+/// Static Select Concurrency Limited Load Balancing Policy
+
+pub struct StaticSelectCL {
+    selpolicy: StaticSelect,
+    _conlimit_org: HashMap<String, i32>, // func -> conlimit - as per config
+    conlimit: HashMap<i32, u32>, // gid -> conlimit
+    waiters: DashMap<SchedGroupID, Arc<Notify>>, // tid -> waiting primitive                                 
+    local_gidstats: GidStats, // it needs it's own gitstats tracking to avoid race conditions                                                 
+}
+
+impl StaticSelectCL {
+    pub fn new(shareddata: SharedData, static_sel_buckets: HashMap<String, i32>, static_con_limit: HashMap<String, i32>,) -> Self {
+        let mut conlimit = HashMap::new();
+        for (func,cl) in static_con_limit.iter() {
+            let cl = *cl as u32;
+            let gid = static_sel_buckets.get(func).unwrap();
+            let clo = conlimit.get(gid);
+            if let Some(clo) = clo {
+                conlimit.insert(*gid, cl + clo );
+            }else{
+                conlimit.insert(*gid, cl );
+            }
+        }
+        
+        let local_gidstats = GidStats::new( shareddata.pgs.clone() );
+
+        StaticSelectCL{
+            selpolicy: StaticSelect {
+                shareddata,
+                static_sel_buckets,
+            },
+            _conlimit_org: static_con_limit,
+            conlimit,
+            waiters: DashMap::new(),
+            local_gidstats,
+        }
+    }
+}
+
+#[async_trait]
+impl LoadBalancingPolicyT for StaticSelectCL {
+
+    async fn block_container_acquire( &self, tid: &TransactionId, fqdn: &str ){
+
+        debug!( tid=%tid, fqdn=%fqdn, "[finesched][staticselcl] blocking handler ");
+        let gid = self.selpolicy.invoke( "", tid, fqdn ); 
+        if let Some(gid) = gid {
+
+            // check if acquiring this gid is within concurrency limit
+            let current = self.local_gidstats.acquire_group( gid ).unwrap();
+            let climit = self.conlimit.get( &gid ).unwrap();
+
+            if current >= *climit {
+                debug!( tid=%tid, fqdn=%fqdn, gid=%gid, current=%current, climit=%climit, "[finesched][staticselcl] blocking given tid until a gid becomes available");
+                // block this thread using a conditional variable against tid 
+                let notify = match self.waiters.get( &gid ){
+                    Some( notify ) => {
+                        notify.clone()
+                    },
+                    None => {
+                        Arc::new(Notify::new())
+                    }
+                };
+                self.waiters.insert( gid, notify.clone() );
+                notify.notified().await;
+            }
+        }
+
+    }
+
+    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, fqdn: &str ) -> Option<SchedGroupID> {
+        debug!( tid=%tid, fqdn=%fqdn, "[finesched][staticselcl] invoke handler ");
+        return self.selpolicy.invoke( cgroup_id, tid, fqdn ) 
+    }
+
+    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId, ){
+        debug!( tid=%tid, "[finesched][staticselcl] invoke_complete handler ");
+
+        let gid = self.selpolicy.shareddata.maptidstats.get( tid ).unwrap();
+
+        self.local_gidstats.return_group( *gid.value() );
+
+        // signal the conditional variable to wake up the thread
+        let notify = self.waiters.get( &gid );
+        match notify {
+            Some( notify ) => {
+                notify.notify_one();
+            },
+            None => {
+                error!( tid=%tid, "[finesched][staticselcl] invoke_complete - no waiters found" );
+            }
+        }
+    }
 }
 
 ////////////////////////////////////
@@ -213,21 +315,19 @@ impl LoadBalancingPolicyT for LWLInvoc {
         // we want to prefer lower numbered domains over higher numbered domains
         for lgid in 0..self.shareddata.pgs.total_groups() {
             let lgid = lgid as SchedGroupID;
-            let lcount = self.shareddata.mapgidstats.get(&lgid).unwrap();
+            let lcount = self.shareddata.mapgidstats.fetch_current(lgid).unwrap();
 
-            if *lcount == 0 {
+            if lcount == 0 {
                 gid = Some(lgid);
                 break;
-            } else if *lcount < min_count {
-                min_count = *lcount;
+            } else if lcount < min_count {
+                min_count = lcount;
                 gid = Some(lgid);
             }
         }
 
         gid
     }
-
-    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId ) {}
 }
 
 
@@ -257,21 +357,19 @@ impl LoadBalancingPolicyT for SITA {
         // we want to prefer lower numbered domains over higher numbered domains
         for lgid in 0..self.shareddata.pgs.total_groups() {
             let lgid = lgid as SchedGroupID;
-            let lcount = self.shareddata.mapgidstats.get(&lgid).unwrap();
+            let lcount = self.shareddata.mapgidstats.fetch_current(lgid).unwrap();
 
-            if *lcount == 0 {
+            if lcount == 0 {
                 gid = Some(lgid);
                 break;
-            } else if *lcount < min_count {
-                min_count = *lcount;
+            } else if lcount < min_count {
+                min_count = lcount;
                 gid = Some(lgid);
             }
         }
 
         gid
     }
-
-    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId ) {}
 }
 
 ////////////////////////////////////
