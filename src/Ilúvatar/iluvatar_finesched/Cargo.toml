@@ -12,7 +12,7 @@ categories.workspace = true
 
 [build-dependencies]
 #scx_utils = { version = "1.0.7" }
-scx_utils = { path = "/data2/ar/finescheduling/scx/rust/scx_utils" }
+scx_utils = { path = "/scx/rust/scx_utils" }
 
 [dependencies]
 # for parsing args
@@ -26,7 +26,7 @@ ctrlc = { version = "3.1", features = ["termination"] }
 anyhow = "1.0"
 libbpf-rs = { version = "0.24.4" }
 #scx_utils = { version = "1.0.7" }
-scx_utils = { path = "/data2/ar/finescheduling/scx/rust/scx_utils" }
+scx_utils = { path = "/scx/rust/scx_utils" }
 
 
 [dev-dependencies]

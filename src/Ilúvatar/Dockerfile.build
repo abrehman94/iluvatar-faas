@@ -1,0 +1,16 @@
+FROM rust:bullseye
+
+RUN apt update && apt install -y software-properties-common
+RUN add-apt-repository "deb http://apt.llvm.org/bullseye/ llvm-toolchain-bullseye main"
+RUN gpg --keyserver keyserver.ubuntu.com --recv-keys 15CF4D18AF4F7421
+RUN gpg --export --armor 15CF4D18AF4F7421 | tee /etc/apt/trusted.gpg.d/debllvm-key.asc
+RUN apt update 
+RUN apt-get install -y llvm clang dwarves libelf-dev
+RUN apt-get install -y cmake gcc g++ libssl-dev pkg-config libprotobuf-dev protobuf-compiler  
+
+# Set the working directory inside the container
+WORKDIR /workspace
+
+# Entry point will assume the current folder is mounted to /workspace
+CMD ["make"]
+

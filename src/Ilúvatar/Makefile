@@ -9,7 +9,7 @@ TARGET :=
 else
 TARGET :=--target $(TARGET_PLAT)
 endif
-RUST_C?=cross
+RUST_C?=cargo
 DEBUG_FLAGS=--all-targets $(TARGET) -j $(NPROCS)
 RELEASE_FLAGS=--lib --bins $(TARGET) -j $(NPROCS) --release
 CARGO_ARGS?=
@@ -37,6 +37,8 @@ tiny:
 debug:
 	@echo "Building debug"
 	@RUSTFLAGS=$(RUST_FLAGS) $(RUST_C) build $(DEBUG_FLAGS) $(CARGO_ARGS)
+in_docker:
+	@./build_in_a_container.sh
 spans:
 	@echo "Building full_spans"
 	@RUSTFLAGS=$(RUST_FLAGS) $(RUST_C) build --features full_spans $(RELEASE_FLAGS) $(CARGO_ARGS)
