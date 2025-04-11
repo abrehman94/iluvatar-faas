@@ -18,6 +18,7 @@ use iluvatar_library::characteristics_map::CharacteristicsMap;
 use iluvatar_finesched::PreAllocatedGroups;
 use iluvatar_finesched::SharedMapsSafe;
 use iluvatar_finesched::SchedGroupID;
+use iluvatar_finesched::SchedGroup;
 use iluvatar_finesched::consts_RESERVED_GID_SWITCH_BACK;
 use iluvatar_library::clock::{get_unix_clock, Clock};
 
@@ -26,6 +27,9 @@ use crate::services::resources::cpugroups::GidStats;
 use std::collections::HashMap;
 use dashmap::DashMap;
 use regex::Regex;
+
+////////////////////////////////////
+/// Shared or Global stuff across policies  
 
 /// dynamic trait cannot have static functions to allow for dynamic dispatch
 #[async_trait]
@@ -64,6 +68,54 @@ impl SharedData {
             cmap,
             maptidstats,
             mapgidstats,
+        }
+    }
+}
+
+
+struct DomConcurrencyLimiter {
+    waiters: DashMap<SchedGroupID, Arc<Notify>>, // tid -> waiting primitive                                 
+    local_gidstats: GidStats, // it needs it's own gitstats tracking to avoid race conditions                                                 
+}
+
+impl DomConcurrencyLimiter {
+    pub fn new( local_gidstats: GidStats ) -> Self {
+        DomConcurrencyLimiter {
+            waiters: DashMap::new(),
+            local_gidstats,
+        }
+    }
+
+    pub fn acquire_group( &self, gid: SchedGroupID ) -> Option<u32> {
+        let current = self.local_gidstats.acquire_group( gid );
+        current
+    }
+
+    pub async fn wait_for_group( &self, gid: SchedGroupID ) {
+        // block this thread using a conditional variable against tid 
+        let notify = match self.waiters.get( &gid ){
+            Some( notify ) => {
+                notify.clone()
+            },
+            None => {
+                Arc::new(Notify::new())
+            }
+        };
+        self.waiters.insert( gid, notify.clone() );
+        notify.notified().await;
+    }
+
+    pub fn return_group( &self, gid: SchedGroupID ) {
+        self.local_gidstats.return_group( gid );
+        // signal the conditional variable to wake up the thread
+        let notify = self.waiters.get( &gid );
+        match notify {
+            Some( notify ) => {
+                notify.notify_one();
+            },
+            None => {
+                error!( gid=%gid, "[finesched][DomConcurrencyLimiter] no waiters found" );
+            }
         }
     }
 }
@@ -198,10 +250,11 @@ impl LoadBalancingPolicyT for StaticSelect {
 
 pub struct StaticSelectCL {
     selpolicy: StaticSelect,
+
     _conlimit_org: HashMap<String, i32>, // func -> conlimit - as per config
     conlimit: HashMap<i32, u32>, // gid -> conlimit
-    waiters: DashMap<SchedGroupID, Arc<Notify>>, // tid -> waiting primitive                                 
-    local_gidstats: GidStats, // it needs it's own gitstats tracking to avoid race conditions                                                 
+                                 //
+    domlimiter: DomConcurrencyLimiter,
 }
 
 impl StaticSelectCL {
@@ -219,16 +272,18 @@ impl StaticSelectCL {
         }
         
         let local_gidstats = GidStats::new( shareddata.pgs.clone() );
+        let domlimiter = DomConcurrencyLimiter::new( local_gidstats );
 
         StaticSelectCL{
             selpolicy: StaticSelect {
                 shareddata,
                 static_sel_buckets,
             },
+            
             _conlimit_org: static_con_limit,
             conlimit,
-            waiters: DashMap::new(),
-            local_gidstats,
+
+            domlimiter,
         }
     }
 }
@@ -243,22 +298,12 @@ impl LoadBalancingPolicyT for StaticSelectCL {
         if let Some(gid) = gid {
 
             // check if acquiring this gid is within concurrency limit
-            let current = self.local_gidstats.acquire_group( gid ).unwrap();
+            let current = self.domlimiter.acquire_group( gid ).unwrap();
             let climit = self.conlimit.get( &gid ).unwrap();
 
             if current >= *climit {
                 debug!( tid=%tid, fqdn=%fqdn, gid=%gid, current=%current, climit=%climit, "[finesched][staticselcl] blocking given tid until a gid becomes available");
-                // block this thread using a conditional variable against tid 
-                let notify = match self.waiters.get( &gid ){
-                    Some( notify ) => {
-                        notify.clone()
-                    },
-                    None => {
-                        Arc::new(Notify::new())
-                    }
-                };
-                self.waiters.insert( gid, notify.clone() );
-                notify.notified().await;
+                self.domlimiter.wait_for_group( gid ).await;
             }
         }
 
@@ -273,21 +318,132 @@ impl LoadBalancingPolicyT for StaticSelectCL {
         debug!( tid=%tid, "[finesched][staticselcl] invoke_complete handler ");
 
         let gid = self.selpolicy.shareddata.maptidstats.get( tid ).unwrap();
+        self.domlimiter.return_group( *gid.value() );
+    }
+}
 
-        self.local_gidstats.return_group( *gid.value() );
 
-        // signal the conditional variable to wake up the thread
-        let notify = self.waiters.get( &gid );
-        match notify {
-            Some( notify ) => {
-                notify.notify_one();
-            },
-            None => {
-                error!( tid=%tid, "[finesched][staticselcl] invoke_complete - no waiters found" );
-            }
+////////////////////////////////////
+/// Online Warm_Core_Maximus Concurrency Limited Load Balancing Policy
+
+struct DomState {
+    serving_count: u32,
+    funcs_serving: DashMap<String, u32>,
+    bpfdom_config: SchedGroup,
+    numa_node: u32, 
+}
+
+impl DomState {
+    pub fn init_map( 
+            pgs: Arc<PreAllocatedGroups>,
+        ) -> DashMap<SchedGroupID, DomState> {
+        let doms = DashMap::new();
+        for gid in 0..pgs.total_groups() {
+            let gid = gid as SchedGroupID;
+            let bpfdom_config = pgs.get_schedgroup( gid ).unwrap();
+            doms.insert( gid, DomState{
+                serving_count: 0,
+                funcs_serving: DashMap::new(),
+                bpfdom_config: bpfdom_config.clone(),
+                numa_node: 0,
+            });
+        }
+        doms
+    }
+}
+
+struct FuncHistory {
+    // 1 means when scheduling domain is used exclusively by this function
+    con_limit_1: u32,  
+    dur_1: u32,
+}
+
+struct TidState {
+    gid: SchedGroupID,
+    fqdn: String,
+}
+
+pub struct WarmCoreMaximusCL {
+    // cmap - for function characteristics 
+    shareddata: SharedData,
+
+    // local dom state tracking 
+    // id: state 
+    doms: DashMap<SchedGroupID, DomState>,
+    
+    // func -> dom ids serving it 
+    fdoms: DashMap<String, Vec<SchedGroupID>>,
+
+    // local function historic characteristics  
+    func_history: DashMap<String, FuncHistory>,
+
+    tid_gid_map: DashMap<TransactionId, TidState>,
+    
+    domlimiter: DomConcurrencyLimiter,
+}
+
+impl WarmCoreMaximusCL {
+    pub fn new( shareddata: SharedData, ) -> Self {
+        
+        let local_gidstats = GidStats::new( shareddata.pgs.clone() );
+        let domlimiter = DomConcurrencyLimiter::new( local_gidstats );
+
+        let doms = DomState::init_map( shareddata.pgs.clone() );
+        
+        WarmCoreMaximusCL{
+            shareddata,
+
+            doms,
+
+            fdoms: DashMap::new(),
+            func_history: DashMap::new(),
+            
+            tid_gid_map: DashMap::new(),
+            domlimiter,
         }
     }
 }
+
+impl WarmCoreMaximusCL {
+    fn find_available_dom( &self, 
+            fqdn: &str,
+        ) -> Option<SchedGroupID> {
+        Some(0)
+    }
+}
+
+#[async_trait]
+impl LoadBalancingPolicyT for WarmCoreMaximusCL {
+
+    async fn block_container_acquire( &self, tid: &TransactionId, fqdn: &str ) {
+        debug!( tid=%tid, fqdn=%fqdn, "[finesched][warmcoremaximuscl] blocking handler ");
+        // check if a dom exists for fqdn that can serve a new request 
+        // pick a dom if none exists 
+        // block if we just cannot pick any 
+        self.tid_gid_map.insert( 
+            tid.clone(), 
+            TidState{
+                gid: 0,
+                fqdn: fqdn.to_string(),
+            }
+        );
+    }
+
+    fn invoke( &self, _cgroup_id: &str, tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
+        debug!( tid=%tid, "[finesched][warmcoremaximuscl] invoke handler ");
+        self.tid_gid_map.get( tid ).map(|v| v.value().gid )
+    }
+
+    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId, ) {
+        debug!( tid=%tid, "[finesched][warmcoremaximuscl] invoke_complete handler ");
+        
+        // update conlimit for fqdn 
+
+        // cleanup 
+        self.tid_gid_map.remove( tid );
+    }
+}
+
 
 ////////////////////////////////////
 /// Least Work Left - Invocation Based -  Load Balancing Policy

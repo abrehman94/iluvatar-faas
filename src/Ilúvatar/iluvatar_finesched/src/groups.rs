@@ -103,6 +103,10 @@ impl PreAllocatedGroups {
         self.sm.cmap_insert(cgroup_id, &cval);
     }
 
+    pub fn get_schedgroup(&self, gid: SchedGroupID) -> Option<SchedGroup> {
+        self.groups.get(&gid).map(|v| v.clone())
+    }
+
     pub fn total_groups(&self) -> usize {
         self.groups.len()
     } 
