@@ -5,8 +5,18 @@ RUN add-apt-repository "deb http://apt.llvm.org/bullseye/ llvm-toolchain-bullsey
 RUN gpg --keyserver keyserver.ubuntu.com --recv-keys 15CF4D18AF4F7421
 RUN gpg --export --armor 15CF4D18AF4F7421 | tee /etc/apt/trusted.gpg.d/debllvm-key.asc
 RUN apt update 
-RUN apt-get install -y llvm clang dwarves libelf-dev
+#RUN apt-get install -y llvm clang 
+RUN apt-get install -y dwarves libelf-dev
 RUN apt-get install -y cmake gcc g++ libssl-dev pkg-config libprotobuf-dev protobuf-compiler  
+RUN rustup component add rustfmt
+RUN apt install bpftool
+
+WORKDIR /llvm-install
+RUN wget https://apt.llvm.org/llvm.sh 
+RUN chmod a+x ./llvm.sh
+RUN ./llvm.sh 18
+RUN ln -s /usr/bin/ld.lld-18 /usr/bin/ld.lld
+RUN ln -s /usr/bin/clang-18 /usr/bin/clang
 
 # Set the working directory inside the container
 WORKDIR /workspace

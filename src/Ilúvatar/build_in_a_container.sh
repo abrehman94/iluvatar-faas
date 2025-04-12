@@ -13,7 +13,8 @@ ORIGINAL_PATH=$(pwd)
 cd $SCRIPT_PATH
 
 ## Build current folder in a debian image 
-if false; then 
+#if false; then 
+if true; then 
     docker build          \
         --network host        \
         -t make-runner        \
@@ -21,6 +22,7 @@ if false; then
         ./
 fi
 
+cmd=$1
 docker run                                 \
     --rm                                       \
     -it                                        \
@@ -28,7 +30,9 @@ docker run                                 \
     -v "/home/abrehman/workspace/scx/scx":/scx \
     -w /workspace                              \
     --network host                             \
-    make-runner                                
+    make-runner  $cmd                             
+#    make-runner                                \
+#    /bin/bash 
 
 
 

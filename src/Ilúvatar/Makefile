@@ -14,7 +14,7 @@ DEBUG_FLAGS=--all-targets $(TARGET) -j $(NPROCS)
 RELEASE_FLAGS=--lib --bins $(TARGET) -j $(NPROCS) --release
 CARGO_ARGS?=
 
-default: debug
+default: debug 
 
 clean:
 	@echo "Cleaning build dir"
@@ -37,6 +37,7 @@ tiny:
 debug:
 	@echo "Building debug"
 	@RUSTFLAGS=$(RUST_FLAGS) $(RUST_C) build $(DEBUG_FLAGS) $(CARGO_ARGS)
+	@chmod a+rw -R ./target
 in_docker:
 	@./build_in_a_container.sh
 spans:
