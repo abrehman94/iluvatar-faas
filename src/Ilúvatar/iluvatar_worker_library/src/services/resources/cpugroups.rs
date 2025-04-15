@@ -26,7 +26,7 @@ use iluvatar_finesched::SharedMapsSafe;
 use iluvatar_finesched::SchedGroupID;
 use iluvatar_finesched::consts_RESERVED_GID_SWITCH_BACK;
 use iluvatar_library::clock::{get_unix_clock, Clock};
-use crate::services::resources::fineloadbalancing::{LoadBalancingPolicyTRef, RoundRobin, RoundRobinRL, StaticSelect, StaticSelectCL, LWLInvoc, DomZero, SharedData};
+use crate::services::resources::fineloadbalancing::{LoadBalancingPolicyTRef, RoundRobin, RoundRobinRL, StaticSelect, StaticSelectCL, LWLInvoc, DomZero, SharedData, WarmCoreMaximusCL};
 
 lazy_static::lazy_static! {
   pub static ref CPU_GROUP_WORKER_TID: TransactionId = "CPUGroupMonitor".to_string();
@@ -134,6 +134,10 @@ impl CpuGroupsResourceTracker {
         );
 
         let dispatch_policy: LoadBalancingPolicyTRef = match config.dispatchpolicy.to_lowercase().as_str() {
+            "warmcoremaximuscl" => {
+                debug!( tid=%tid, "[finesched] using warmcoremaximuscl dispatch policy" );
+                Arc::new( WarmCoreMaximusCL::new(shareddata) )
+            },
             "static_select_con_limited" => {
                 debug!( tid=%tid, "[finesched] using static_select_con_limited dispatch policy" );
                 Arc::new( StaticSelectCL::new(shareddata, config.static_sel_buckets.clone(), config.static_sel_conc_limit.clone()) )
