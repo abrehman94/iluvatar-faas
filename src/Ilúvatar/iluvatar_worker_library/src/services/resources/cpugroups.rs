@@ -33,6 +33,7 @@ lazy_static::lazy_static! {
 }
 
 const INVOKE_GAP: u64 = 1000; // 1 second
+pub const consts_RESERVED_GID_UNASSIGNED: SchedGroupID = 404;
 
 fn fqdn_to_name(fqdn: &str) -> String {
     let n = fqdn.split(".").nth(0).unwrap();
@@ -56,6 +57,7 @@ impl GidStats {
             mapgidstats.insert(i as SchedGroupID, AtomicU32::new(0));
         });
         mapgidstats.insert(consts_RESERVED_GID_SWITCH_BACK as SchedGroupID, AtomicU32::new(0));
+        mapgidstats.insert(consts_RESERVED_GID_UNASSIGNED as SchedGroupID, AtomicU32::new(0));
         let mapgidstats = GidStats { stats: mapgidstats };
         GidStats{
             stats: mapgidstats.stats.clone(),
@@ -64,23 +66,24 @@ impl GidStats {
 
     // returns the number of times the group has been acquired
     // it will panic if gid was not populated with a zero counter on init  
-    pub fn acquire_group(&self, gid: SchedGroupID) -> Option<u32> {
+    pub fn acquire_group(&self, gid: SchedGroupID) -> u32 {
         let count = self.stats.get( &gid ).unwrap();
         let ccount = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         debug!(gid=%gid, group_count=%ccount, "[finesched][GidStats] acquire_group( gid ) - acquired group id");
-        Some(ccount)
+        ccount
     }
     
     // returns the group to the pool
-    // harmfull to call excessively if already at zero - race condition 
-    pub fn return_group(&self, gid: SchedGroupID) {
+    // harmful to call excessively if already at zero - race condition 
+    pub fn return_group(&self, gid: SchedGroupID) -> u32 {
         let count = self.stats.get( &gid ).unwrap();
-        let ccount = count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let mut ccount = count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         if ccount == 0 {
             warn!(gid=%gid, group_count=%ccount, "[finesched][GidStats] return_group( gid ) - overflowed there was extra return");
-            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ccount = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         debug!(gid=%gid, group_count=%ccount, "[finesched][GidStats] return_group( gid ) - returned group id");
+        ccount
     }
 
     pub fn fetch_current(&self, gid: SchedGroupID) -> Option<u32> {
@@ -210,8 +213,8 @@ impl CpuResourceTrackerT for CpuGroupsResourceTracker {
         }
     }
 
-    fn notify_cgroup_id_done( &self, _cgroup_id: &str, _tid: &TransactionId, ) {
-        self.lbpolicy.invoke_complete( _cgroup_id, _tid );
+    fn notify_cgroup_id_done( &self, _cgroup_id: &str, _tid: &TransactionId, fqdn: &str ) {
+        self.lbpolicy.invoke_complete( _cgroup_id, _tid, fqdn );
         let gid = match self.maptidstats.get( _tid ) {
             Some(ent) => *ent.value(),
             None => {

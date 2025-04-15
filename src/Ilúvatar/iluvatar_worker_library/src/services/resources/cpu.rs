@@ -17,14 +17,14 @@ lazy_static::lazy_static! {
 #[async_trait]
 pub trait CpuResourceTrackerT {
     fn try_acquire_cores( &self, reg: &Arc<RegisteredFunction>, _tid: &TransactionId, ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::TryAcquireError>;
-    async fn block_container_acquire( &self, _tid: &TransactionId, fqdn: &str ){
-        debug!( _tid=%_tid, fqdn=%fqdn, "[finesched] default handler block container acquire");
+    async fn block_container_acquire( &self, _tid: &TransactionId, _fqdn: &str ){
+        debug!( _tid=%_tid, _fqdn=%_fqdn, "[finesched] default handler block container acquire" );
     }
-    fn notify_cgroup_id( &self, _cgroup_id: &str, _tid: &TransactionId, fqdn: &str ){
-        debug!(_cgroup_id=%_cgroup_id, _tid=%_tid, "[finesched] cgroup assigned for the invocation");
+    fn notify_cgroup_id( &self, _cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ){
+        debug!( _cgroup_id=%_cgroup_id, _tid=%_tid, _fqdn=%_fqdn, "[finesched] cgroup assigned for the invocation" );
     } 
-    fn notify_cgroup_id_done( &self, _cgroup_id: &str, _tid: &TransactionId, ){
-        debug!(_cgroup_id=%_cgroup_id, _tid=%_tid, "[finesched] cgroup assigned for the invocation is done");
+    fn notify_cgroup_id_done( &self, _cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ){
+        debug!( _cgroup_id=%_cgroup_id, _tid=%_tid, _fqdn=%_fqdn, "[finesched] cgroup assigned for the invocation is done" );
     } 
 }
 

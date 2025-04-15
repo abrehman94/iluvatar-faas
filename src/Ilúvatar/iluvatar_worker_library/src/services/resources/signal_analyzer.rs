@@ -154,28 +154,29 @@ impl SignalAnalyzer<i64>
         self.data.lock().unwrap().buffer.len()
     }
 
-    pub fn get_nth_max(&self, index: Option<isize>) -> i64 {
+    pub fn get_nth_max(&self, index: isize) -> i64 {
         self.get_at(&self.data.lock().unwrap().maxs, index)
     }
 
-    pub fn get_nth_min(&self, index: Option<isize>) -> i64 {
+    pub fn get_nth_min(&self, index: isize) -> i64 {
         self.get_at(&self.data.lock().unwrap().mins, index)
     }
 
-    pub fn get_nth_avg(&self, index: Option<isize>) -> i64 {
+    pub fn get_nth_avg(&self, index: isize) -> i64 {
         self.get_at(&self.data.lock().unwrap().avgs, index)
     }
 
-    pub fn get_nth_minnorm_avg(&self, index: Option<isize>) -> i64 {
+    pub fn get_nth_minnorm_avg(&self, index: isize) -> i64 {
         self.get_at(&self.data.lock().unwrap().avgs_norm_min, index)
     }
 
-    fn get_at(&self, vec: &Vec<i64>, index: Option<isize>) -> i64 {
-        let idx = match index {
-            Some(i) if i < 0 => (vec.len() as isize + i) as usize,
-            Some(i) => i as usize,
-            None => vec.len() - 1,
-        };
+    fn get_at(&self, vec: &Vec<i64>, index: isize) -> i64 {
+        let idx;  
+        if index < 0 {
+            idx = (vec.len() as isize + index) as usize;
+        } else {
+            idx = index as usize;
+        }
         vec.get(idx).copied().unwrap_or(0)
     }
 }
@@ -203,18 +204,26 @@ mod signal_analyzer_tests {
         // Normalized Mins: [1, 1, 2, 2]
         assert_eq!(sa.get_n(), 6);
 
-        assert_eq!( sa.get_nth_avg(Some(0))          , 23);
-        assert_eq!( sa.get_nth_avg(Some(-1))         , 50);
+        assert_eq!( sa.get_nth_avg(0)          , 23);
+        assert_eq!( sa.get_nth_avg(-1)         , 50);
 
-        assert_eq!( sa.get_nth_min(Some(0))          , 23);
-        assert_eq!( sa.get_nth_min(Some(-1))         , 23);
+        assert_eq!( sa.get_nth_min(0)          , 23);
+        assert_eq!( sa.get_nth_min(-1)         , 23);
 
-        assert_eq!( sa.get_nth_max(Some(0))          , 23);
-        assert_eq!( sa.get_nth_max(Some(-1))         , 50);
+        assert_eq!( sa.get_nth_max(0)          , 23);
+        assert_eq!( sa.get_nth_max(-1)         , 50);
 
-        assert_eq!( sa.get_nth_minnorm_avg(Some(0))  , 1);
-        assert_eq!( sa.get_nth_minnorm_avg(Some(-1)) , 2);
+        assert_eq!( sa.get_nth_minnorm_avg(0)  , 1);
+        assert_eq!( sa.get_nth_minnorm_avg(-1) , 2);
     }
 }
 
+impl Clone for SignalAnalyzer<i64> {
+    fn clone(&self) -> Self {
+        SignalAnalyzer {
+            idata: self.idata.clone(),
+            data: Mutex::new(self.data.lock().unwrap().clone()),
+        }
+    }
+}
 

@@ -1,6 +1,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::AtomicU32;
 
 use tokio::sync::Notify;
 use tokio::task;
@@ -23,7 +24,10 @@ use iluvatar_finesched::consts_RESERVED_GID_SWITCH_BACK;
 use iluvatar_library::clock::{get_unix_clock, Clock};
 
 use crate::services::resources::cpugroups::GidStats;
+use crate::services::resources::cpugroups::consts_RESERVED_GID_UNASSIGNED;
 use crate::services::resources::signal_analyzer::SignalAnalyzer;
+use crate::services::resources::arc_map::ArcMap;
+use crate::services::resources::arc_map::ClonableAtomicU32;
 
 use std::collections::HashMap;
 use dashmap::DashMap;
@@ -39,7 +43,7 @@ pub trait LoadBalancingPolicyT {
         debug!( _tid=%_tid, fqdn=%fqdn, "[finesched] default handler block container acquire in LoadBalancingPolicyT");
     }
     fn invoke( &self, _cgroup_id: &str, _tid: &TransactionId, fqdn: &str, ) -> Option<SchedGroupID>;
-    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId, ){}
+    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId, fqdn: &str, ){}
 }
 
 pub type LoadBalancingPolicyTRef = Arc<dyn LoadBalancingPolicyT + Sync + Send>;
@@ -87,9 +91,8 @@ impl DomConcurrencyLimiter {
         }
     }
 
-    pub fn acquire_group( &self, gid: SchedGroupID ) -> Option<u32> {
-        let current = self.local_gidstats.acquire_group( gid );
-        current
+    pub fn acquire_group( &self, gid: SchedGroupID ) -> u32 {
+        self.local_gidstats.acquire_group( gid )
     }
 
     pub async fn wait_for_group( &self, gid: SchedGroupID ) {
@@ -106,8 +109,8 @@ impl DomConcurrencyLimiter {
         notify.notified().await;
     }
 
-    pub fn return_group( &self, gid: SchedGroupID ) {
-        self.local_gidstats.return_group( gid );
+    pub fn return_group( &self, gid: SchedGroupID ) -> u32 {
+        let count = self.local_gidstats.return_group( gid );
         // signal the conditional variable to wake up the thread
         let notify = self.waiters.get( &gid );
         match notify {
@@ -118,6 +121,7 @@ impl DomConcurrencyLimiter {
                 error!( gid=%gid, "[finesched][DomConcurrencyLimiter] no waiters found" );
             }
         }
+        count
     }
 }
 
@@ -300,7 +304,7 @@ impl LoadBalancingPolicyT for StaticSelectCL {
         if let Some(gid) = gid {
 
             // check if acquiring this gid is within concurrency limit
-            let current = self.domlimiter.acquire_group( gid ).unwrap();
+            let current = self.domlimiter.acquire_group( gid );
             let climit = self.conlimit.get( &gid ).unwrap();
 
             if current >= *climit {
@@ -316,7 +320,7 @@ impl LoadBalancingPolicyT for StaticSelectCL {
         return self.selpolicy.invoke( cgroup_id, tid, fqdn ) 
     }
 
-    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId, ){
+    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId, fqdn: &str, ){
         debug!( tid=%tid, "[finesched][staticselcl] invoke_complete handler ");
 
         let gid = self.selpolicy.shareddata.maptidstats.get( tid ).unwrap();
@@ -328,80 +332,50 @@ impl LoadBalancingPolicyT for StaticSelectCL {
 ////////////////////////////////////
 /// Online Warm_Core_Maximus Concurrency Limited Load Balancing Policy
 
+#[derive(Clone, Default)]
 struct DomState {
     serving_count: u32,
     funcs_serving: DashMap<String, u32>,
     bpfdom_config: SchedGroup,
     numa_node: u32, 
+    concur_limit: ClonableAtomicU32,
 }
 
 impl DomState {
     pub fn init_map( 
             pgs: Arc<PreAllocatedGroups>,
-        ) -> DashMap<SchedGroupID, DomState> {
-        let doms = DashMap::new();
+        ) -> ArcMap<SchedGroupID, DomState> {
+        let doms = ArcMap::new();
         for gid in 0..pgs.total_groups() {
             let gid = gid as SchedGroupID;
             let bpfdom_config = pgs.get_schedgroup( gid ).unwrap();
-            doms.insert( gid, DomState{
+            doms.map.insert( gid, Arc::new(DomState{
                 serving_count: 0,
                 funcs_serving: DashMap::new(),
                 bpfdom_config: bpfdom_config.clone(),
                 numa_node: 0,
-            });
+                concur_limit: ClonableAtomicU32::new(48), // we start from an overcommit state 
+            }));
         }
         doms
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct FuncHistory {
-    // 1 means when scheduling domain is used exclusively by this function
-    con_limit_1: u32,  
-    dur_1: u32,
+    pub dur_buffer_1: SignalAnalyzer<i64>,
+    pub concur_buffer_1: SignalAnalyzer<i64>,
+    pub concur_limit_1: ArcMap<SchedGroupID, ClonableAtomicU32>,
 }
 
-struct FuncHistMap {
-    map: DashMap<String, FuncHistory>,
-    buff_limit: usize,
-}
-
-impl FuncHistMap {
-    pub fn new() -> Self {
-        FuncHistMap {
-            map: DashMap::new(),
-            buff_limit: 5,
+impl Default for FuncHistory {
+    fn default() -> Self {
+        FuncHistory{
+            dur_buffer_1: SignalAnalyzer::new( 6 ),
+            concur_buffer_1: SignalAnalyzer::new( 6 ),
+            concur_limit_1: ArcMap::new(),
         }
     }
-
-    // pub fn get_or_create( &self, func: &str ) -> FuncHistory {
-    //     match self.map.get( func ) {
-    //         Some( v ) => v.value().clone(),
-    //         None => {
-    //             let fh = FuncHistory{
-    //                 con_limit_1: 0,
-    //                 dur_1: 0,
-    //             };
-    //             self.map.insert( func.to_string(), fh.clone() );
-    //             fh
-    //         }
-    //     }
-    // }
-
-    // pub fn update_dur(&self, 
-    //         func: &str,
-    //         dur: f64,
-    //     ) {
-    //     let mut fh = self.get_or_create( func );
-    //     fh.dur_1 = dur as u32;
-    //     fh.buffer_1.add_value( dur );
-    //     self.map.insert( func.to_string(), fh.clone() );
-    // }
-}
-
-struct TidState {
-    gid: SchedGroupID,
-    fqdn: String,
 }
 
 pub struct WarmCoreMaximusCL {
@@ -410,15 +384,15 @@ pub struct WarmCoreMaximusCL {
 
     // local dom state tracking 
     // id: state 
-    doms: DashMap<SchedGroupID, DomState>,
+    doms: ArcMap<SchedGroupID, DomState>,
     
     // func -> dom ids serving it 
-    fdoms: DashMap<String, Vec<SchedGroupID>>,
+    fdoms: ArcMap<String, Vec<SchedGroupID>>,
 
     // local function historic characteristics  
-    func_history: FuncHistMap,
+    func_history: ArcMap<String, FuncHistory>,
 
-    tid_gid_map: DashMap<TransactionId, TidState>,
+    tid_gid_map: ArcMap<TransactionId, SchedGroupID>,
     
     domlimiter: DomConcurrencyLimiter,
 }
@@ -436,18 +410,66 @@ impl WarmCoreMaximusCL {
 
             doms,
 
-            fdoms: DashMap::new(),
-            func_history: FuncHistMap::new(),
+            fdoms: ArcMap::new(),
+            func_history: ArcMap::new(),
             
-            tid_gid_map: DashMap::new(),
+            tid_gid_map: ArcMap::new(),
             domlimiter,
         }
     }
-
-    fn find_available_dom( &self, 
-            fqdn: &str,
+    
+    /// Checks with domlimiter before handing over the gid  
+    async fn find_available_dom( &self, 
+            _fqdn: &str,
         ) -> Option<SchedGroupID> {
+
+        // first check if a dom is already allocated to fqdn in it's history 
+        
+        // if no 
+            // iterate over available domains and find an empty one 
+            
+        // acquire whatever found from domlimiter and return 
+        // check if concurrency of domilimiter is within limit 
+        // if not 
+            // wait for it to become available
+        
+        // return the gid
+        
+        let _current = self.domlimiter.acquire_group(0);
+        // check if current is within the concurrency limit of the dom as well 
+        // sleep if not 
         Some(0)
+    }
+
+    pub fn return_and_update_concurrency_limit( &self, fqdn: &str, gid: SchedGroupID ) {
+        
+        // history of fqdn 
+        let fhist = self.func_history.get_or_create( &fqdn.to_string() );
+        let db = &fhist.dur_buffer_1;
+        
+        // updating duration 
+        let dur = self.shareddata.cmap.get_exec_time( fqdn ) * 1000.0;
+        let dur = dur as i64; // ms 
+        db.push( dur );
+        let slowdown = db.get_nth_minnorm_avg( -1 ); // latest slowdown 
+        let min_dur = db.get_nth_min( -1 );
+        let avg_dur = db.get_nth_avg( -1 );
+        debug!( fqdn=%fqdn, dur=%dur, slowdown=%slowdown, min_dur=%min_dur, avg_dur=%avg_dur, "[finesched][warmcoremaximuscl][slowdown] invoke_complete handler ");
+
+        // updating concur stats 
+        let cb = &fhist.concur_buffer_1;
+        let concur = self.domlimiter.return_group( gid );
+        let concur = concur * 100; // two decimal places
+        cb.push( concur as i64 );
+        let max_concur = cb.get_nth_max( -2 ); // second last max average concurrency limit seen so far
+        debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] invoke_complete handler ");
+
+        // update the concurrency limit if the slowdown is greater than 3 
+        if slowdown > 3 {
+            let domstate = self.doms.get( &gid ).unwrap();
+            domstate.concur_limit.value.store( max_concur as u32, Ordering::Relaxed );
+            debug!( fqdn=%fqdn, gid=%gid, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] updated concurrency limit ");
+        }
     }
 }
 
@@ -457,40 +479,32 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
     async fn block_container_acquire( &self, tid: &TransactionId, fqdn: &str ) {
         debug!( tid=%tid, fqdn=%fqdn, "[finesched][warmcoremaximuscl] blocking handler ");
         
-        // exec_time is data.duration_sec as returned on function completion from within the
-        // container
-        // exec_time is most recent value - not an average 
-        // let dur = self.shareddata.cmap.get_exec_time( fqdn );
-        // self.func_history.update_dur( fqdn, dur );
-        // let buf = self.func_history.get_or_create( fqdn ).buffer_1;
-        // let durl3 = buf.average_for_last( 3 );
-        // let durl5 = buf.average_for_last( 5 );
-        // debug!( tid=%tid, fqdn=%fqdn, dur=%dur, durl3=%durl3, durl5=%durl5, "[finesched][warmcoremaximuscl] blocking handler ");
-
-        // check if a dom exists for fqdn that can serve a new request 
-        // pick a dom if none exists 
-        // block if we just cannot pick any 
-        self.tid_gid_map.insert( 
-            tid.clone(), 
-            TidState{
-                gid: 0,
-                fqdn: fqdn.to_string(),
+        let gid = loop {
+            let gid = self.find_available_dom( fqdn ).await;  
+            if let Some(gid) = gid {
+                break gid;
             }
-        );
+            self.domlimiter.acquire_group( consts_RESERVED_GID_UNASSIGNED );
+            self.domlimiter.wait_for_group( consts_RESERVED_GID_UNASSIGNED ).await;
+        };
+        self.tid_gid_map.map.insert( tid.clone(), Arc::new(gid) );
     }
 
     fn invoke( &self, _cgroup_id: &str, tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
         debug!( tid=%tid, "[finesched][warmcoremaximuscl] invoke handler ");
-        self.tid_gid_map.get( tid ).map(|v| v.value().gid )
+        self.tid_gid_map.get( tid ).map(|v| *v)
     }
 
-    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId, ) {
+    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId, fqdn: &str, ) {
         debug!( tid=%tid, "[finesched][warmcoremaximuscl] invoke_complete handler ");
+
+        let gid = self.tid_gid_map.get( tid ).unwrap();
         
-        // update conlimit for fqdn 
+        self.return_and_update_concurrency_limit( fqdn, *gid );
 
         // cleanup 
-        self.tid_gid_map.remove( tid );
+        self.tid_gid_map.map.remove( tid );
+        self.domlimiter.return_group( consts_RESERVED_GID_UNASSIGNED );
     }
 }
 

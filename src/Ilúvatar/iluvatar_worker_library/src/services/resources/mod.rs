@@ -1,4 +1,5 @@
 pub mod signal_analyzer;
+pub mod arc_map;
 
 pub mod cpu;
 pub mod cpugroups;
