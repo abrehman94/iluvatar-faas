@@ -1,7 +1,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::collections::VecDeque;
 
 use tokio::sync::Notify;
 use tokio::task;
@@ -24,6 +23,7 @@ use iluvatar_finesched::consts_RESERVED_GID_SWITCH_BACK;
 use iluvatar_library::clock::{get_unix_clock, Clock};
 
 use crate::services::resources::cpugroups::GidStats;
+use crate::services::resources::signal_analyzer::SignalAnalyzer;
 
 use std::collections::HashMap;
 use dashmap::DashMap;
@@ -328,49 +328,6 @@ impl LoadBalancingPolicyT for StaticSelectCL {
 ////////////////////////////////////
 /// Online Warm_Core_Maximus Concurrency Limited Load Balancing Policy
 
-/// Aggregator for a window history of values  
-#[derive(Clone, Debug)]
-struct Aggregator<T> 
-    where T: Into<f64> + Copy,
-{
-    values: VecDeque<T>,
-    max_size: usize,
-}
-
-impl<T> Aggregator<T> 
-    where T: Into<f64> + Copy,
-{
-    pub fn new( max_size: usize ) -> Self {
-        Aggregator {
-            values: VecDeque::new(),
-            max_size,
-        }
-    }
-
-    pub fn add_value(&mut self, value: T) {
-        if self.values.len() >= self.max_size {
-            self.values.pop_back();
-        }
-        self.values.push_front(value);
-    }
-
-    pub fn average_for_last(&self, count: usize) -> f64 {
-        if self.values.len() == 0 {
-            return 0.0;
-        }
-        let mut sum: f64 = 0.0;
-        let mut actual_count = 0;
-        for v in self.values.iter().take(count) {
-            sum += (*v).into() ;
-            actual_count += 1;
-        }
-        if actual_count == 0 {
-            return 0.0;
-        }
-        sum / (actual_count as f64)
-    }
-}
-
 struct DomState {
     serving_count: u32,
     funcs_serving: DashMap<String, u32>,
@@ -402,7 +359,6 @@ struct FuncHistory {
     // 1 means when scheduling domain is used exclusively by this function
     con_limit_1: u32,  
     dur_1: u32,
-    buffer_1: Aggregator<f64>,
 }
 
 struct FuncHistMap {
@@ -418,30 +374,29 @@ impl FuncHistMap {
         }
     }
 
-    pub fn get_or_create( &self, func: &str ) -> FuncHistory {
-        match self.map.get( func ) {
-            Some( v ) => v.value().clone(),
-            None => {
-                let fh = FuncHistory{
-                    con_limit_1: 0,
-                    dur_1: 0,
-                    buffer_1: Aggregator::new( self.buff_limit ),
-                };
-                self.map.insert( func.to_string(), fh.clone() );
-                fh
-            }
-        }
-    }
+    // pub fn get_or_create( &self, func: &str ) -> FuncHistory {
+    //     match self.map.get( func ) {
+    //         Some( v ) => v.value().clone(),
+    //         None => {
+    //             let fh = FuncHistory{
+    //                 con_limit_1: 0,
+    //                 dur_1: 0,
+    //             };
+    //             self.map.insert( func.to_string(), fh.clone() );
+    //             fh
+    //         }
+    //     }
+    // }
 
-    pub fn update_dur(&self, 
-            func: &str,
-            dur: f64,
-        ) {
-        let mut fh = self.get_or_create( func );
-        fh.dur_1 = dur as u32;
-        fh.buffer_1.add_value( dur );
-        self.map.insert( func.to_string(), fh.clone() );
-    }
+    // pub fn update_dur(&self, 
+    //         func: &str,
+    //         dur: f64,
+    //     ) {
+    //     let mut fh = self.get_or_create( func );
+    //     fh.dur_1 = dur as u32;
+    //     fh.buffer_1.add_value( dur );
+    //     self.map.insert( func.to_string(), fh.clone() );
+    // }
 }
 
 struct TidState {
@@ -505,12 +460,12 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
         // exec_time is data.duration_sec as returned on function completion from within the
         // container
         // exec_time is most recent value - not an average 
-        let dur = self.shareddata.cmap.get_exec_time( fqdn );
-        self.func_history.update_dur( fqdn, dur );
-        let buf = self.func_history.get_or_create( fqdn ).buffer_1;
-        let durl3 = buf.average_for_last( 3 );
-        let durl5 = buf.average_for_last( 5 );
-        debug!( tid=%tid, fqdn=%fqdn, dur=%dur, durl3=%durl3, durl5=%durl5, "[finesched][warmcoremaximuscl] blocking handler ");
+        // let dur = self.shareddata.cmap.get_exec_time( fqdn );
+        // self.func_history.update_dur( fqdn, dur );
+        // let buf = self.func_history.get_or_create( fqdn ).buffer_1;
+        // let durl3 = buf.average_for_last( 3 );
+        // let durl5 = buf.average_for_last( 5 );
+        // debug!( tid=%tid, fqdn=%fqdn, dur=%dur, durl3=%durl3, durl5=%durl5, "[finesched][warmcoremaximuscl] blocking handler ");
 
         // check if a dom exists for fqdn that can serve a new request 
         // pick a dom if none exists 

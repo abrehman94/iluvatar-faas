@@ -1,3 +1,5 @@
+pub mod signal_analyzer;
+
 pub mod cpu;
 pub mod cpugroups;
 
