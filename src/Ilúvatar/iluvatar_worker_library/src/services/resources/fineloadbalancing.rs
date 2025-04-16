@@ -149,13 +149,13 @@ impl LoadBalancingPolicyT for DomZero {
 
 pub struct RoundRobin {
     shareddata: SharedData,
-    nextgid: AtomicI32,
+    nextgid: ClonableAtomicI32,
 }
 
 impl RoundRobin {
     pub fn new(starting_gid: SchedGroupID, shareddata: SharedData) -> Self {
         RoundRobin {
-            nextgid: AtomicI32::new(starting_gid),
+            nextgid: ClonableAtomicI32::new(starting_gid),
             shareddata
         }
     }
@@ -163,11 +163,11 @@ impl RoundRobin {
 
 impl LoadBalancingPolicyT for RoundRobin {
     fn invoke( &self, cgroup_id: &str, tid: &TransactionId, fqdn: &str ) -> Option<SchedGroupID> {
-        let mut gid = self.nextgid.fetch_add( 1, Ordering::Relaxed );
+        let mut gid = self.nextgid.value.fetch_add( 1, Ordering::Relaxed );
         let tgroups = self.shareddata.pgs.total_groups() as i32;
         if gid >= tgroups {
             gid = 0;
-            self.nextgid.store( 1, Ordering::Relaxed );
+            self.nextgid.value.store( 1, Ordering::Relaxed );
         }
         return Some(gid) 
     }
@@ -179,13 +179,13 @@ impl LoadBalancingPolicyT for RoundRobin {
 pub struct RoundRobinRL {
     shareddata: SharedData,
     lastgid: DashMap<String, SchedGroupID>,
-    nextgid: AtomicI32,
+    nextgid: ClonableAtomicI32,
 }
 
 impl RoundRobinRL {
     pub fn new(starting_gid: SchedGroupID, shareddata: SharedData) -> Self {
         RoundRobinRL {
-            nextgid: AtomicI32::new(starting_gid),
+            nextgid: ClonableAtomicI32::new(starting_gid),
             shareddata,
             lastgid: DashMap::new(),
         }
@@ -196,11 +196,11 @@ impl LoadBalancingPolicyT for RoundRobinRL {
     fn invoke( &self, cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
         let lgid = self.lastgid.get(cgroup_id);
         if lgid.is_none() {
-            let mut gid = self.nextgid.fetch_add( 1, Ordering::Relaxed );
+            let mut gid = self.nextgid.value.fetch_add( 1, Ordering::Relaxed );
             let tgroups = self.shareddata.pgs.total_groups() as i32;
             if gid >= tgroups {
                 gid = 0;
-                self.nextgid.store( 1, Ordering::Relaxed );
+                self.nextgid.value.store( 1, Ordering::Relaxed );
             }
             self.lastgid.insert(cgroup_id.to_string(), gid);
             return Some(gid); 
@@ -269,7 +269,7 @@ impl StaticSelectCL {
     pub fn new(shareddata: SharedData, static_sel_buckets: HashMap<String, i32>, static_con_limit: HashMap<String, i32>,) -> Self {
         let mut conlimit = HashMap::new();
         for (func,cl) in static_con_limit.iter() {
-            let cl = *cl as u32;
+            let cl = *cl;
             let gid = static_sel_buckets.get(func).unwrap();
             let clo = conlimit.get(gid);
             if let Some(clo) = clo {
@@ -407,7 +407,6 @@ impl WarmCoreMaximusCL {
 
             doms,
 
-            fdoms: ArcMap::new(),
             func_history: ArcMap::new(),
             
             tid_gid_map: ArcMap::new(),
@@ -431,10 +430,12 @@ impl WarmCoreMaximusCL {
 
                 let domid = kvref.key();
                 let domstate = kvref.value();
-
                 let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
+
+                debug!( fqdn=%fqdn, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl][find_available_dom] iterating over domains" );
+
                 if serving_fqdn.len() == 0 {
-                    match fhist.assigned_dom.value.compare_exchange_weak( 
+                    match fhist.assigned_dom.value.compare_exchange( 
                         consts_RESERVED_GID_UNASSIGNED, 
                         *domid, 
                         Ordering::SeqCst, 
@@ -450,10 +451,14 @@ impl WarmCoreMaximusCL {
                         }
                     }
                     ldomstate = Some(domstate.clone());
+                    drop( serving_fqdn );
                     break;
-                } // 
-                  
+                }  
+
+                drop( serving_fqdn );
             } 
+        } else {
+            ldomstate = self.doms.get( &adom );
         }
         
         // couldn't find any available dom 
@@ -563,7 +568,7 @@ impl LoadBalancingPolicyT for LWLInvoc {
 
     fn invoke( &self, _cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
         let mut gid: Option<SchedGroupID> = None;  
-        let mut min_count = u32::MAX;
+        let mut min_count = i32::MAX;
         
         // directly iterating over self.shareddata.mapgidstats produces random order 
         // due to the randomized hashing of dashmap
@@ -605,7 +610,7 @@ impl LoadBalancingPolicyT for SITA {
 
     fn invoke( &self, _cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
         let mut gid: Option<SchedGroupID> = None;  
-        let mut min_count = u32::MAX;
+        let mut min_count = i32::MAX;
         
         // directly iterating over self.shareddata.mapgidstats produces random order 
         // due to the randomized hashing of dashmap
