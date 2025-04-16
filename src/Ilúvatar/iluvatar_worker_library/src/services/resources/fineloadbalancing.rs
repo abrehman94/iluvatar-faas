@@ -451,11 +451,8 @@ impl WarmCoreMaximusCL {
                         }
                     }
                     ldomstate = Some(domstate.clone());
-                    drop( serving_fqdn );
                     break;
                 }  
-
-                drop( serving_fqdn );
             } 
         } else {
             ldomstate = self.doms.get( &adom );
@@ -504,9 +501,11 @@ impl WarmCoreMaximusCL {
         let max_concur = cb.get_nth_max( -2 ); // second last max average concurrency limit seen so far
         debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] invoke_complete handler ");
 
-        // update the concurrency limit if the slowdown is greater than 3 
-        if slowdown > 3 {
+        // update the concurrency limit if the slowdown is greater than 5  
+        // it will always update the concurrency limit to last known max value  
+        if slowdown > 5 {
             let domstate = self.doms.get( &gid ).unwrap();
+            let max_concur = max_concur / 100; // back to original value - with a ceil operation 
             domstate.concur_limit.value.store( max_concur , Ordering::Relaxed );
             debug!( fqdn=%fqdn, gid=%gid, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] updated concurrency limit ");
         }

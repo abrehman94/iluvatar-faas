@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use async_trait::async_trait;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
 use std::collections::HashMap;
 use dashmap::DashMap;
 
@@ -27,6 +27,7 @@ use iluvatar_finesched::SchedGroupID;
 use iluvatar_finesched::consts_RESERVED_GID_SWITCH_BACK;
 use iluvatar_library::clock::{get_unix_clock, Clock};
 use crate::services::resources::fineloadbalancing::{LoadBalancingPolicyTRef, RoundRobin, RoundRobinRL, StaticSelect, StaticSelectCL, LWLInvoc, DomZero, SharedData, WarmCoreMaximusCL};
+use crate::services::resources::arc_map::ClonableAtomicI32;
 
 lazy_static::lazy_static! {
   pub static ref CPU_GROUP_WORKER_TID: TransactionId = "CPUGroupMonitor".to_string();
@@ -44,9 +45,9 @@ fn fqdn_to_name(fqdn: &str) -> String {
 
 // It's like a primitive atomic datastructure with 
 // acquire and release operations only to avoid dataraces 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GidStats {
-    stats: Arc<DashMap<SchedGroupID, AtomicI32>>,
+    stats: Arc<DashMap<SchedGroupID, ClonableAtomicI32>>,
 }  
 
 impl GidStats {
@@ -54,10 +55,10 @@ impl GidStats {
     pub fn new(pgs: Arc<PreAllocatedGroups>) -> Self {
         let mapgidstats = Arc::new(DashMap::new());
         (0..pgs.total_groups()).for_each(|i| {
-            mapgidstats.insert(i as SchedGroupID, AtomicI32::new(0));
+            mapgidstats.insert(i as SchedGroupID, ClonableAtomicI32::new(0));
         });
-        mapgidstats.insert(consts_RESERVED_GID_SWITCH_BACK as SchedGroupID, AtomicI32::new(0));
-        mapgidstats.insert(consts_RESERVED_GID_UNASSIGNED as SchedGroupID, AtomicI32::new(0));
+        mapgidstats.insert(consts_RESERVED_GID_SWITCH_BACK as SchedGroupID, ClonableAtomicI32::new(0));
+        mapgidstats.insert(consts_RESERVED_GID_UNASSIGNED as SchedGroupID, ClonableAtomicI32::new(0));
         let mapgidstats = GidStats { stats: mapgidstats };
         GidStats{
             stats: mapgidstats.stats.clone(),
@@ -68,27 +69,22 @@ impl GidStats {
     // it will panic if gid was not populated with a zero counter on init  
     pub fn acquire_group(&self, gid: SchedGroupID) -> i32 {
         let count = self.stats.get( &gid ).unwrap();
-        let ccount = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ccount = count.value.fetch_add(1, Ordering::SeqCst);
         debug!(gid=%gid, group_count=%ccount, "[finesched][GidStats] acquire_group( gid ) - acquired group id");
         ccount
     }
     
     // returns the group to the pool
-    // harmful to call excessively if already at zero - race condition 
     pub fn return_group(&self, gid: SchedGroupID) -> i32 {
         let count = self.stats.get( &gid ).unwrap();
-        let mut ccount = count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if ccount == 0 {
-            warn!(gid=%gid, group_count=%ccount, "[finesched][GidStats] return_group( gid ) - overflowed there was extra return");
-            ccount = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        let ccount = count.sub_clamp_zero( 1 );
         debug!(gid=%gid, group_count=%ccount, "[finesched][GidStats] return_group( gid ) - returned group id");
         ccount
     }
 
     pub fn fetch_current(&self, gid: SchedGroupID) -> Option<i32> {
         let count = self.stats.get( &gid ).unwrap();
-        Some(count.load(std::sync::atomic::Ordering::SeqCst))
+        Some(count.value.load(Ordering::SeqCst))
     }
 }
 

@@ -2,6 +2,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use dashmap::DashMap;
 
@@ -83,6 +84,25 @@ impl ClonableAtomicI32 {
             value: AtomicI32::new(value),
         }
     }
+
+    pub fn sub_clamp_zero(&self, val: i32) -> i32 {
+        loop {
+            let current = self.value.load(Ordering::Relaxed);
+            if current == 0 {
+                break current;
+            }
+
+            let sub = if val > current { current } else { val };
+            let new = current - sub;
+
+            if self.value
+                .compare_exchange(current, new, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                break current;
+            }
+        }
+    }
 }
 
 impl Default for ClonableAtomicI32 {
@@ -100,6 +120,9 @@ impl Clone for ClonableAtomicI32 {
         }
     }
 }
+
+
+
 
 /// Ugly Code ends 
 ///////////////////////////////////////
