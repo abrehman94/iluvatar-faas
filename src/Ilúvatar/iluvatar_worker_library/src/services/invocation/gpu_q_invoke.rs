@@ -152,6 +152,7 @@ impl GpuQueueingInvoker {
         gpu: Option<Arc<GpuResourceTracker>>,
         gpu_config: &Option<Arc<GPUResourceConfig>>,
     ) -> Result<Arc<Self>> {
+
         let (gpu_handle, gpu_tx) = tokio_runtime(
             invocation_config.queue_sleep_ms,
             INVOKER_GPU_QUEUE_WORKER_TID.clone(),

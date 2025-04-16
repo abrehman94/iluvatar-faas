@@ -1,10 +1,15 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::future::Future;
+use std::thread::JoinHandle as OsHandle;
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 use tokio::sync::Notify;
 use tokio::task;
 use tokio::runtime::Handle;
+use iluvatar_library::{threading::tokio_runtime, threading::EventualItem};
+
 
 use async_trait::async_trait;
 
@@ -37,6 +42,10 @@ use regex::Regex;
 
 ////////////////////////////////////
 /// Shared or Global stuff across policies  
+
+lazy_static::lazy_static! {
+  pub static ref FINESCHED_RECLAMATION_WORKER_TID: TransactionId = "FineSchedReclamationWorker".to_string();
+}
 
 /// dynamic trait cannot have static functions to allow for dynamic dispatch
 #[async_trait]
@@ -334,11 +343,25 @@ impl LoadBalancingPolicyT for StaticSelectCL {
 ////////////////////////////////////
 /// Online Warm_Core_Maximus Concurrency Limited Load Balancing Policy
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct DomState {
     bpfdom_config: SchedGroup,
     concur_limit: ClonableAtomicI32,
     serving_fqdn: ClonableMutex<String>, // it also serves as a lock for the domain
+    usage_count: ClonableAtomicI32,
+    id: SchedGroupID,
+}
+
+impl Default for DomState {
+    fn default() -> Self {
+        DomState {
+            bpfdom_config: SchedGroup::default(),
+            concur_limit: ClonableAtomicI32::new(48), // we start from an overcommit state 
+            serving_fqdn: ClonableMutex::new("".to_string()),
+            usage_count: ClonableAtomicI32::new(0),
+            id: consts_RESERVED_GID_UNASSIGNED,
+        }
+    }
 }
 
 impl DomState {
@@ -353,6 +376,8 @@ impl DomState {
                 bpfdom_config: bpfdom_config.clone(),
                 concur_limit: ClonableAtomicI32::new(48), // we start from an overcommit state 
                 serving_fqdn: ClonableMutex::new("".to_string()),
+                usage_count: ClonableAtomicI32::new(0),
+                id: gid,
             }));
         }
         doms
@@ -364,7 +389,7 @@ struct FuncHistory {
     pub dur_buffer_1: ArcMap<SchedGroupID, SignalAnalyzer<i32>>,
     pub concur_buffer_1: ArcMap<SchedGroupID, SignalAnalyzer<i32>>,
     pub concur_limit_1: ArcMap<SchedGroupID, ClonableAtomicI32>,
-    pub assigned_dom: ClonableAtomicI32,
+    pub assigned_dom: ClonableMutex<Arc<DomState>>,
 }
 
 impl Default for FuncHistory {
@@ -373,7 +398,7 @@ impl Default for FuncHistory {
             dur_buffer_1: ArcMap::new(),
             concur_buffer_1: ArcMap::new(),
             concur_limit_1: ArcMap::new(),
-            assigned_dom: ClonableAtomicI32::new( consts_RESERVED_GID_UNASSIGNED ),
+            assigned_dom: ClonableMutex::new(Arc::new(DomState::default())),
         }
     }
 }
@@ -392,17 +417,30 @@ pub struct WarmCoreMaximusCL {
     tid_gid_map: ArcMap<TransactionId, SchedGroupID>,
     
     domlimiter: DomConcurrencyLimiter,
+
+    _rec_worker_thread: std::thread::JoinHandle<()>,
 }
 
+
+
 impl WarmCoreMaximusCL {
-    pub fn new( shareddata: SharedData, ) -> Self {
+    pub fn new( shareddata: SharedData, ) -> Arc<Self> {
         
         let local_gidstats = GidStats::new( shareddata.pgs.clone() );
         let domlimiter = DomConcurrencyLimiter::new( local_gidstats );
 
         let doms = DomState::init_map( shareddata.pgs.clone() );
+
+        // spawn reclamation worker
+        let (rec_handle, rec_tx) = tokio_runtime::<_,_, tokio::sync::futures::Notified<'static>>(
+            3000, // every second 
+            FINESCHED_RECLAMATION_WORKER_TID.clone(),
+            Self::reclamation_worker,
+            None,
+            Some(1 as usize),
+        ).unwrap();
         
-        WarmCoreMaximusCL{
+        let wcl = Arc::new(WarmCoreMaximusCL{
             shareddata,
 
             doms,
@@ -411,71 +449,87 @@ impl WarmCoreMaximusCL {
             
             tid_gid_map: ArcMap::new(),
             domlimiter,
+            _rec_worker_thread: rec_handle,
+        });
+
+        rec_tx.send( wcl.clone() ).unwrap();
+        wcl.clone()
+    }
+
+    async fn reclamation_worker( self: Arc<Self>, tid: TransactionId ) {
+        debug!( tid=%tid, "[finesched][warmcoremaximuscl] reclamation worker called" );
+        
+        let doms = &self.doms;
+        let fhist_map = &self.func_history;
+
+        // reclaim domains that have been unused since last time 
+        for kvref in doms.map.iter() {
+            let domid = kvref.key();
+            let domstate = kvref.value();
+            let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
+            let fhist = self.func_history.get_or_create( &serving_fqdn );
+            let mut adom = fhist.assigned_dom.value.lock().unwrap();
+
+            let usage = domstate.usage_count.value.load( Ordering::SeqCst );
+            if usage == 0 {
+                if adom.id != consts_RESERVED_GID_UNASSIGNED {
+                    *adom = Default::default();
+                }
+                serving_fqdn.clear();
+                debug!( tid=%tid, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl] reclamation worker - resetting serving fqdn" );
+            } else {
+                // reset the usage count 
+                domstate.usage_count.value.store(0, Ordering::Relaxed);
+                debug!( tid=%tid, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl] reclamation worker - resetting usage count" );
+            }
         }
     }
-    
+
     /// Checks with domlimiter before handing over the gid  
     async fn find_available_dom( &self, 
             fqdn: &str,
         ) -> Option<SchedGroupID> {
 
-        // first check if a dom is already allocated to fqdn in it's history 
-        let fhist = self.func_history.get_or_create( &fqdn.to_string() );
-        let mut adom = fhist.assigned_dom.value.load( Ordering::SeqCst );
-        let mut ldomstate = None;  
+        let (assigned_gid, domstate) = {
+            // first check if a dom is already allocated to fqdn in it's history 
+            let fhist = self.func_history.get_or_create( &fqdn.to_string() );
+            let mut adom = fhist.assigned_dom.value.lock().unwrap();
+            if adom.id == consts_RESERVED_GID_UNASSIGNED {
+                // iterate over available domains and find an empty one 
+                for kvref in self.doms.map.iter() {
 
-        if adom == consts_RESERVED_GID_UNASSIGNED {
-            // iterate over available domains and find an empty one 
-            for kvref in self.doms.map.iter() {
+                    let domid = kvref.key();
+                    let domstate = kvref.value();
+                    let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
 
-                let domid = kvref.key();
-                let domstate = kvref.value();
-                let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
+                    debug!( fqdn=%fqdn, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl][find_available_dom] iterating over domains" );
 
-                debug!( fqdn=%fqdn, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl][find_available_dom] iterating over domains" );
-
-                if serving_fqdn.len() == 0 {
-                    match fhist.assigned_dom.value.compare_exchange( 
-                        consts_RESERVED_GID_UNASSIGNED, 
-                        *domid, 
-                        Ordering::SeqCst, 
-                        Ordering::SeqCst,
-                    ) {
-                        Ok(_) => {
-                            adom = *domid;
-                            serving_fqdn.push_str( fqdn );
-                        }
-                        Err(old) => {
-                            // some other thread already assigned the dom for this fqdn
-                            adom = old;
-                        }
-                    }
-                    ldomstate = Some(domstate.clone());
-                    break;
-                }  
+                    if serving_fqdn.len() == 0 {
+                        *adom = domstate.clone();
+                        serving_fqdn.push_str( fqdn );
+                        debug!( fqdn=%fqdn, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl][find_available_dom] assigned domain" );
+                        break;
+                    }  
+                } 
             } 
-        } else {
-            ldomstate = self.doms.get( &adom );
-        }
-        
-        // couldn't find any available dom 
-        if adom == consts_RESERVED_GID_UNASSIGNED {
+            (adom.id, adom.clone())
+        };
+
+        if assigned_gid == consts_RESERVED_GID_UNASSIGNED {
+            error!( fqdn=%fqdn, "[finesched][warmcoremaximuscl][find_available_dom] no available domain found" );
             return None;
         }
 
         // acquire whatever found from domlimiter and return 
-        let current = self.domlimiter.acquire_group(adom);
+        let current = self.domlimiter.acquire_group(assigned_gid);
 
         // check if concurrency of domilimiter is within limit 
-        if let Some(domstate) = ldomstate {
-            if current > domstate.concur_limit.value.load( Ordering::SeqCst ) {
-                // wait for it to become available
-                self.domlimiter.wait_for_group( adom ).await;
-            }
-            return Some(adom);
+        if current > domstate.concur_limit.value.load( Ordering::SeqCst ) {
+            // wait for it to become available
+            self.domlimiter.wait_for_group( assigned_gid ).await;
         }
-        
-        None
+        domstate.usage_count.value.fetch_add(1, Ordering::Relaxed);
+        Some(assigned_gid)
     }
 
     pub fn return_and_update_concurrency_limit( &self, fqdn: &str, gid: SchedGroupID ) {

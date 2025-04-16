@@ -172,6 +172,17 @@ impl <K, V> ArcMap<K, V>
             }
         }
     }
+
+    pub fn get_or_insert( &self, key: &K, value: V ) -> Arc<V> {
+        match self.map.get( key ) {
+            Some( v ) => (*v.value()).clone(),
+            None => {
+                let val: Arc<V> = Arc::new(value);
+                self.map.insert( (*key).clone(), val.clone() );
+                val 
+            }
+        }
+    }
 }
 
 impl<K,V> Default for ArcMap<K, V>

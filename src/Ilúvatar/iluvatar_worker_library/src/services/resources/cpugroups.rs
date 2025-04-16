@@ -135,7 +135,7 @@ impl CpuGroupsResourceTracker {
         let dispatch_policy: LoadBalancingPolicyTRef = match config.dispatchpolicy.to_lowercase().as_str() {
             "warmcoremaximuscl" => {
                 debug!( tid=%tid, "[finesched] using warmcoremaximuscl dispatch policy" );
-                Arc::new( WarmCoreMaximusCL::new(shareddata) )
+                WarmCoreMaximusCL::new(shareddata) 
             },
             "static_select_con_limited" => {
                 debug!( tid=%tid, "[finesched] using static_select_con_limited dispatch policy" );
