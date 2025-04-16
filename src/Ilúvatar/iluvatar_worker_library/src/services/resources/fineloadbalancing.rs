@@ -1,7 +1,6 @@
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 
 use tokio::sync::Notify;
 use tokio::task;
@@ -26,8 +25,11 @@ use iluvatar_library::clock::{get_unix_clock, Clock};
 use crate::services::resources::cpugroups::GidStats;
 use crate::services::resources::cpugroups::consts_RESERVED_GID_UNASSIGNED;
 use crate::services::resources::signal_analyzer::SignalAnalyzer;
+use crate::services::resources::signal_analyzer::const_DEFAULT_BUFFER_SIZE;
 use crate::services::resources::arc_map::ArcMap;
 use crate::services::resources::arc_map::ClonableAtomicU32;
+use crate::services::resources::arc_map::ClonableAtomicI32;
+use crate::services::resources::arc_map::ClonableMutex;
 
 use std::collections::HashMap;
 use dashmap::DashMap;
@@ -91,7 +93,7 @@ impl DomConcurrencyLimiter {
         }
     }
 
-    pub fn acquire_group( &self, gid: SchedGroupID ) -> u32 {
+    pub fn acquire_group( &self, gid: SchedGroupID ) -> i32 {
         self.local_gidstats.acquire_group( gid )
     }
 
@@ -109,7 +111,7 @@ impl DomConcurrencyLimiter {
         notify.notified().await;
     }
 
-    pub fn return_group( &self, gid: SchedGroupID ) -> u32 {
+    pub fn return_group( &self, gid: SchedGroupID ) -> i32 {
         let count = self.local_gidstats.return_group( gid );
         // signal the conditional variable to wake up the thread
         let notify = self.waiters.get( &gid );
@@ -258,7 +260,7 @@ pub struct StaticSelectCL {
     selpolicy: StaticSelect,
 
     _conlimit_org: HashMap<String, i32>, // func -> conlimit - as per config
-    conlimit: HashMap<i32, u32>, // gid -> conlimit
+    conlimit: HashMap<i32, i32>, // gid -> conlimit
                                  //
     domlimiter: DomConcurrencyLimiter,
 }
@@ -334,11 +336,9 @@ impl LoadBalancingPolicyT for StaticSelectCL {
 
 #[derive(Clone, Default)]
 struct DomState {
-    serving_count: u32,
-    funcs_serving: DashMap<String, u32>,
     bpfdom_config: SchedGroup,
-    numa_node: u32, 
-    concur_limit: ClonableAtomicU32,
+    concur_limit: ClonableAtomicI32,
+    serving_fqdn: ClonableMutex<String>, // it also serves as a lock for the domain
 }
 
 impl DomState {
@@ -350,11 +350,9 @@ impl DomState {
             let gid = gid as SchedGroupID;
             let bpfdom_config = pgs.get_schedgroup( gid ).unwrap();
             doms.map.insert( gid, Arc::new(DomState{
-                serving_count: 0,
-                funcs_serving: DashMap::new(),
                 bpfdom_config: bpfdom_config.clone(),
-                numa_node: 0,
-                concur_limit: ClonableAtomicU32::new(48), // we start from an overcommit state 
+                concur_limit: ClonableAtomicI32::new(48), // we start from an overcommit state 
+                serving_fqdn: ClonableMutex::new("".to_string()),
             }));
         }
         doms
@@ -363,17 +361,19 @@ impl DomState {
 
 #[derive(Clone)]
 struct FuncHistory {
-    pub dur_buffer_1: SignalAnalyzer<i64>,
-    pub concur_buffer_1: SignalAnalyzer<i64>,
-    pub concur_limit_1: ArcMap<SchedGroupID, ClonableAtomicU32>,
+    pub dur_buffer_1: ArcMap<SchedGroupID, SignalAnalyzer<i32>>,
+    pub concur_buffer_1: ArcMap<SchedGroupID, SignalAnalyzer<i32>>,
+    pub concur_limit_1: ArcMap<SchedGroupID, ClonableAtomicI32>,
+    pub assigned_dom: ClonableAtomicI32,
 }
 
 impl Default for FuncHistory {
     fn default() -> Self {
-        FuncHistory{
-            dur_buffer_1: SignalAnalyzer::new( 6 ),
-            concur_buffer_1: SignalAnalyzer::new( 6 ),
+        FuncHistory {
+            dur_buffer_1: ArcMap::new(),
+            concur_buffer_1: ArcMap::new(),
             concur_limit_1: ArcMap::new(),
+            assigned_dom: ClonableAtomicI32::new( consts_RESERVED_GID_UNASSIGNED ),
         }
     }
 }
@@ -386,9 +386,6 @@ pub struct WarmCoreMaximusCL {
     // id: state 
     doms: ArcMap<SchedGroupID, DomState>,
     
-    // func -> dom ids serving it 
-    fdoms: ArcMap<String, Vec<SchedGroupID>>,
-
     // local function historic characteristics  
     func_history: ArcMap<String, FuncHistory>,
 
@@ -420,36 +417,74 @@ impl WarmCoreMaximusCL {
     
     /// Checks with domlimiter before handing over the gid  
     async fn find_available_dom( &self, 
-            _fqdn: &str,
+            fqdn: &str,
         ) -> Option<SchedGroupID> {
 
         // first check if a dom is already allocated to fqdn in it's history 
-        
-        // if no 
+        let fhist = self.func_history.get_or_create( &fqdn.to_string() );
+        let mut adom = fhist.assigned_dom.value.load( Ordering::SeqCst );
+        let mut ldomstate = None;  
+
+        if adom == consts_RESERVED_GID_UNASSIGNED {
             // iterate over available domains and find an empty one 
-            
+            for kvref in self.doms.map.iter() {
+
+                let domid = kvref.key();
+                let domstate = kvref.value();
+
+                let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
+                if serving_fqdn.len() == 0 {
+                    match fhist.assigned_dom.value.compare_exchange_weak( 
+                        consts_RESERVED_GID_UNASSIGNED, 
+                        *domid, 
+                        Ordering::SeqCst, 
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => {
+                            adom = *domid;
+                            serving_fqdn.push_str( fqdn );
+                        }
+                        Err(old) => {
+                            // some other thread already assigned the dom for this fqdn
+                            adom = old;
+                        }
+                    }
+                    ldomstate = Some(domstate.clone());
+                    break;
+                } // 
+                  
+            } 
+        }
+        
+        // couldn't find any available dom 
+        if adom == consts_RESERVED_GID_UNASSIGNED {
+            return None;
+        }
+
         // acquire whatever found from domlimiter and return 
+        let current = self.domlimiter.acquire_group(adom);
+
         // check if concurrency of domilimiter is within limit 
-        // if not 
-            // wait for it to become available
+        if let Some(domstate) = ldomstate {
+            if current > domstate.concur_limit.value.load( Ordering::SeqCst ) {
+                // wait for it to become available
+                self.domlimiter.wait_for_group( adom ).await;
+            }
+            return Some(adom);
+        }
         
-        // return the gid
-        
-        let _current = self.domlimiter.acquire_group(0);
-        // check if current is within the concurrency limit of the dom as well 
-        // sleep if not 
-        Some(0)
+        None
     }
 
     pub fn return_and_update_concurrency_limit( &self, fqdn: &str, gid: SchedGroupID ) {
         
         // history of fqdn 
         let fhist = self.func_history.get_or_create( &fqdn.to_string() );
-        let db = &fhist.dur_buffer_1;
+        let db = fhist.dur_buffer_1.get_or_create( &gid );
         
         // updating duration 
         let dur = self.shareddata.cmap.get_exec_time( fqdn ) * 1000.0;
-        let dur = dur as i64; // ms 
+        let dur = dur as i32; // ms 
         db.push( dur );
         let slowdown = db.get_nth_minnorm_avg( -1 ); // latest slowdown 
         let min_dur = db.get_nth_min( -1 );
@@ -457,17 +492,17 @@ impl WarmCoreMaximusCL {
         debug!( fqdn=%fqdn, dur=%dur, slowdown=%slowdown, min_dur=%min_dur, avg_dur=%avg_dur, "[finesched][warmcoremaximuscl][slowdown] invoke_complete handler ");
 
         // updating concur stats 
-        let cb = &fhist.concur_buffer_1;
+        let cb = fhist.concur_buffer_1.get_or_create( &gid );
         let concur = self.domlimiter.return_group( gid );
-        let concur = concur * 100; // two decimal places
-        cb.push( concur as i64 );
+        let concur = (concur * 100) as i32; // two decimal places
+        cb.push( concur );
         let max_concur = cb.get_nth_max( -2 ); // second last max average concurrency limit seen so far
         debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] invoke_complete handler ");
 
         // update the concurrency limit if the slowdown is greater than 3 
         if slowdown > 3 {
             let domstate = self.doms.get( &gid ).unwrap();
-            domstate.concur_limit.value.store( max_concur as u32, Ordering::Relaxed );
+            domstate.concur_limit.value.store( max_concur , Ordering::Relaxed );
             debug!( fqdn=%fqdn, gid=%gid, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] updated concurrency limit ");
         }
     }

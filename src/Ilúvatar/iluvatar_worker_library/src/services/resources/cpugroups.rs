@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use async_trait::async_trait;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicI32;
 use std::collections::HashMap;
 use dashmap::DashMap;
 
@@ -46,7 +46,7 @@ fn fqdn_to_name(fqdn: &str) -> String {
 // acquire and release operations only to avoid dataraces 
 #[derive(Debug, Clone)]
 pub struct GidStats {
-    stats: Arc<DashMap<SchedGroupID, AtomicU32>>,
+    stats: Arc<DashMap<SchedGroupID, AtomicI32>>,
 }  
 
 impl GidStats {
@@ -54,10 +54,10 @@ impl GidStats {
     pub fn new(pgs: Arc<PreAllocatedGroups>) -> Self {
         let mapgidstats = Arc::new(DashMap::new());
         (0..pgs.total_groups()).for_each(|i| {
-            mapgidstats.insert(i as SchedGroupID, AtomicU32::new(0));
+            mapgidstats.insert(i as SchedGroupID, AtomicI32::new(0));
         });
-        mapgidstats.insert(consts_RESERVED_GID_SWITCH_BACK as SchedGroupID, AtomicU32::new(0));
-        mapgidstats.insert(consts_RESERVED_GID_UNASSIGNED as SchedGroupID, AtomicU32::new(0));
+        mapgidstats.insert(consts_RESERVED_GID_SWITCH_BACK as SchedGroupID, AtomicI32::new(0));
+        mapgidstats.insert(consts_RESERVED_GID_UNASSIGNED as SchedGroupID, AtomicI32::new(0));
         let mapgidstats = GidStats { stats: mapgidstats };
         GidStats{
             stats: mapgidstats.stats.clone(),
@@ -66,7 +66,7 @@ impl GidStats {
 
     // returns the number of times the group has been acquired
     // it will panic if gid was not populated with a zero counter on init  
-    pub fn acquire_group(&self, gid: SchedGroupID) -> u32 {
+    pub fn acquire_group(&self, gid: SchedGroupID) -> i32 {
         let count = self.stats.get( &gid ).unwrap();
         let ccount = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         debug!(gid=%gid, group_count=%ccount, "[finesched][GidStats] acquire_group( gid ) - acquired group id");
@@ -75,7 +75,7 @@ impl GidStats {
     
     // returns the group to the pool
     // harmful to call excessively if already at zero - race condition 
-    pub fn return_group(&self, gid: SchedGroupID) -> u32 {
+    pub fn return_group(&self, gid: SchedGroupID) -> i32 {
         let count = self.stats.get( &gid ).unwrap();
         let mut ccount = count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         if ccount == 0 {
@@ -86,7 +86,7 @@ impl GidStats {
         ccount
     }
 
-    pub fn fetch_current(&self, gid: SchedGroupID) -> Option<u32> {
+    pub fn fetch_current(&self, gid: SchedGroupID) -> Option<i32> {
         let count = self.stats.get( &gid ).unwrap();
         Some(count.load(std::sync::atomic::Ordering::SeqCst))
     }

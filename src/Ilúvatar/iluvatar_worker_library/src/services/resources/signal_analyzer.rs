@@ -7,22 +7,24 @@
 ///     generate signals like average, min, max, normalized min, normalized max
 ///     over windows 
 ///
-/// Currently supports only i64. Can be extended to support other types.
+/// Currently supports only i32. Can be extended to support other types.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+
+pub const const_DEFAULT_BUFFER_SIZE: usize = 6;
 
 trait ValueBounds<T> {
     fn maxval() -> T;
     fn minval() -> T;
 }
 
-impl ValueBounds<i64> for i64 {
-    fn maxval() -> i64 {
-        i64::MAX
+impl ValueBounds<i32> for i32 {
+    fn maxval() -> i32 {
+        i32::MAX
     }
-    fn minval() -> i64 {
-        i64::MIN
+    fn minval() -> i32 {
+        i32::MIN
     }
 }
 
@@ -50,18 +52,18 @@ struct SignalAnalyzerMutData<T>
     buffer_filled_win_init: bool,
 }
 
-impl SignalAnalyzerMutData<i64> 
+impl SignalAnalyzerMutData<i32> 
 {
     fn update_windows(&mut self) {
 
-        let buffer_vec: Vec<i64> = self.buffer.iter().copied().collect();
+        let buffer_vec: Vec<i32> = self.buffer.iter().copied().collect();
         
         // update windows
         for i in 0..self.idata.win_count {
             let window = &buffer_vec[i..i + self.idata.win_size];
             self.windows[i] = window.to_vec();
 
-            let avg = window.iter().map(|e|*e).sum::<i64>() / self.idata.win_size as i64;
+            let avg = window.iter().map(|e|*e).sum::<i32>() / self.idata.win_size as i32;
             self.avgs[i] = avg;
             if self.buffer_filled_win_init {
                 self.mins[i] = self.mins[i].min(avg);
@@ -78,8 +80,8 @@ impl SignalAnalyzerMutData<i64>
                 // win 1 -> min/max( 0:1 averages )
                 // ...
                 // then they are accurately updated based on running avg 
-                self.mins[i] = self.avgs[0..i+1].iter().map(|e|*e).reduce(i64::min).unwrap_or(i64::maxval());
-                self.maxs[i] = self.avgs[0..i+1].iter().map(|e|*e).reduce(i64::max).unwrap_or(i64::minval());
+                self.mins[i] = self.avgs[0..i+1].iter().map(|e|*e).reduce(i32::min).unwrap_or(i32::maxval());
+                self.maxs[i] = self.avgs[0..i+1].iter().map(|e|*e).reduce(i32::max).unwrap_or(i32::minval());
                 println!("{} - avg: {} min: {}", i, self.avgs[i], self.mins[i], );
             }
             self.buffer_filled_win_init = true;
@@ -106,7 +108,7 @@ pub struct SignalAnalyzer<T>
     data: Mutex<SignalAnalyzerMutData<T>>,
 }
 
-impl SignalAnalyzer<i64> 
+impl SignalAnalyzer<i32> 
 //   where T: Clone + Default + ValueBounds<T> + Copy
 {
     pub fn new(buffer_size: usize) -> Self {
@@ -118,14 +120,14 @@ impl SignalAnalyzer<i64>
             win_size,
             win_count,
         };
-        let data = SignalAnalyzerMutData::<i64> {
+        let data = SignalAnalyzerMutData::<i32> {
             idata: idata.clone(),
 
             buffer: VecDeque::with_capacity(buffer_size),
             windows: vec![vec![Default::default(); win_size]; win_count],
             avgs: vec![Default::default(); win_count],
-            mins: vec![i64::maxval(); win_count],
-            maxs: vec![i64::minval(); win_count],
+            mins: vec![i32::maxval(); win_count],
+            maxs: vec![i32::minval(); win_count],
             avgs_norm_min: vec![Default::default(); win_count],
             avgs_norm_max: vec![Default::default(); win_count],
             buffer_filled_win_init: false,
@@ -138,7 +140,7 @@ impl SignalAnalyzer<i64>
         }
     }
 
-    pub fn push(&self, val: i64) {
+    pub fn push(&self, val: i32) {
         let mut data = self.data.lock().unwrap();
         data.buffer.push_back(val);
         if data.buffer.len() > self.idata.buffer_size {
@@ -154,23 +156,23 @@ impl SignalAnalyzer<i64>
         self.data.lock().unwrap().buffer.len()
     }
 
-    pub fn get_nth_max(&self, index: isize) -> i64 {
+    pub fn get_nth_max(&self, index: isize) -> i32 {
         self.get_at(&self.data.lock().unwrap().maxs, index)
     }
 
-    pub fn get_nth_min(&self, index: isize) -> i64 {
+    pub fn get_nth_min(&self, index: isize) -> i32 {
         self.get_at(&self.data.lock().unwrap().mins, index)
     }
 
-    pub fn get_nth_avg(&self, index: isize) -> i64 {
+    pub fn get_nth_avg(&self, index: isize) -> i32 {
         self.get_at(&self.data.lock().unwrap().avgs, index)
     }
 
-    pub fn get_nth_minnorm_avg(&self, index: isize) -> i64 {
+    pub fn get_nth_minnorm_avg(&self, index: isize) -> i32 {
         self.get_at(&self.data.lock().unwrap().avgs_norm_min, index)
     }
 
-    fn get_at(&self, vec: &Vec<i64>, index: isize) -> i64 {
+    fn get_at(&self, vec: &Vec<i32>, index: isize) -> i32 {
         let idx;  
         if index < 0 {
             idx = (vec.len() as isize + index) as usize;
@@ -187,7 +189,7 @@ mod signal_analyzer_tests {
 
     #[test]
     fn test_basic_push_and_average() {
-        let sa = SignalAnalyzer::new(6);
+        let sa = SignalAnalyzer::new(const_DEFAULT_BUFFER_SIZE);
         sa.push(20);
         sa.push(20);
         sa.push(30);
@@ -202,7 +204,7 @@ mod signal_analyzer_tests {
         // Mins: [23, 23, 23, 23]
         // Max: [23, 30, 40, 50]
         // Normalized Mins: [1, 1, 2, 2]
-        assert_eq!(sa.get_n(), 6);
+        assert_eq!(sa.get_n(), const_DEFAULT_BUFFER_SIZE);
 
         assert_eq!( sa.get_nth_avg(0)          , 23);
         assert_eq!( sa.get_nth_avg(-1)         , 50);
@@ -218,7 +220,7 @@ mod signal_analyzer_tests {
     }
 }
 
-impl Clone for SignalAnalyzer<i64> {
+impl Clone for SignalAnalyzer<i32> {
     fn clone(&self) -> Self {
         SignalAnalyzer {
             idata: self.idata.clone(),
@@ -226,4 +228,12 @@ impl Clone for SignalAnalyzer<i64> {
         }
     }
 }
+
+impl Default for SignalAnalyzer<i32> {
+    fn default() -> Self {
+        SignalAnalyzer::new(const_DEFAULT_BUFFER_SIZE)
+    }
+}
+
+
 
