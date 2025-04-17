@@ -10,6 +10,8 @@ use tokio::task;
 use tokio::runtime::Handle;
 use iluvatar_library::{threading::tokio_runtime, threading::EventualItem};
 
+use iluvatar_library::clock::now;
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 
@@ -349,6 +351,7 @@ struct DomState {
     concur_limit: ClonableAtomicI32,
     serving_fqdn: ClonableMutex<String>, // it also serves as a lock for the domain
     usage_count: ClonableAtomicI32,
+    last_used_ts: ClonableMutex<u64>,
     id: SchedGroupID,
 }
 
@@ -359,6 +362,7 @@ impl Default for DomState {
             concur_limit: ClonableAtomicI32::new(48), // we start from an overcommit state 
             serving_fqdn: ClonableMutex::new("".to_string()),
             usage_count: ClonableAtomicI32::new(0),
+            last_used_ts: ClonableMutex::new(0),
             id: consts_RESERVED_GID_UNASSIGNED,
         }
     }
@@ -377,6 +381,7 @@ impl DomState {
                 concur_limit: ClonableAtomicI32::new(48), // we start from an overcommit state 
                 serving_fqdn: ClonableMutex::new("".to_string()),
                 usage_count: ClonableAtomicI32::new(0),
+                last_used_ts: ClonableMutex::new(0),
                 id: gid,
             }));
         }
@@ -386,6 +391,7 @@ impl DomState {
 
 #[derive(Clone)]
 struct FuncHistory {
+    pub iat_buffer: Arc<SignalAnalyzer<i32>>,
     pub dur_buffer_1: ArcMap<SchedGroupID, SignalAnalyzer<i32>>,
     pub concur_buffer_1: ArcMap<SchedGroupID, SignalAnalyzer<i32>>,
     pub concur_limit_1: ArcMap<SchedGroupID, ClonableAtomicI32>,
@@ -395,6 +401,7 @@ struct FuncHistory {
 impl Default for FuncHistory {
     fn default() -> Self {
         FuncHistory {
+            iat_buffer: Arc::new(SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE )),
             dur_buffer_1: ArcMap::new(),
             concur_buffer_1: ArcMap::new(),
             concur_limit_1: ArcMap::new(),
@@ -419,8 +426,8 @@ pub struct WarmCoreMaximusCL {
     domlimiter: DomConcurrencyLimiter,
 
     _rec_worker_thread: std::thread::JoinHandle<()>,
+    creation_time: Instant,
 }
-
 
 
 impl WarmCoreMaximusCL {
@@ -450,17 +457,32 @@ impl WarmCoreMaximusCL {
             tid_gid_map: ArcMap::new(),
             domlimiter,
             _rec_worker_thread: rec_handle,
+            creation_time: Instant::now(),
         });
 
         rec_tx.send( wcl.clone() ).unwrap();
         wcl.clone()
     }
 
+    pub fn timestamp( &self ) -> u64 {
+        let elapsed = self.creation_time.elapsed();
+        let elapsed = elapsed.as_secs(); 
+        elapsed
+    }
+
+    pub fn timestamp_diff( &self, timestamp: u64 ) -> u64 {
+        let elapsed = self.timestamp();
+        if elapsed > timestamp {
+            elapsed - timestamp
+        } else {
+            0
+        }
+    }
+
     async fn reclamation_worker( self: Arc<Self>, tid: TransactionId ) {
         debug!( tid=%tid, "[finesched][warmcoremaximuscl] reclamation worker called" );
         
         let doms = &self.doms;
-        let fhist_map = &self.func_history;
 
         // reclaim domains that have been unused since last time 
         for kvref in doms.map.iter() {
@@ -470,8 +492,30 @@ impl WarmCoreMaximusCL {
             let fhist = self.func_history.get_or_create( &serving_fqdn );
             let mut adom = fhist.assigned_dom.value.lock().unwrap();
 
+            // get iat 
+            let iat = fhist.iat_buffer.get_nth_min( -1 ); // latest average minimum iat in ms 
+            let mut too_old = false;
+            
+            if iat != 0 {
+                // get time difference between last used ts and now 
+                let timesince = self.timestamp_diff( *domstate.last_used_ts.value.lock().unwrap() ); // in
+                                                                                                     // secs
+                
+                // if unused time is factor of buffer length iats we reclaim the domain 
+                // it implicitly encodes that we don't know much after buffer length times
+                // what would happen 
+                let factor = (timesince*1000)/(iat as u64);
+                if factor > (const_DEFAULT_BUFFER_SIZE as u64) {
+                    too_old = true;
+                }
+            } else {
+                // if iat is 0 then we have no idea about the function characteristics 
+                // so we reclaim the domain 
+                too_old = true;
+            }
+
             let usage = domstate.usage_count.value.load( Ordering::SeqCst );
-            if usage == 0 {
+            if usage == 0 && too_old {
                 if adom.id != consts_RESERVED_GID_UNASSIGNED {
                     *adom = Default::default();
                 }
@@ -524,10 +568,14 @@ impl WarmCoreMaximusCL {
         let current = self.domlimiter.acquire_group(assigned_gid);
 
         // check if concurrency of domilimiter is within limit 
-        if current > domstate.concur_limit.value.load( Ordering::SeqCst ) {
+        let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
+        if current > limit {
+            debug!( fqdn=%fqdn, assigned_gid=%assigned_gid, current=%current, limit=%limit, "[finesched][warmcoremaximuscl][find_available_dom] waiting for assigned_gid to go below limit" );
             // wait for it to become available
             self.domlimiter.wait_for_group( assigned_gid ).await;
         }
+        let mut ts = domstate.last_used_ts.value.lock().unwrap();
+        *ts = self.timestamp();
         domstate.usage_count.value.fetch_add(1, Ordering::Relaxed);
         Some(assigned_gid)
     }
@@ -536,9 +584,25 @@ impl WarmCoreMaximusCL {
         
         // history of fqdn 
         let fhist = self.func_history.get_or_create( &fqdn.to_string() );
-        let db = fhist.dur_buffer_1.get_or_create( &gid );
-        
+
+        // updating iat 
+        let idb = fhist.iat_buffer.clone();
+        let iat = self.shareddata.cmap.get_iat( fqdn ) * 1000.0;
+        let iat = iat as i32; // ms 
+        idb.push( iat );
+        let asfrequent = idb.get_nth_minnorm_avg( -1 ); // normalized by min iat represents a
+                                                      // comparison to the minimum seen iat so far 
+                                                      // a value of 1 means - it's as frequent as
+                                                      // we have seen so far
+                                                      // a value of 5 means - invocations are
+                                                      // becoming infrequent in comparison to the
+                                                      // most frequent we have seen so far 
+        let min_iat = idb.get_nth_min( -1 );
+        let avg_iat = idb.get_nth_avg( -1 );
+        debug!( fqdn=%fqdn, iat=%iat, asfrequent=%asfrequent, min_iat=%min_iat, avg_iat=%avg_iat, "[finesched][warmcoremaximuscl][iat] invoke_complete handler ");
+
         // updating duration 
+        let db = fhist.dur_buffer_1.get_or_create( &gid );
         let dur = self.shareddata.cmap.get_exec_time( fqdn ) * 1000.0;
         let dur = dur as i32; // ms 
         db.push( dur );
