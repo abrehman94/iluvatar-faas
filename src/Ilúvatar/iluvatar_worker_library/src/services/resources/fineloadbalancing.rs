@@ -352,6 +352,7 @@ struct DomState {
     serving_fqdn: ClonableMutex<String>, // it also serves as a lock for the domain
     usage_count: ClonableAtomicI32,
     last_used_ts: ClonableMutex<u64>,
+    last_limit_up_ts: ClonableMutex<u64>,
     id: SchedGroupID,
 }
 
@@ -363,6 +364,7 @@ impl Default for DomState {
             serving_fqdn: ClonableMutex::new("".to_string()),
             usage_count: ClonableAtomicI32::new(0),
             last_used_ts: ClonableMutex::new(0),
+            last_limit_up_ts: ClonableMutex::new(0),
             id: consts_RESERVED_GID_UNASSIGNED,
         }
     }
@@ -382,6 +384,7 @@ impl DomState {
                 serving_fqdn: ClonableMutex::new("".to_string()),
                 usage_count: ClonableAtomicI32::new(0),
                 last_used_ts: ClonableMutex::new(0),
+                last_limit_up_ts: ClonableMutex::new(0),
                 id: gid,
             }));
         }
@@ -479,6 +482,20 @@ impl WarmCoreMaximusCL {
         }
     }
 
+    // if unused time is factor of buffer length iats we reclaim the domain 
+    // it implicitly encodes that we don't know much after buffer length times
+    // what would happen 
+    pub fn time_within_factor( &self, time: u64, basetime: u64 ) -> bool {
+        if basetime == 0 {
+            return false;
+        }
+        let factor = time / basetime;
+        if factor > (const_DEFAULT_BUFFER_SIZE as u64) {
+            return true;
+        }
+        false
+    }
+
     async fn reclamation_worker( self: Arc<Self>, tid: TransactionId ) {
         debug!( tid=%tid, "[finesched][warmcoremaximuscl] reclamation worker called" );
         
@@ -494,25 +511,13 @@ impl WarmCoreMaximusCL {
 
             // get iat 
             let iat = fhist.iat_buffer.get_nth_min( -1 ); // latest average minimum iat in ms 
-            let mut too_old = false;
-            
-            if iat != 0 {
+            let mut too_old = true;
+            if iat != i32::MAX {
                 // get time difference between last used ts and now 
                 let timesince = self.timestamp_diff( *domstate.last_used_ts.value.lock().unwrap() ); // in
                                                                                                      // secs
-                
-                // if unused time is factor of buffer length iats we reclaim the domain 
-                // it implicitly encodes that we don't know much after buffer length times
-                // what would happen 
-                let factor = (timesince*1000)/(iat as u64);
-                if factor > (const_DEFAULT_BUFFER_SIZE as u64) {
-                    too_old = true;
-                }
-            } else {
-                // if iat is 0 then we have no idea about the function characteristics 
-                // so we reclaim the domain 
-                too_old = true;
-            }
+                too_old = self.time_within_factor( timesince*1000, iat as u64 );
+            } 
 
             let usage = domstate.usage_count.value.load( Ordering::SeqCst );
             if usage == 0 && too_old {
@@ -618,11 +623,21 @@ impl WarmCoreMaximusCL {
         cb.push( concur );
         let max_concur = cb.get_nth_max( -2 ); // second last max average concurrency limit seen so far
         debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] invoke_complete handler ");
+        
+        let domstate = self.doms.get( &gid ).unwrap();
+        // determine if concur limit update should happen based on iat 
+        let mut lts_yes = false;
+        let mut lts = domstate.last_limit_up_ts.value.lock().unwrap();
+        if *lts == 0 || min_iat ==  i32::MAX {
+            *lts = self.timestamp();
+        } else {
+            let timesince = self.timestamp_diff( *lts );
+            lts_yes = self.time_within_factor( timesince*1000, min_iat as u64 );
+        }
 
         // update the concurrency limit if the slowdown is greater than 5  
         // it will always update the concurrency limit to last known max value  
-        if slowdown > 5 {
-            let domstate = self.doms.get( &gid ).unwrap();
+        if lts_yes && slowdown > 5 {
             let max_concur = max_concur / 100; // back to original value - with a ceil operation 
             domstate.concur_limit.value.store( max_concur , Ordering::Relaxed );
             debug!( fqdn=%fqdn, gid=%gid, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] updated concurrency limit ");
