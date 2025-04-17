@@ -399,6 +399,7 @@ struct FuncHistory {
     pub concur_buffer_1: ArcMap<SchedGroupID, SignalAnalyzer<i32>>,
     pub concur_limit_1: ArcMap<SchedGroupID, ClonableAtomicI32>,
     pub assigned_dom: ClonableMutex<Arc<DomState>>,
+    pub last_assigned_dom: ClonableMutex<Arc<DomState>>,
 }
 
 impl Default for FuncHistory {
@@ -409,6 +410,7 @@ impl Default for FuncHistory {
             concur_buffer_1: ArcMap::new(),
             concur_limit_1: ArcMap::new(),
             assigned_dom: ClonableMutex::new(Arc::new(DomState::default())),
+            last_assigned_dom: ClonableMutex::new(Arc::new(DomState::default())),
         }
     }
 }
@@ -539,11 +541,23 @@ impl WarmCoreMaximusCL {
             fqdn: &str,
         ) -> Option<SchedGroupID> {
 
-        let (assigned_gid, domstate) = {
+        let (assigned_gid, domstate) = loop {
             // first check if a dom is already allocated to fqdn in it's history 
             let fhist = self.func_history.get_or_create( &fqdn.to_string() );
+            let mut ladom = fhist.last_assigned_dom.value.lock().unwrap();
             let mut adom = fhist.assigned_dom.value.lock().unwrap();
             if adom.id == consts_RESERVED_GID_UNASSIGNED {
+
+                // reuse last assigned domain if it is not in use
+                if ladom.id != consts_RESERVED_GID_UNASSIGNED {
+                    let mut serving_fqdn = ladom.serving_fqdn.value.lock().unwrap();
+                    if serving_fqdn.len() == 0 {
+                       serving_fqdn.push_str( fqdn );
+                        *adom = ladom.clone();
+                       break (ladom.id, ladom.clone());
+                    }
+                }
+
                 // iterate over available domains and find an empty one 
                 for kvref in self.doms.map.iter() {
 
@@ -561,7 +575,10 @@ impl WarmCoreMaximusCL {
                     }  
                 } 
             } 
-            (adom.id, adom.clone())
+            if adom.id != consts_RESERVED_GID_UNASSIGNED {
+                *ladom = adom.clone();
+            }
+            break (adom.id, adom.clone());
         };
 
         if assigned_gid == consts_RESERVED_GID_UNASSIGNED {
