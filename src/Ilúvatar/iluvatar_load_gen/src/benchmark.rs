@@ -91,6 +91,9 @@ pub struct BenchmarkArgs {
     /// Number of concurrent warm invocations to make, default is to make one warm invocation at a
     /// time.
     warm_concur: u32,
+    #[arg(long)]
+    /// The csv with all the functions to be benchmarked listed inside of it. In the form <f_name>,<f_image>
+    mixed_function_file: Option<String>,
     #[arg(long, default_value = "0")]
     /// Duration in minutes that each function will be run for, being invoked in a closed loop.
     /// An alternative to cold/warm-iters.
@@ -110,14 +113,14 @@ pub struct BenchmarkArgs {
     pub log_stdout: bool,
 }
 
-pub fn load_functions(args: &BenchmarkArgs) -> Result<Vec<ToBenchmarkFunction>> {
+pub fn load_functions(function_file: &String) -> Result<Vec<ToBenchmarkFunction>> {
     let mut functions = Vec::new();
 
-    let mut rdr = match csv::Reader::from_path(&args.function_file) {
+    let mut rdr = match csv::Reader::from_path(function_file) {
         Ok(r) => r,
         Err(e) => anyhow::bail!(
             "Unable to open metadata csv file '{}' because of error '{}'",
-            &args.function_file,
+            function_file,
             e
         ),
     };
@@ -129,7 +132,14 @@ pub fn load_functions(args: &BenchmarkArgs) -> Result<Vec<ToBenchmarkFunction>> 
 }
 
 pub fn benchmark_functions(args: BenchmarkArgs) -> Result<()> {
-    let functions = load_functions(&args)?;
+    let functions = load_functions(&args.function_file)?;
+    let mfuncs;
+    if let Some(mf) = args.mixed_function_file {
+        mfuncs = load_functions(&mf)?;
+    }else{
+        mfuncs = vec![];
+    }
+
     let threaded_rt = build_tokio_runtime(&None, &None, &None, &gen_tid())?;
 
     match args.target {
@@ -270,27 +280,11 @@ pub async fn benchmark_controller(
 pub fn benchmark_worker(
     threaded_rt: &TokioRuntime,
     functions: Vec<ToBenchmarkFunction>,
+    mfunctions: Vec<ToBenchmarkFunction>,
     args: BenchmarkArgs,
 ) -> Result<()> {
-    let mut full_data = BenchmarkStore::new();
-    for f in &functions {
-        full_data
-            .data
-            .insert(f.name.clone(), FunctionStore::new(f.image_name.clone(), f.name.clone()));
-    }
-    let mut invokes = vec![];
-    let factory = iluvatar_worker_library::worker_api::worker_comm::WorkerAPIFactory::boxed();
-    let clock = get_global_clock(&gen_tid())?;
-    let mut cold_repeats = args.cold_iters;
-    let warm_concur = args.warm_concur;
 
-    for function in &functions {
-        match args.runtime {
-            0 => (),
-            _ => {
-                cold_repeats = 1;
-            }
-        };
+    fn get_characteristics(function: &ToBenchmarkFunction) -> Result<(Compute, Isolation, MemSizeMb, String)>{
         let compute = match function.compute.as_ref() {
             Some(c) => Compute::try_from(c)?,
             None => Compute::CPU,
@@ -311,39 +305,141 @@ pub fn benchmark_worker(
             }
             None => "{\"name\":\"TESTING\"}".to_string(),
         };
-        async fn invoke(
-            name: String,
-            version: String,
-            host: String,
-            port: Port,
-            tid: TransactionId,
-            args: Option<String>,
-            clock: Clock,
-            factory: Arc<WorkerAPIFactory>,
-            comm_method: Option<CommunicationMethod>,
-        ) -> Result<CompletedWorkerInvocation> {
-            worker_invoke(
-                name.as_str(),
-                version.as_str(),
-                host.as_str(),
-                port,
-                &tid,
-                args,
-                clock,
-                &factory,
-                comm_method,
-            ).await
+        Ok((compute, isolation, memory, func_args))
+    }
+
+    fn fill_store( store: &mut BenchmarkStore, funcs: &Vec<ToBenchmarkFunction> ){
+        for f in funcs {
+           store 
+                .data
+                .insert(f.name.clone(), FunctionStore::new(f.image_name.clone(), f.name.clone()));
         }
+    }
+
+    async fn invoke(
+        name: String,
+        version: String,
+        host: String,
+        port: Port,
+        tid: TransactionId,
+        args: Option<String>,
+        clock: Clock,
+        factory: Arc<WorkerAPIFactory>,
+        comm_method: Option<CommunicationMethod>,
+    ) -> Result<CompletedWorkerInvocation> {
+        worker_invoke(
+            name.as_str(),
+            version.as_str(),
+            host.as_str(),
+            port,
+            &tid,
+            args,
+            clock,
+            &factory,
+            comm_method,
+        ).await
+    }
+
+    fn wait_on_handles( handles: Vec<tokio::task::JoinHandle<Result<CompletedWorkerInvocation, anyhow::Error>>>, mut invokes: &mut Vec<CompletedWorkerInvocation>, threaded_rt: &TokioRuntime,) -> Result<()> 
+    {
+        for handle in handles {
+            let r = threaded_rt.block_on(handle)?;
+            match r {
+                Ok(r) => invokes.push(r),
+                Err(e) => {
+                    error!("Invocation error: {}", e);
+                    continue;
+                }
+            };
+        }
+        Ok(())
+    }
+
+    // base file data collection 
+    let mut full_data = BenchmarkStore::new();
+    let mut invokes = vec![];
+    
+    // mixed function data collection
+    let mut mix_full_data = BenchmarkStore::new();
+    let mut mix_invokes = vec![];
+    let mut mversions = vec![];
+    let mut mnames = vec![];
+    let mut mcharacteristics = vec![];
+
+    fill_store(&mut full_data, &functions);
+    fill_store(&mut mix_full_data, &mfunctions);
+
+    let factory = iluvatar_worker_library::worker_api::worker_comm::WorkerAPIFactory::boxed();
+    let clock = get_global_clock(&gen_tid())?;
+    let mut cold_repeats = args.cold_iters;
+    let warm_concur = args.warm_concur;
+
+    // register all the functions from the mixed function file
+    for mfunction in &mfunctions {
+        let ver = format!("{}.0.0", 1);
+        mversions.push( ver.clone() );
+        let (compute, isolation, memory, func_args) = match get_characteristics(mfunction) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("{}", e);
+                continue;
+            }
+        };
+        let name = format!("{}.{:?}.{}", &mfunction.name, compute, 999);
+        mnames.push(name.clone());
+        mcharacteristics.push((compute, isolation, memory, func_args));
+
+        let (_s, _reg_dur, _tid) = match threaded_rt.block_on(worker_register(
+                name.clone(),
+                &ver,
+                mfunction.image_name.clone(),
+                memory,
+                args.host.clone(),
+                args.port,
+                &factory,
+                None,
+                isolation,
+                compute,
+                None,
+        )) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("{:?}", e);
+                continue;
+            }
+        };
+    }
+
+    // benchmark each function 
+    for function in &functions {
+        match args.runtime {
+            0 => (),
+            _ => {
+                cold_repeats = 1;
+            }
+        };
+
+        let (compute, isolation, memory, func_args) = match get_characteristics(function) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("{}", e);
+                continue;
+            }
+        };
 
         for supported_compute in compute {
             info!("{} {:?}", &function.name, supported_compute);
 
             for iter in 0..cold_repeats {
                 let name = format!("{}.{:?}.{}", &function.name, supported_compute, iter);
+                
+                // each concurrent invocation would execute in it's own version of container 
                 let mut versions = vec![];
                 for i in 0..warm_concur {
                     versions.push(format!("0.{}.{}", i, iter));
                 }
+                
+                // register all versions of the function
                 for version in versions.iter(){
                     let (_s, _reg_dur, _tid) = match threaded_rt.block_on(worker_register(
                             name.clone(),
@@ -370,6 +466,8 @@ pub fn benchmark_worker(
                     0 => {
                         for _ in 0..args.warm_iters + 1 {
                             let mut handles = vec![];
+                            let mut mhandles = vec![];
+                            // concurrent invokes 
                             for i in 0..warm_concur {
                                 handles.push(threaded_rt.spawn(
                                         invoke(
@@ -384,17 +482,27 @@ pub fn benchmark_worker(
                                             None,
                                         )
                                 ));
-                            }
-                            for handle in handles {
-                                let r = threaded_rt.block_on(handle)?;
-                                match r {
-                                    Ok(r) => invokes.push(r),
-                                    Err(e) => {
-                                        error!("Invocation error: {}", e);
-                                        continue;
+                                // make invocation call for the mixed functions as well 
+                                for j in 0..mnames.len() {
+                                    for k in 0..mversions.len() {
+                                        mhandles.push(threaded_rt.spawn(
+                                            invoke(
+                                                mnames[j].clone(),
+                                                mversions[k as usize].clone(),
+                                                args.host.clone(),
+                                                args.port,
+                                                gen_tid(),
+                                                Some(mcharacteristics[j].3.clone()),
+                                                clock.clone(),
+                                                factory.clone(),
+                                                None,
+                                            )
+                                        ));
                                     }
-                                };
+                                } 
                             }
+                            let _ = wait_on_handles( handles, &mut invokes, threaded_rt)?;
+                            let _ = wait_on_handles( mhandles, &mut mix_invokes, threaded_rt)?;
                         }
                     }
                     duration_sec => {
@@ -431,9 +539,9 @@ pub fn benchmark_worker(
         }
     }
 
-    for invoke in invokes.iter() {
+    fn push_data_to_store( invoke: &CompletedWorkerInvocation, store: &mut BenchmarkStore ) -> Result<()> {
         let parts = invoke.function_name.split('.').collect::<Vec<&str>>();
-        let d = full_data
+        let d = store 
             .data
             .get_mut(parts[0])
             .expect("Unable to find function in result hash, but it should have been there");
@@ -467,11 +575,27 @@ pub fn benchmark_worker(
         } else {
             error!("invoke failure {:?}", invoke.worker_response.json_result);
         }
+        Ok(())
     }
+    
+    invokes.iter().for_each(|invoke| {
+        push_data_to_store(&invoke, &mut full_data).unwrap();
+    });
+    mix_invokes.iter().for_each(|invoke| {
+        push_data_to_store(&invoke, &mut mix_full_data).unwrap();
+    });
+
     let p = Path::new(&args.out_folder).join("worker_function_benchmarks.json");
     save_result_json(p, &full_data)?;
     let p = Path::new(&args.out_folder).join("benchmark-full.json");
     save_result_json(p, &invokes)?;
     let p = Path::new(&args.out_folder).join("benchmark-output.csv");
-    save_worker_result_csv(p, &invokes)
+    save_worker_result_csv(p, &invokes)?;
+
+    let p = Path::new(&args.out_folder).join("mix_worker_function_benchmarks.json");
+    save_result_json(p, &mix_full_data)?;
+    let p = Path::new(&args.out_folder).join("mix_benchmark-full.json");
+    save_result_json(p, &mix_invokes)?;
+    let p = Path::new(&args.out_folder).join("mix_benchmark-output.csv");
+    save_worker_result_csv(p, &mix_invokes)
 }
