@@ -604,6 +604,7 @@ impl WarmCoreMaximusCL {
 
     pub fn return_and_update_concurrency_limit( &self, fqdn: &str, gid: SchedGroupID ) {
         
+
         // history of fqdn 
         let fhist = self.func_history.get_or_create( &fqdn.to_string() );
 
@@ -635,7 +636,8 @@ impl WarmCoreMaximusCL {
 
         // updating concur stats 
         let cb = fhist.concur_buffer_1.get_or_create( &gid );
-        let concur = self.domlimiter.return_group( gid );
+        // gid stats are those which actually got to run 
+        let concur = self.shareddata.mapgidstats.fetch_current( gid ).unwrap();
         let concur = (concur * 100) as i32; // two decimal places
         cb.push( concur );
         let max_concur = cb.get_nth_max( -2 ); // second last max average concurrency limit seen so far
@@ -659,6 +661,10 @@ impl WarmCoreMaximusCL {
             domstate.concur_limit.value.store( max_concur , Ordering::Relaxed );
             debug!( fqdn=%fqdn, gid=%gid, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] updated concurrency limit ");
         }
+
+        // return group to domlimiter 
+        let concur = self.domlimiter.return_group( gid );
+        debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][domlimiter][count] invoke_complete handler ");
     }
 }
 
