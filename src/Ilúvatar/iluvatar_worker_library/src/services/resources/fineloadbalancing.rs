@@ -512,7 +512,9 @@ impl WarmCoreMaximusCL {
             let mut adom = fhist.assigned_dom.value.lock().unwrap();
 
             // get iat 
-            let iat = fhist.iat_buffer.get_nth_min( -1 ); // latest average minimum iat in ms 
+            // let iat = fhist.iat_buffer.get_nth_min( -1 ); // latest average minimum iat in ms 
+            // minimum yeilds very small time and is not an indicator of current state 
+            let iat = fhist.iat_buffer.get_nth_avg( -1 ); // latest average iat in ms 
             let mut too_old = true;
             if iat != i32::MAX {
                 // get time difference between last used ts and now 
