@@ -85,10 +85,10 @@ impl ClonableAtomicI32 {
         }
     }
 
-    pub fn sub_clamp_zero(&self, val: i32) -> i32 {
+    pub fn sub_clamp_limited(&self, val: i32, lower_clamp: i32) -> i32 {
         loop {
             let current = self.value.load(Ordering::Relaxed);
-            if current == 0 {
+            if lower_clamp == current {
                 break current;
             }
 

@@ -45,6 +45,8 @@ use regex::Regex;
 ////////////////////////////////////
 /// Shared or Global stuff across policies  
 
+pub const const_DOM_OVERCOMMIT: i32 = 48;
+
 lazy_static::lazy_static! {
   pub static ref FINESCHED_RECLAMATION_WORKER_TID: TransactionId = "FineSchedReclamationWorker".to_string();
 }
@@ -360,7 +362,7 @@ impl Default for DomState {
     fn default() -> Self {
         DomState {
             bpfdom_config: SchedGroup::default(),
-            concur_limit: ClonableAtomicI32::new(48), // we start from an overcommit state 
+            concur_limit: ClonableAtomicI32::new(const_DOM_OVERCOMMIT), // we start from an overcommit state 
             serving_fqdn: ClonableMutex::new("".to_string()),
             usage_count: ClonableAtomicI32::new(0),
             last_used_ts: ClonableMutex::new(0),
@@ -380,7 +382,7 @@ impl DomState {
             let bpfdom_config = pgs.get_schedgroup( gid ).unwrap();
             doms.map.insert( gid, Arc::new(DomState{
                 bpfdom_config: bpfdom_config.clone(),
-                concur_limit: ClonableAtomicI32::new(48), // we start from an overcommit state 
+                concur_limit: ClonableAtomicI32::new(const_DOM_OVERCOMMIT), // we start from an overcommit state 
                 serving_fqdn: ClonableMutex::new("".to_string()),
                 usage_count: ClonableAtomicI32::new(0),
                 last_used_ts: ClonableMutex::new(0),
@@ -658,11 +660,21 @@ impl WarmCoreMaximusCL {
 
         // update the concurrency limit if the slowdown is greater than 5  
         // it will always update the concurrency limit to last known max value  
+        let mut max_concur = max_concur / 100; // back to original value - with a ceil operation 
+        let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
         if lts_yes && slowdown > 5 {
-            let max_concur = max_concur / 100; // back to original value - with a ceil operation 
-            domstate.concur_limit.value.store( max_concur , Ordering::Relaxed );
-            debug!( fqdn=%fqdn, gid=%gid, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] updated concurrency limit ");
+            if limit == const_DOM_OVERCOMMIT {
+                domstate.concur_limit.value.store( max_concur , Ordering::Relaxed );
+            }else{
+                // decrement by one with a lower clamp of 1
+                max_concur = domstate.concur_limit.sub_clamp_limited( 1, 1 );
+            }
+        } else {
+            if limit < const_DOM_OVERCOMMIT {
+                max_concur = domstate.concur_limit.value.fetch_add( 1, Ordering::Relaxed );
+            }
         }
+        debug!( fqdn=%fqdn, gid=%gid, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] updated concurrency limit ");
 
         // return group to domlimiter 
         let concur = self.domlimiter.return_group( gid );
