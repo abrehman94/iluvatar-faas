@@ -77,7 +77,7 @@ impl GidStats {
     // returns the group to the pool
     pub fn return_group(&self, gid: SchedGroupID) -> i32 {
         let count = self.stats.get( &gid ).unwrap();
-        let ccount = count.sub_clamp_zero( 1 );
+        let ccount = count.sub_clamp_limited( 1, 0 );
         debug!(gid=%gid, group_count=%ccount, "[finesched][GidStats] return_group( gid ) - returned group id");
         ccount
     }

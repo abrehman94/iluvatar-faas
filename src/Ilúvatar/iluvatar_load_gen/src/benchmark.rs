@@ -134,7 +134,7 @@ pub fn load_functions(function_file: &String) -> Result<Vec<ToBenchmarkFunction>
 pub fn benchmark_functions(args: BenchmarkArgs) -> Result<()> {
     let functions = load_functions(&args.function_file)?;
     let mfuncs;
-    if let Some(mf) = args.mixed_function_file {
+    if let Some(mf) = args.mixed_function_file.clone() {
         mfuncs = load_functions(&mf)?;
     }else{
         mfuncs = vec![];
@@ -143,7 +143,7 @@ pub fn benchmark_functions(args: BenchmarkArgs) -> Result<()> {
     let threaded_rt = build_tokio_runtime(&None, &None, &None, &gen_tid())?;
 
     match args.target {
-        Target::Worker => benchmark_worker(&threaded_rt, functions, args),
+        Target::Worker => benchmark_worker(&threaded_rt, functions, mfuncs, args),
         Target::Controller => threaded_rt.block_on(benchmark_controller(
             args.host.clone(),
             args.port,
