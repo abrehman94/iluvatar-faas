@@ -46,6 +46,7 @@ use regex::Regex;
 /// Shared or Global stuff across policies  
 
 pub const const_DOM_OVERCOMMIT: i32 = 48;
+pub const const_DOM_STARTING_LIMIT: i32 = 1;
 
 lazy_static::lazy_static! {
   pub static ref FINESCHED_RECLAMATION_WORKER_TID: TransactionId = "FineSchedReclamationWorker".to_string();
@@ -362,7 +363,9 @@ impl Default for DomState {
     fn default() -> Self {
         DomState {
             bpfdom_config: SchedGroup::default(),
-            concur_limit: ClonableAtomicI32::new(const_DOM_OVERCOMMIT), // we start from an overcommit state 
+            concur_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
+                                                                            // overprovisioned
+                                                                            // state 
             serving_fqdn: ClonableMutex::new("".to_string()),
             usage_count: ClonableAtomicI32::new(0),
             last_used_ts: ClonableMutex::new(0),
@@ -382,7 +385,9 @@ impl DomState {
             let bpfdom_config = pgs.get_schedgroup( gid ).unwrap();
             doms.map.insert( gid, Arc::new(DomState{
                 bpfdom_config: bpfdom_config.clone(),
-                concur_limit: ClonableAtomicI32::new(const_DOM_OVERCOMMIT), // we start from an overcommit state 
+                concur_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
+                                                                            // overprovisioned
+                                                                            // state 
                 serving_fqdn: ClonableMutex::new("".to_string()),
                 usage_count: ClonableAtomicI32::new(0),
                 last_used_ts: ClonableMutex::new(0),
@@ -644,7 +649,8 @@ impl WarmCoreMaximusCL {
         let concur = self.shareddata.mapgidstats.fetch_current( gid ).unwrap();
         let concur = (concur * 100) as i32; // two decimal places
         cb.push( concur );
-        let max_concur = cb.get_nth_max( -2 ); // second last max average concurrency limit seen so far
+        let max_concur = cb.get_nth_max( -2 ); // second last max average concurrency limit seen so far - produces 
+                                               // i32::min when there is no value -xxxxx
         debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] invoke_complete handler ");
         
         let domstate = self.doms.get( &gid ).unwrap();
@@ -663,15 +669,13 @@ impl WarmCoreMaximusCL {
         let mut max_concur = max_concur / 100; // back to original value - with a ceil operation 
         let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
         if lts_yes && slowdown > 5 {
-            if limit == const_DOM_OVERCOMMIT {
-                domstate.concur_limit.value.store( max_concur , Ordering::Relaxed );
-            }else{
-                // decrement by one with a lower clamp of 1
-                max_concur = domstate.concur_limit.sub_clamp_limited( 1, 1 );
-            }
+            // decrement by one with a lower clamp of 1
+            max_concur = domstate.concur_limit.sub_clamp_limited( 1, 1 );
         } else {
             if limit < const_DOM_OVERCOMMIT {
                 max_concur = domstate.concur_limit.value.fetch_add( 1, Ordering::Relaxed );
+            } else {
+                max_concur = domstate.concur_limit.value.load( Ordering::Relaxed );
             }
         }
         debug!( fqdn=%fqdn, gid=%gid, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] updated concurrency limit ");
