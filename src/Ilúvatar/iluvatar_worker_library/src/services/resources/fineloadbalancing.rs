@@ -47,6 +47,7 @@ use regex::Regex;
 
 pub const const_DOM_OVERCOMMIT: i32 = 48;
 pub const const_DOM_STARTING_LIMIT: i32 = 1;
+pub const const_SLOWDOWN_THRESHOLD: i32 = 5;
 
 lazy_static::lazy_static! {
   pub static ref FINESCHED_RECLAMATION_WORKER_TID: TransactionId = "FineSchedReclamationWorker".to_string();
@@ -397,6 +398,12 @@ impl DomState {
         }
         doms
     }
+
+    pub fn reset(&self){
+        self.serving_fqdn.value.lock().unwrap().clear();
+        self.usage_count.value.store(0, Ordering::Relaxed);
+        self.concur_limit.value.store( const_DOM_STARTING_LIMIT, Ordering::Relaxed );
+    }
 }
 
 #[derive(Clone)]
@@ -407,6 +414,18 @@ struct FuncHistory {
     pub concur_limit_1: ArcMap<SchedGroupID, ClonableAtomicI32>,
     pub assigned_dom: ClonableMutex<Arc<DomState>>,
     pub last_assigned_dom: ClonableMutex<Arc<DomState>>,
+
+    /// requesting other doms 
+    pub impact_on_others: ArcMap<(SchedGroupID,String), SignalAnalyzer<i32>>,
+    pub frgn_dur_buffer: Arc<SignalAnalyzer<i32>>,
+    pub frgn_reqs_limit: Arc<ClonableAtomicI32>, // this limit based off frgn_dur
+                                            // it is intended to limit funcs with 
+                                            // global resource contention like dd 
+                                            // have different limit for each forgn dom
+                                            // assumes a function is cpu centric 
+                                            // besides we want to discourage foreign 
+                                            // requests to avoid overcrowding of doms by 
+                                            // requests 
 }
 
 impl Default for FuncHistory {
@@ -441,6 +460,20 @@ pub struct WarmCoreMaximusCL {
     creation_time: Instant,
 }
 
+fn wcmcl_update_concur_limit_inc_dec(concur_limit: &ClonableAtomicI32, slowdown: i32, slw_threshold: i32, limit_upper_clamp: i32) -> i32 {
+    let limit = concur_limit.value.load( Ordering::SeqCst );
+    let old_concur; 
+    if slowdown > slw_threshold {
+        old_concur = concur_limit.sub_clamp_limited( 1, 1 );
+    } else {
+        if limit < limit_upper_clamp {
+            old_concur = concur_limit.value.fetch_add( 1, Ordering::Relaxed );
+        } else {
+            old_concur = concur_limit.value.load( Ordering::Relaxed );
+        }
+    }
+    old_concur
+}
 
 impl WarmCoreMaximusCL {
     pub fn new( shareddata: SharedData, ) -> Arc<Self> {
@@ -514,7 +547,7 @@ impl WarmCoreMaximusCL {
         for kvref in doms.map.iter() {
             let domid = kvref.key();
             let domstate = kvref.value();
-            let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
+            let serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
             let fhist = self.func_history.get_or_create( &serving_fqdn );
             let mut adom = fhist.assigned_dom.value.lock().unwrap();
 
@@ -535,8 +568,9 @@ impl WarmCoreMaximusCL {
                 if adom.id != consts_RESERVED_GID_UNASSIGNED {
                     *adom = Default::default();
                 }
-                serving_fqdn.clear();
                 debug!( tid=%tid, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl] reclamation worker - resetting serving fqdn" );
+                drop(serving_fqdn);
+                domstate.reset();
             } else {
                 // reset the usage count 
                 domstate.usage_count.value.store(0, Ordering::Relaxed);
@@ -546,11 +580,103 @@ impl WarmCoreMaximusCL {
     }
 
     /// Checks with domlimiter before handing over the gid  
+    fn pick_foreign_domain( &self, 
+            fqdn: &str,
+        ) -> Option<SchedGroupID> {
+        
+        let mut sel_dom = Arc::new(DomState::default()); 
+        // let fhist = self.func_history.get_or_create( &fqdn.to_string() );
+
+        // iterate over available domains and find an empty one
+        if let Some(adom) = self.find_empty_domain( fqdn ) {
+            sel_dom = adom;
+        } else {
+            // create a set of domains who have one or more capacity within their concurrency limit
+            let doms = self.set_of_domains_fillable();
+            // let mut fhist_doms = vec!();
+            // if doms.len() > 0 {
+            //     for dom in doms.iter() {
+            //         let key = (dom.id,fqdn.to_string());
+            //         let foreign_data =  fhist.foreign_hist.get(&key);
+            //         if foreign_data.is_none() {
+            //             continue;
+            //         }else{
+            //             fhist_doms.push( dom.clone() );
+            //         }
+            //     }
+            // }
+            // if fhist_doms.len() == 0 {
+            //     // just pick a random domain
+            // } else {
+            //     // pick one with the least latest delta slowdown 
+            // }
+        
+            // just pick a random domain
+            if doms.len() > 0 {
+                sel_dom = doms[0].clone();
+            } 
+        }
+
+        // acquire the selected dom, check limit and return if all good 
+        if sel_dom.id != consts_RESERVED_GID_UNASSIGNED {
+            let current = self.domlimiter.acquire_group( sel_dom.id );
+            let limit = sel_dom.concur_limit.value.load( Ordering::SeqCst );
+            if current < limit {
+                return Some(sel_dom.id);
+            }
+        }
+
+        None
+    }
+
+    fn set_of_domains_fillable(&self) -> Vec<Arc<DomState>> {
+        let mut doms = vec!();
+        for kvref in self.doms.map.iter() {
+
+            let domid = kvref.key();
+            let domstate = kvref.value();
+            let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
+            // unassigned 
+            if serving_fqdn.len() == 0 {
+                doms.push( (*domstate).clone() );
+            } else {
+                let concur = self.domlimiter.local_gidstats.fetch_current( *domid ).unwrap();
+                let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
+                if concur < limit {
+                    doms.push( (*domstate).clone() );
+                }
+            } 
+        }
+        doms 
+    }
+
+    fn find_empty_domain(&self, fqdn: &str ) -> Option<Arc<DomState>> {
+        // iterate over available domains and find an empty one 
+        for kvref in self.doms.map.iter() {
+
+            let domid = kvref.key();
+            let domstate = kvref.value();
+            let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
+
+            debug!( fqdn=%fqdn, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl][find_available_dom] iterating over domains" );
+
+            if serving_fqdn.len() == 0 {
+                serving_fqdn.push_str( fqdn );
+                debug!( fqdn=%fqdn, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl][find_available_dom] assigned domain" );
+                return Some(domstate.clone());
+            }  
+        }
+        None
+    }
+
+
+
+    /// Checks with domlimiter before handing over the gid  
     async fn find_available_dom( &self, 
             fqdn: &str,
         ) -> Option<SchedGroupID> {
 
-        let (assigned_gid, domstate) = loop {
+        let (mut assigned_gid, domstate) = loop {
             // first check if a dom is already allocated to fqdn in it's history 
             let fhist = self.func_history.get_or_create( &fqdn.to_string() );
             let mut ladom = fhist.last_assigned_dom.value.lock().unwrap();
@@ -566,23 +692,10 @@ impl WarmCoreMaximusCL {
                        break (ladom.id, ladom.clone());
                     }
                 }
-
-                // iterate over available domains and find an empty one 
-                for kvref in self.doms.map.iter() {
-
-                    let domid = kvref.key();
-                    let domstate = kvref.value();
-                    let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
-
-                    debug!( fqdn=%fqdn, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl][find_available_dom] iterating over domains" );
-
-                    if serving_fqdn.len() == 0 {
-                        *adom = domstate.clone();
-                        serving_fqdn.push_str( fqdn );
-                        debug!( fqdn=%fqdn, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl][find_available_dom] assigned domain" );
-                        break;
-                    }  
-                } 
+                
+                if let Some(temp_dom) = self.find_empty_domain( fqdn ) {
+                    *adom = temp_dom;
+                }
             } 
             if adom.id != consts_RESERVED_GID_UNASSIGNED {
                 *ladom = adom.clone();
@@ -601,9 +714,18 @@ impl WarmCoreMaximusCL {
         // check if concurrency of domilimiter is within limit 
         let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
         if current > limit {
-            debug!( fqdn=%fqdn, assigned_gid=%assigned_gid, current=%current, limit=%limit, "[finesched][warmcoremaximuscl][find_available_dom] waiting for assigned_gid to go below limit" );
-            // wait for it to become available
-            self.domlimiter.wait_for_group( assigned_gid ).await;
+            
+            let foreign_gid = self.pick_foreign_domain( fqdn );
+            // try to pick a foreign domain
+            if let Some(foreign_gid) = foreign_gid {
+                self.domlimiter.return_group( assigned_gid );
+                assigned_gid = foreign_gid;
+            }else{
+                // if pick failed just wait for this domain to become available
+                debug!( fqdn=%fqdn, assigned_gid=%assigned_gid, current=%current, limit=%limit, "[finesched][warmcoremaximuscl][find_available_dom] waiting for assigned_gid to go below limit" );
+                // wait for it to become available
+                self.domlimiter.wait_for_group( assigned_gid ).await;
+            }
         }
         let mut ts = domstate.last_used_ts.value.lock().unwrap();
         *ts = self.timestamp();
@@ -612,8 +734,6 @@ impl WarmCoreMaximusCL {
     }
 
     pub fn return_and_update_concurrency_limit( &self, fqdn: &str, gid: SchedGroupID ) {
-        
-
         // history of fqdn 
         let fhist = self.func_history.get_or_create( &fqdn.to_string() );
 
@@ -643,6 +763,7 @@ impl WarmCoreMaximusCL {
         let avg_dur = db.get_nth_avg( -1 );
         debug!( fqdn=%fqdn, dur=%dur, slowdown=%slowdown, min_dur=%min_dur, avg_dur=%avg_dur, "[finesched][warmcoremaximuscl][slowdown] invoke_complete handler ");
 
+
         // updating concur stats 
         let cb = fhist.concur_buffer_1.get_or_create( &gid );
         // gid stats are those which actually got to run 
@@ -653,32 +774,46 @@ impl WarmCoreMaximusCL {
                                                // i32::min when there is no value -xxxxx
         debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] invoke_complete handler ");
         
-        let domstate = self.doms.get( &gid ).unwrap();
-        // determine if concur limit update should happen based on iat 
-        let mut lts_yes = false;
+        let domstate = fhist.assigned_dom.value.lock().unwrap();
         let mut lts = domstate.last_limit_up_ts.value.lock().unwrap();
-        if *lts == 0 || min_iat ==  i32::MAX {
-            *lts = self.timestamp();
-        } else {
-            let timesince = self.timestamp_diff( *lts );
-            lts_yes = self.time_within_factor( timesince*1000, min_iat as u64 );
-        }
-
-        // update the concurrency limit if the slowdown is greater than 5  
-        // it will always update the concurrency limit to last known max value  
-        let mut max_concur = max_concur / 100; // back to original value - with a ceil operation 
-        let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
-        if lts_yes && slowdown > 5 {
-            // decrement by one with a lower clamp of 1
-            max_concur = domstate.concur_limit.sub_clamp_limited( 1, 1 );
-        } else {
-            if limit < const_DOM_OVERCOMMIT {
-                max_concur = domstate.concur_limit.value.fetch_add( 1, Ordering::Relaxed );
-            } else {
-                max_concur = domstate.concur_limit.value.load( Ordering::Relaxed );
-            }
-        }
+        *lts = self.timestamp();
+        max_concur = wcmcl_update_concur_limit_inc_dec( &domstate.concur_limit, slowdown, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
         debug!( fqdn=%fqdn, gid=%gid, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] updated concurrency limit ");
+
+        let was_foreign = domstate.id != gid;
+        if was_foreign {
+            // impact on other - delta slowdown of other domain 
+            let other_dom = self.doms.get( &gid ).unwrap();
+            let other_fqdn = other_dom.serving_fqdn.value.lock().unwrap();
+            let other_dur_sigaz = self.func_history.get_or_create( &other_fqdn.to_string() );
+            let slowdown_lst = other_dur_sigaz.dur_buffer_1.get_nth_minnorm_avg( -1 );
+            let slowdown_old = other_dur_sigaz.dur_buffer_1.get_nth_minnorm_avg( -2 );
+            if slowdown_lst > 0 {
+                // we only update stuff if we have enough history 
+
+                // impact on other dom
+                let delta = slowdown_lst - slowdown_old;
+                let key = (gid,other_fqdn.to_string());
+                let db = fhist.impact_on_others.get_or_create( &key );
+                db.push( delta );
+
+                // slowdown of foreign invoke 
+                let db = fhist.frgn_dur_buffer.clone();
+                db.push( dur ); // dur was pulled way up
+                                // this function needs a revamp! 
+                let _impact_delta = db.get_nth_avg( -1 );
+                // limit on foreign requests  
+                let frgn_slw = db.get_nth_minnorm_avg( -1 );
+                let frgn_limit = 0;
+                if frgn_slw > 0 {
+                    frgn_limit = wcmcl_update_concur_limit_inc_dec( fhist.frgn_reqs_limit.as_ref(), frgn_slw, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
+                }
+
+                debug!( fqdn=%fqdn, self_id=%domstate.id, other_id=%gid, other_fqdn=%other_fqdn, impact_delta=%_impact_delta, frgn_slw=%frgn_slw,
+                    frgn_limit=%frgn_limit,
+                    "[finesched][warmcoremaximuscl][foreign_requests][update_self] captured a data point from a completed foreign request");
+            }
+        } 
 
         // return group to domlimiter 
         let concur = self.domlimiter.return_group( gid );
