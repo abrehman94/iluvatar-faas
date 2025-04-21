@@ -409,7 +409,8 @@ pub fn benchmark_worker(
             }
         };
     }
-
+    
+    let mut idx_func = 0;
     // benchmark each function 
     for function in &functions {
         match args.runtime {
@@ -483,23 +484,19 @@ pub fn benchmark_worker(
                                         )
                                 ));
                                 // make invocation call for the mixed functions as well 
-                                for j in 0..mnames.len() {
-                                    for k in 0..mversions.len() {
-                                        mhandles.push(threaded_rt.spawn(
-                                            invoke(
-                                                mnames[j].clone(),
-                                                mversions[k as usize].clone(),
-                                                args.host.clone(),
-                                                args.port,
-                                                gen_tid(),
-                                                Some(mcharacteristics[j].3.clone()),
-                                                clock.clone(),
-                                                factory.clone(),
-                                                None,
-                                            )
-                                        ));
-                                    }
-                                } 
+                                mhandles.push(threaded_rt.spawn(
+                                        invoke(
+                                            mnames[idx_func].clone(),
+                                            mversions[idx_func as usize].clone(),
+                                            args.host.clone(),
+                                            args.port,
+                                            gen_tid(),
+                                            Some(mcharacteristics[idx_func].3.clone()),
+                                            clock.clone(),
+                                            factory.clone(),
+                                            None,
+                                        )
+                                ));
                             }
                             let _ = wait_on_handles( handles, &mut invokes, threaded_rt)?;
                             let _ = wait_on_handles( mhandles, &mut mix_invokes, threaded_rt)?;
@@ -537,6 +534,7 @@ pub fn benchmark_worker(
                 }
             }
         }
+        idx_func += 1;
     }
 
     fn push_data_to_store( invoke: &CompletedWorkerInvocation, store: &mut BenchmarkStore ) -> Result<()> {
