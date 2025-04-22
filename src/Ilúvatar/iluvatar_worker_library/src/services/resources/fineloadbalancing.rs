@@ -404,6 +404,15 @@ impl DomState {
         self.usage_count.value.store(0, Ordering::Relaxed);
         self.concur_limit.value.store( const_DOM_STARTING_LIMIT, Ordering::Relaxed );
     }
+
+    pub fn acquire_dom(&self, fqdn: &str) -> bool {
+        let mut serving_fqdn = self.serving_fqdn.value.lock().unwrap();
+        if serving_fqdn.len() == 0 {
+            serving_fqdn.push_str( fqdn );
+            return true;
+        }
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -664,23 +673,15 @@ impl WarmCoreMaximusCL {
     fn find_empty_domain(&self, fqdn: &str ) -> Option<Arc<DomState>> {
         // iterate over available domains and find an empty one 
         for kvref in self.doms.map.iter() {
-
             let domid = kvref.key();
             let domstate = kvref.value();
             let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
-
-            debug!( fqdn=%fqdn, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl][find_available_dom] iterating over domains" );
-
             if serving_fqdn.len() == 0 {
-                serving_fqdn.push_str( fqdn );
-                debug!( fqdn=%fqdn, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl][find_available_dom] assigned domain" );
                 return Some(domstate.clone());
             }  
         }
         None
     }
-
-
 
     /// Checks with domlimiter before handing over the gid  
     async fn find_available_dom( &self, 
@@ -696,16 +697,16 @@ impl WarmCoreMaximusCL {
 
                 // reuse last assigned domain if it is not in use
                 if ladom.id != consts_RESERVED_GID_UNASSIGNED {
-                    let mut serving_fqdn = ladom.serving_fqdn.value.lock().unwrap();
-                    if serving_fqdn.len() == 0 {
-                       serving_fqdn.push_str( fqdn );
+                    if ladom.acquire_dom( fqdn ) {
                         *adom = ladom.clone();
-                       break (ladom.id, ladom.clone());
+                        break (ladom.id, ladom.clone());
                     }
                 }
                 
                 if let Some(temp_dom) = self.find_empty_domain( fqdn ) {
-                    *adom = temp_dom;
+                    if temp_dom.acquire_dom( fqdn ) {
+                        *adom = temp_dom;
+                    }
                 }
             } 
             if adom.id != consts_RESERVED_GID_UNASSIGNED {
@@ -745,6 +746,9 @@ impl WarmCoreMaximusCL {
     }
 
     pub fn return_and_update_concurrency_limit( &self, fqdn: &str, gid: SchedGroupID ) {
+
+        // fqdn -- this request fqdn 
+        // gid -- foreign / local request gid 
 
         // history of fqdn 
         let fhist = self.func_history.get_or_create( &fqdn.to_string() );
