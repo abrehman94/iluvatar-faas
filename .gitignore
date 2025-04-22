@@ -8,3 +8,4 @@ __pycache__/*.lock
 *.swp
 todo.md
 issue_v05.md
+verification.md
