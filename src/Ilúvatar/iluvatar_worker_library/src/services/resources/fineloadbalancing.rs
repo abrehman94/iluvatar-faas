@@ -604,16 +604,11 @@ impl WarmCoreMaximusCL {
             for dom in doms.iter() {
                 let ofqdn = dom.serving_fqdn.value.lock().unwrap();
                 let key = (dom.id,ofqdn.to_string());
-                let foreign_data =  fhist.impact_on_others.get(&key);
-                if foreign_data.is_none() {
-                    continue;
-                }else{
-                    let lsigaz = foreign_data.value();
-                    let limpact = lsigaz.get_nth_minnorm_avg( -1 ); 
-                    if limpact < lowest_impact {
-                        lowest_impact = limpact;
-                        lowest_dom = dom.clone();
-                    }
+                let foreign_data =  fhist.impact_on_others.get_or_create( &key );
+                let limpact = foreign_data.get_nth_minnorm_avg( -1 ); 
+                if limpact < lowest_impact {
+                    lowest_impact = limpact;
+                    lowest_dom = dom.clone();
                 }
             }
 
@@ -750,8 +745,12 @@ impl WarmCoreMaximusCL {
     }
 
     pub fn return_and_update_concurrency_limit( &self, fqdn: &str, gid: SchedGroupID ) {
+
         // history of fqdn 
         let fhist = self.func_history.get_or_create( &fqdn.to_string() );
+        let domstate = fhist.assigned_dom.value.lock().unwrap();
+        let dur = self.shareddata.cmap.get_exec_time( fqdn ) * 1000.0;
+        let dur = dur as i32; // ms 
 
         // updating iat 
         let idb = fhist.iat_buffer.clone();
@@ -769,33 +768,6 @@ impl WarmCoreMaximusCL {
         let avg_iat = idb.get_nth_avg( -1 );
         debug!( fqdn=%fqdn, iat=%iat, asfrequent=%asfrequent, min_iat=%min_iat, avg_iat=%avg_iat, "[finesched][warmcoremaximuscl][iat] invoke_complete handler ");
 
-        // updating duration 
-        let db = fhist.dur_buffer_1.get_or_create( &gid );
-        let dur = self.shareddata.cmap.get_exec_time( fqdn ) * 1000.0;
-        let dur = dur as i32; // ms 
-        db.push( dur );
-        let slowdown = db.get_nth_minnorm_avg( -1 ); // latest slowdown 
-        let min_dur = db.get_nth_min( -1 );
-        let avg_dur = db.get_nth_avg( -1 );
-        debug!( fqdn=%fqdn, dur=%dur, slowdown=%slowdown, min_dur=%min_dur, avg_dur=%avg_dur, "[finesched][warmcoremaximuscl][slowdown] invoke_complete handler ");
-
-
-        // updating concur stats 
-        let cb = fhist.concur_buffer_1.get_or_create( &gid );
-        // gid stats are those which actually got to run 
-        let concur = self.shareddata.mapgidstats.fetch_current( gid ).unwrap();
-        let concur = (concur * 100) as i32; // two decimal places
-        cb.push( concur );
-        let mut max_concur = cb.get_nth_max( -2 ); // second last max average concurrency limit seen so far - produces 
-                                               // i32::min when there is no value -xxxxx
-        debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] invoke_complete handler ");
-        
-        let domstate = fhist.assigned_dom.value.lock().unwrap();
-        let mut lts = domstate.last_limit_up_ts.value.lock().unwrap();
-        *lts = self.timestamp();
-        max_concur = wcmcl_update_concur_limit_inc_dec( &domstate.concur_limit, slowdown, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
-        debug!( fqdn=%fqdn, gid=%domstate.id, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] updated concurrency limit ");
-
         let was_foreign = domstate.id != gid;
         if was_foreign {
 
@@ -805,8 +777,9 @@ impl WarmCoreMaximusCL {
             let other_dur_sigaz = self.func_history.get_or_create( &other_fqdn.to_string() ).dur_buffer_1.get_or_create( &gid );
             let slowdown_lst = other_dur_sigaz.get_nth_minnorm_avg( -1 );
             let slowdown_old = other_dur_sigaz.get_nth_minnorm_avg( -2 );
+            let frgn_reqs_count = fhist.frgn_reqs_count.value.fetch_sub(1, Ordering::SeqCst);
             if slowdown_lst > 0 {
-                // we only update stuff if we have enough history 
+                // we only update stuff if we have enough history of other dom fqdn 
 
                 // impact on other dom
                 let delta = slowdown_lst - slowdown_old;
@@ -817,8 +790,7 @@ impl WarmCoreMaximusCL {
 
                 // slowdown of foreign invoke 
                 let db = fhist.frgn_dur_buffer.clone();
-                db.push( dur ); // dur was pulled way up
-                                // this function needs a revamp! 
+                db.push( dur ); 
                                 
                 // limit on foreign requests  
                 let frgn_slw = db.get_nth_minnorm_avg( -1 );
@@ -828,16 +800,37 @@ impl WarmCoreMaximusCL {
                 }
 
                 debug!( fqdn=%fqdn, self_id=%domstate.id, other_id=%gid, other_fqdn=%other_fqdn, impact_delta=%_impact_delta, frgn_slw=%frgn_slw,
-                    frgn_limit=%frgn_limit,
+                    frgn_limit=%frgn_limit, frgn_reqs_count=%frgn_reqs_count,
                     "[finesched][warmcoremaximuscl][foreign_requests][update_self] captured a data point from a completed foreign request");
             }
+        } else {
+            // updating duration 
+            let db = fhist.dur_buffer_1.get_or_create( &gid );
+            db.push( dur );
+            let slowdown = db.get_nth_minnorm_avg( -1 ); // latest slowdown 
+            let min_dur = db.get_nth_min( -1 );
+            let avg_dur = db.get_nth_avg( -1 );
+            debug!( fqdn=%fqdn, dur=%dur, slowdown=%slowdown, min_dur=%min_dur, avg_dur=%avg_dur, "[finesched][warmcoremaximuscl][slowdown] invoke_complete handler ");
 
-            fhist.frgn_reqs_count.fetch_sub(1, Ordering::SeqCst);
+            // updating concur stats 
+            let cb = fhist.concur_buffer_1.get_or_create( &gid );
+            // gid stats are those which actually got to run 
+            let concur = self.shareddata.mapgidstats.fetch_current( gid ).unwrap();
+            let concur = (concur * 100) as i32; // two decimal places
+            cb.push( concur );
+            let max_concur = cb.get_nth_max( -2 ); // second last max average concurrency limit seen so far - produces 
+                                                       // i32::min when there is no value -xxxxx
+            debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] invoke_complete handler ");
+
+            let mut lts = domstate.last_limit_up_ts.value.lock().unwrap();
+            *lts = self.timestamp();
+            let concur_limit = wcmcl_update_concur_limit_inc_dec( &domstate.concur_limit, slowdown, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
+            debug!( fqdn=%fqdn, gid=%domstate.id, concur_limit=%concur_limit, "[finesched][warmcoremaximuscl][concur] updated concurrency limit");
         } 
 
         // return group to domlimiter 
-        let concur = self.domlimiter.return_group( gid );
-        debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][domlimiter][count] invoke_complete handler ");
+        let dom_count = self.domlimiter.return_group( gid );
+        debug!( dom_count=%dom_count, gid=%gid, "[finesched][warmcoremaximuscl][domlimiter][count] returned group to domlimiter ");
     }
 }
 
