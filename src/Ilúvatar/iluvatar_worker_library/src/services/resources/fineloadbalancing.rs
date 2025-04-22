@@ -778,35 +778,44 @@ impl WarmCoreMaximusCL {
             // impact on other - delta slowdown of other domain 
             let other_dom = self.doms.get( &gid ).unwrap();
             let other_fqdn = other_dom.serving_fqdn.value.lock().unwrap();
-            let other_dur_sigaz = self.func_history.get_or_create( &other_fqdn.to_string() ).dur_buffer_1.get_or_create( &gid );
-            let slowdown_lst = other_dur_sigaz.get_nth_minnorm_avg( -1 );
-            let slowdown_old = other_dur_sigaz.get_nth_minnorm_avg( -2 );
             let frgn_reqs_count = fhist.frgn_reqs_count.value.fetch_sub(1, Ordering::SeqCst);
-            if slowdown_lst > 0 {
-                // we only update stuff if we have enough history of other dom fqdn 
+            let _impact_delta;
 
-                // impact on other dom
-                let delta = slowdown_lst - slowdown_old;
-                let key = (gid,other_fqdn.to_string());
-                let db = fhist.impact_on_others.get_or_create( &key );
-                db.push( delta );
-                let _impact_delta = db.get_nth_avg( -1 );
-
-                // slowdown of foreign invoke 
-                let db = fhist.frgn_dur_buffer.clone();
-                db.push( dur ); 
-                                
-                // limit on foreign requests  
-                let frgn_slw = db.get_nth_minnorm_avg( -1 );
-                let mut frgn_limit = 0;
-                if frgn_slw > 0 {
-                    frgn_limit = wcmcl_update_concur_limit_inc_dec( fhist.frgn_reqs_limit.as_ref(), frgn_slw, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
-                }
-
-                debug!( fqdn=%fqdn, self_id=%domstate.id, other_id=%gid, other_fqdn=%other_fqdn, impact_delta=%_impact_delta, frgn_slw=%frgn_slw,
-                    frgn_limit=%frgn_limit, frgn_reqs_count=%frgn_reqs_count,
-                    "[finesched][warmcoremaximuscl][foreign_requests][update_self] captured a data point from a completed foreign request");
+            // slowdown of foreign invoke 
+            let db = fhist.frgn_dur_buffer.clone();
+            db.push( dur ); 
+                            
+            // limit on foreign requests  
+            let frgn_slw = db.get_nth_minnorm_avg( -1 );
+            let mut frgn_limit = 0;
+            if frgn_slw > 0 {
+                frgn_limit = wcmcl_update_concur_limit_inc_dec( fhist.frgn_reqs_limit.as_ref(), frgn_slw, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
             }
+
+            // assuming foreign dom was empty 
+            let mut delta = i32::MIN;
+            let mut key = (gid,"".to_string());
+            
+            // update if not 
+            if other_fqdn.len() > 0 {
+                let other_dur_sigaz = self.func_history.get_or_create( &other_fqdn.to_string() ).dur_buffer_1.get_or_create( &gid );
+                let slowdown_lst = other_dur_sigaz.get_nth_minnorm_avg( -1 );
+                let slowdown_old = other_dur_sigaz.get_nth_minnorm_avg( -2 );
+                if slowdown_lst > 0 {
+                    // we only update stuff if we have enough history of other dom fqdn 
+                    // impact on other dom
+                    delta = slowdown_lst - slowdown_old;
+                    key = (gid,other_fqdn.to_string());
+                }
+            } 
+
+            let db = fhist.impact_on_others.get_or_create( &key );
+            db.push( delta );
+            _impact_delta = db.get_nth_avg( -1 );
+
+            debug!( fqdn=%fqdn, self_id=%domstate.id, other_id=%gid, other_fqdn=%other_fqdn, impact_delta=%_impact_delta, frgn_slw=%frgn_slw,
+                frgn_limit=%frgn_limit, frgn_reqs_count=%frgn_reqs_count,
+                "[finesched][warmcoremaximuscl][foreign_requests][update_self] captured a data point from a completed foreign request");
         } else {
             // updating duration 
             let db = fhist.dur_buffer_1.get_or_create( &gid );
