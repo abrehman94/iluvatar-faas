@@ -451,7 +451,7 @@ impl Default for FuncHistory {
             impact_on_others: ArcMap::new(),            
             frgn_dur_buffer: Arc::new(SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE )),
             frgn_reqs_count: Arc::new(Default::default()),
-            frgn_reqs_limit: Arc::new(Default::default()), // this limit based off frgn_dur
+            frgn_reqs_limit: Arc::new(ClonableAtomicI32::new(const_DOM_STARTING_LIMIT)), // this limit based off frgn_dur
         }
     }
 }
@@ -787,7 +787,8 @@ impl WarmCoreMaximusCL {
                             
             // limit on foreign requests  
             let frgn_slw = db.get_nth_minnorm_avg( -1 );
-            let mut frgn_limit = 0;
+            let mut frgn_limit = 0; // a zero here indicates it has not been updated yet  
+                                    // limit actually starts from a default overprovisioned state
             if frgn_slw > 0 {
                 frgn_limit = wcmcl_update_concur_limit_inc_dec( fhist.frgn_reqs_limit.as_ref(), frgn_slw, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
             }
