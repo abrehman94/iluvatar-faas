@@ -808,10 +808,9 @@ impl WarmCoreMaximusCL {
                             
             // limit on foreign requests  
             let frgn_slw = db.get_nth_minnorm_avg( -1 );
-            let mut frgn_limit = 0; // a zero here indicates it has not been updated yet  
-                                    // limit actually starts from a default overprovisioned state
-            if frgn_slw > 0 {
-                frgn_limit = wcmcl_update_concur_limit_inc_dec( fhist.frgn_reqs_limit.as_ref(), frgn_slw, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
+            let mut frgn_limit = 0;
+            if db.get_nth_min( -1 ) != i32::MAX {
+                frgn_limit= wcmcl_update_concur_limit_inc_dec( fhist.frgn_reqs_limit.as_ref(), frgn_slw, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
             }
 
             // assuming foreign dom was empty 
@@ -852,6 +851,12 @@ impl WarmCoreMaximusCL {
             let min_dur = db.get_nth_min( -1 );
             let avg_dur = db.get_nth_avg( -1 );
             debug!( fqdn=%fqdn, dur=%dur, slowdown=%slowdown, min_dur=%min_dur, avg_dur=%avg_dur, "[finesched][warmcoremaximuscl][slowdown] invoke_complete handler ");
+
+            // fill up the foreign request buffer with local data 
+            let db = fhist.frgn_dur_buffer.clone();
+            if db.get_nth_min( -1 ) == i32::MAX {
+                db.push( dur ); 
+            }
 
             // updating concur stats 
             let cb = fhist.concur_buffer_1.get_or_create( &gid );
