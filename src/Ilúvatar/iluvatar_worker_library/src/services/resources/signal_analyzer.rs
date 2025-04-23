@@ -62,8 +62,25 @@ impl SignalAnalyzerMutData<i32>
         for i in 0..self.idata.win_count {
             let window = &buffer_vec[i..i + self.idata.win_size];
             self.windows[i] = window.to_vec();
+            
+            // if the sum overflows for whatever reason for a given window 
+            // the avg will be set to zero with commented out snippet 
+            //
+            // an avg of zero at runtime for no reason can lead to 
+            // all sorts of problems and it would be difficult to debug if a problem 
+            // happens because of this zero - it is easier to see a panic 
+            // a sum overflow in the first place indicates a problem - solve that 
+            //
+            // let sum = window.iter().try_fold(0i32, |acc, &x| acc.checked_add(x));
+            // let avg;
+            // if let Some(sum) = sum {
+            //     avg = sum / self.idata.win_size as i32;
+            // } else {
+            //     avg = 0;
+            // }            
 
             let avg = window.iter().map(|e|*e).sum::<i32>() / self.idata.win_size as i32;
+
             self.avgs[i] = avg;
             if self.buffer_filled_win_init {
                 self.mins[i] = self.mins[i].min(avg);

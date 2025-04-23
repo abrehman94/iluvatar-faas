@@ -793,7 +793,8 @@ impl WarmCoreMaximusCL {
             }
 
             // assuming foreign dom was empty 
-            let mut delta = i32::MIN;
+            let mut delta = 1000; // starting with assumption that foreign request had a bad impact 
+                                  // this assumption will be corrected when we will have enough history
             let mut key = (gid,"".to_string());
             
             // update if not 
@@ -807,6 +808,9 @@ impl WarmCoreMaximusCL {
                     delta = slowdown_lst - slowdown_old;
                     key = (gid,other_fqdn.to_string());
                 }
+            } else {
+                delta = -1000; // if the foreign dom was empty, this request had no impact
+                               // infact we want to prefer such foreign doms   
             } 
 
             let db = fhist.impact_on_others.get_or_create( &key );
