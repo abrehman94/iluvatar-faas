@@ -48,6 +48,7 @@ use regex::Regex;
 pub const const_DOM_OVERCOMMIT: i32 = 48;
 pub const const_DOM_STARTING_LIMIT: i32 = 1;
 pub const const_SLOWDOWN_THRESHOLD: i32 = 5;
+pub const const_IMPACT_THRESHOLD: i32 = 2;
 
 lazy_static::lazy_static! {
   pub static ref FINESCHED_RECLAMATION_WORKER_TID: TransactionId = "FineSchedReclamationWorker".to_string();
@@ -353,6 +354,7 @@ impl LoadBalancingPolicyT for StaticSelectCL {
 struct DomState {
     bpfdom_config: SchedGroup,
     concur_limit: ClonableAtomicI32,
+    forgn_req_limit: ClonableAtomicI32,
     serving_fqdn: ClonableMutex<String>, // it also serves as a lock for the domain
     usage_count: ClonableAtomicI32,
     last_used_ts: ClonableMutex<u64>,
@@ -367,6 +369,7 @@ impl Default for DomState {
             concur_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
                                                                             // overprovisioned
                                                                             // state 
+            forgn_req_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
             serving_fqdn: ClonableMutex::new("".to_string()),
             usage_count: ClonableAtomicI32::new(0),
             last_used_ts: ClonableMutex::new(0),
@@ -389,6 +392,7 @@ impl DomState {
                 concur_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
                                                                             // overprovisioned
                                                                             // state 
+                forgn_req_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
                 serving_fqdn: ClonableMutex::new("".to_string()),
                 usage_count: ClonableAtomicI32::new(0),
                 last_used_ts: ClonableMutex::new(0),
@@ -427,7 +431,7 @@ struct FuncHistory {
     /// requesting other doms 
     pub impact_on_others: ArcMap<(SchedGroupID,String), SignalAnalyzer<i32>>,
     pub frgn_dur_buffer: Arc<SignalAnalyzer<i32>>,
-    pub frgn_reqs_count: Arc<ClonableAtomicI32>,
+    pub frgn_reqs_count: Arc<ClonableAtomicI32>, // this limit based off frgn_dur
     pub frgn_reqs_limit: Arc<ClonableAtomicI32>, // this limit based off frgn_dur
                                             // it is intended to limit funcs with 
                                             // global resource contention like dd 
@@ -469,7 +473,8 @@ pub struct WarmCoreMaximusCL {
 
     tid_gid_map: ArcMap<TransactionId, SchedGroupID>,
     
-    domlimiter: DomConcurrencyLimiter,
+    domlimiter: DomConcurrencyLimiter, // per dom concurrncy limiter
+    forgn_req_limiter: DomConcurrencyLimiter, // per dom foreign request limiter
 
     _rec_worker_thread: std::thread::JoinHandle<()>,
     creation_time: Instant,
@@ -494,7 +499,8 @@ impl WarmCoreMaximusCL {
     pub fn new( shareddata: SharedData, ) -> Arc<Self> {
         
         let local_gidstats = GidStats::new( shareddata.pgs.clone() );
-        let domlimiter = DomConcurrencyLimiter::new( local_gidstats );
+        let domlimiter = DomConcurrencyLimiter::new( local_gidstats.clone() );
+        let forgn_req_limiter = DomConcurrencyLimiter::new( local_gidstats );
 
         let doms = DomState::init_map( shareddata.pgs.clone() );
 
@@ -516,6 +522,7 @@ impl WarmCoreMaximusCL {
             
             tid_gid_map: ArcMap::new(),
             domlimiter,
+            forgn_req_limiter,
             _rec_worker_thread: rec_handle,
             creation_time: Instant::now(),
         });
@@ -633,17 +640,13 @@ impl WarmCoreMaximusCL {
 
         // acquire the selected dom, check limit and return if all good 
         if sel_dom.id != consts_RESERVED_GID_UNASSIGNED {
-            let current = self.domlimiter.acquire_group( sel_dom.id );
-            let limit = sel_dom.concur_limit.value.load( Ordering::SeqCst );
-            if current < limit {
-                let fcount = fhist.frgn_reqs_count.value.fetch_add( 1, Ordering::SeqCst );
-                let flimit = fhist.frgn_reqs_limit.value.load( Ordering::SeqCst );
-                if fcount < flimit {
-                    return Some(sel_dom.id);
-                }
-                fhist.frgn_reqs_count.value.fetch_sub( 1, Ordering::SeqCst );
+            // we must check if the dom can accomodate foreign requests 
+            let fcount = self.forgn_req_limiter.acquire_group( sel_dom.id );
+            let flimit = sel_dom.forgn_req_limit.value.load( Ordering::SeqCst );
+            if fcount < flimit {
+                return Some(sel_dom.id);
             }
-            self.domlimiter.return_group( sel_dom.id );
+            self.forgn_req_limiter.return_group( sel_dom.id );
         }
 
         None
@@ -689,9 +692,10 @@ impl WarmCoreMaximusCL {
             fqdn: &str,
         ) -> Option<SchedGroupID> {
 
+        // first check if a dom is already allocated to fqdn in it's history 
+        let fhist = self.func_history.get_or_create( &fqdn.to_string() );
+
         let (mut assigned_gid, domstate) = loop {
-            // first check if a dom is already allocated to fqdn in it's history 
-            let fhist = self.func_history.get_or_create( &fqdn.to_string() );
             let mut ladom = fhist.last_assigned_dom.value.lock().unwrap();
             let mut adom = fhist.assigned_dom.value.lock().unwrap();
             if adom.id == consts_RESERVED_GID_UNASSIGNED {
@@ -726,14 +730,27 @@ impl WarmCoreMaximusCL {
         // check if concurrency of domilimiter is within limit 
         let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
         if current > limit {
-            
-            // try to pick a foreign domain
-            // it would have already acquired the foreign_gid from the domlimiter
-            let foreign_gid = self.pick_foreign_domain( fqdn );
-            if let Some(foreign_gid) = foreign_gid {
-                self.domlimiter.return_group( assigned_gid );
-                assigned_gid = foreign_gid;
-            }else{
+           
+            // check if we can make a foreign request without impact on our own slowdown 
+            // this limit is on an fqdn making a request 
+            // it is different from dom enforcing a foreign request limit it can accomodate
+            let fcount = fhist.frgn_reqs_count.value.fetch_add(1, Ordering::SeqCst );
+            let flimit = fhist.frgn_reqs_limit.value.load( Ordering::SeqCst );
+            let mut foreign_picked = false;
+
+            if fcount < flimit {
+                // try to pick a foreign domain
+                // it would have already acquired the foreign_gid from the domlimiter
+                let foreign_gid = self.pick_foreign_domain( fqdn );
+                if let Some(foreign_gid) = foreign_gid {
+                    self.domlimiter.return_group( assigned_gid );
+                    assigned_gid = foreign_gid;
+                    foreign_picked = true;
+                }
+            }
+
+            if !foreign_picked {
+                fhist.frgn_reqs_count.value.fetch_sub(1, Ordering::SeqCst );
                 // if pick failed just wait for this domain to become available
                 debug!( fqdn=%fqdn, assigned_gid=%assigned_gid, current=%current, limit=%limit, "[finesched][warmcoremaximuscl][find_available_dom] waiting for assigned_gid to go below limit" );
                 // wait for it to become available
@@ -779,8 +796,11 @@ impl WarmCoreMaximusCL {
             // impact on other - delta slowdown of other domain 
             let other_dom = self.doms.get( &gid ).unwrap();
             let other_fqdn = other_dom.serving_fqdn.value.lock().unwrap();
-            let frgn_reqs_count = fhist.frgn_reqs_count.value.fetch_sub(1, Ordering::SeqCst);
-            let _impact_delta;
+            let dom_frgn_reqs_count = self.forgn_req_limiter.return_group( gid ); // return dom foreign
+                                                                              // request 
+            let fqdn_frgn_reqs_count = fhist.frgn_reqs_count.value.fetch_sub( 1, Ordering::SeqCst ); // return fqdn foreign request 
+
+            let impact_delta;
 
             // slowdown of foreign invoke 
             let db = fhist.frgn_dur_buffer.clone();
@@ -817,10 +837,12 @@ impl WarmCoreMaximusCL {
 
             let db = fhist.impact_on_others.get_or_create( &key );
             db.push( delta );
-            _impact_delta = db.get_nth_avg( -1 );
+            impact_delta = db.get_nth_avg( -1 );
+            let dom_frgn_limit = wcmcl_update_concur_limit_inc_dec( &other_dom.forgn_req_limit, impact_delta, const_IMPACT_THRESHOLD, const_DOM_OVERCOMMIT );
 
-            debug!( fqdn=%fqdn, self_id=%domstate.id, other_id=%gid, other_fqdn=%other_fqdn, impact_delta=%_impact_delta, frgn_slw=%frgn_slw,
-                frgn_limit=%frgn_limit, frgn_reqs_count=%frgn_reqs_count,
+            debug!( fqdn=%fqdn, self_id=%domstate.id, other_id=%gid, other_fqdn=%other_fqdn, impact_delta=%impact_delta, frgn_slw=%frgn_slw,
+                frgn_limit=%frgn_limit, dom_frgn_limit=%dom_frgn_limit, dom_frgn_reqs_count=%dom_frgn_reqs_count, 
+                fqdn_frgn_reqs_count=%fqdn_frgn_reqs_count,
                 "[finesched][warmcoremaximuscl][foreign_requests][update_self] captured a data point from a completed foreign request");
         } else {
             // updating duration 
