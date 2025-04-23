@@ -582,8 +582,9 @@ impl WarmCoreMaximusCL {
             } 
 
             let domserving_count = self.domlimiter.local_gidstats.fetch_current( *domid ).unwrap_or(0);
-            let forgn_req_count = self.forgn_req_limiter.local_gidstats.fetch_current( *domid ).unwrap_or(0);
-            let usage = domserving_count + forgn_req_count;
+            let dom_forgn_req_count = self.forgn_req_limiter.local_gidstats.fetch_current( *domid ).unwrap_or(0);
+            let fqdn_forgn_req_count = fhist.frgn_reqs_count.value.load( Ordering::SeqCst );
+            let usage = domserving_count + dom_forgn_req_count + fqdn_forgn_req_count;
             if usage == 0 && too_old {
                 if adom.id != consts_RESERVED_GID_UNASSIGNED {
                     *adom = Default::default();
