@@ -657,7 +657,7 @@ impl WarmCoreMaximusCL {
             let domstate = kvref.value();
             let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
             // unassigned 
-            if serving_fqdn.len() == 0 {
+            if *domid != consts_RESERVED_GID_UNASSIGNED && serving_fqdn.len() == 0 {
                 doms.push( (*domstate).clone() );
             } else {
                 let concur = self.domlimiter.local_gidstats.fetch_current( *domid ).unwrap();
@@ -676,7 +676,8 @@ impl WarmCoreMaximusCL {
             let domid = kvref.key();
             let domstate = kvref.value();
             let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
-            if serving_fqdn.len() == 0 {
+            // 404 dom would always be empty
+            if *domid != consts_RESERVED_GID_UNASSIGNED && serving_fqdn.len() == 0 {
                 return Some(domstate.clone());
             }  
         }
@@ -698,7 +699,6 @@ impl WarmCoreMaximusCL {
                 // reuse last assigned domain if it is not in use
                 if ladom.id != consts_RESERVED_GID_UNASSIGNED {
                     if ladom.acquire_dom( fqdn ) {
-                        *adom = ladom.clone();
                         break (ladom.id, ladom.clone());
                     }
                 }
@@ -727,8 +727,9 @@ impl WarmCoreMaximusCL {
         let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
         if current > limit {
             
-            let foreign_gid = self.pick_foreign_domain( fqdn );
             // try to pick a foreign domain
+            // it would have already acquired the foreign_gid from the domlimiter
+            let foreign_gid = self.pick_foreign_domain( fqdn );
             if let Some(foreign_gid) = foreign_gid {
                 self.domlimiter.return_group( assigned_gid );
                 assigned_gid = foreign_gid;
@@ -866,6 +867,8 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
             self.domlimiter.acquire_group( consts_RESERVED_GID_UNASSIGNED );
             self.domlimiter.wait_for_group( consts_RESERVED_GID_UNASSIGNED ).await;
         };
+        // gid must always be a valid gid 
+        assert!( 0 <= gid && gid < (self.shareddata.pgs.total_groups() as SchedGroupID) );
         self.tid_gid_map.map.insert( tid.clone(), Arc::new(gid) );
     }
 
