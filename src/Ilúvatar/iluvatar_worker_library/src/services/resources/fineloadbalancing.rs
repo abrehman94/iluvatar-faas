@@ -356,7 +356,6 @@ struct DomState {
     concur_limit: ClonableAtomicI32,
     forgn_req_limit: ClonableAtomicI32,
     serving_fqdn: ClonableMutex<String>, // it also serves as a lock for the domain
-    usage_count: ClonableAtomicI32,
     last_used_ts: ClonableMutex<u64>,
     last_limit_up_ts: ClonableMutex<u64>,
     id: SchedGroupID,
@@ -371,7 +370,6 @@ impl Default for DomState {
                                                                             // state 
             forgn_req_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
             serving_fqdn: ClonableMutex::new("".to_string()),
-            usage_count: ClonableAtomicI32::new(0),
             last_used_ts: ClonableMutex::new(0),
             last_limit_up_ts: ClonableMutex::new(0),
             id: consts_RESERVED_GID_UNASSIGNED,
@@ -394,7 +392,6 @@ impl DomState {
                                                                             // state 
                 forgn_req_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
                 serving_fqdn: ClonableMutex::new("".to_string()),
-                usage_count: ClonableAtomicI32::new(0),
                 last_used_ts: ClonableMutex::new(0),
                 last_limit_up_ts: ClonableMutex::new(0),
                 id: gid,
@@ -405,7 +402,6 @@ impl DomState {
 
     pub fn reset(&self){
         self.serving_fqdn.value.lock().unwrap().clear();
-        self.usage_count.value.store(0, Ordering::Relaxed);
         self.concur_limit.value.store( const_DOM_STARTING_LIMIT, Ordering::Relaxed );
     }
 
@@ -585,7 +581,9 @@ impl WarmCoreMaximusCL {
                 too_old = self.time_within_factor( timesince*1000, iat as u64 );
             } 
 
-            let usage = domstate.usage_count.value.load( Ordering::SeqCst );
+            let domserving_count = self.domlimiter.local_gidstats.fetch_current( *domid ).unwrap_or(0);
+            let forgn_req_count = self.forgn_req_limiter.local_gidstats.fetch_current( *domid ).unwrap_or(0);
+            let usage = domserving_count + forgn_req_count;
             if usage == 0 && too_old {
                 if adom.id != consts_RESERVED_GID_UNASSIGNED {
                     *adom = Default::default();
@@ -594,8 +592,6 @@ impl WarmCoreMaximusCL {
                 drop(serving_fqdn);
                 domstate.reset();
             } else {
-                // reset the usage count 
-                domstate.usage_count.value.store(0, Ordering::Relaxed);
                 debug!( tid=%tid, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl] reclamation worker - resetting usage count" );
             }
         }
@@ -759,7 +755,6 @@ impl WarmCoreMaximusCL {
         }
         let mut ts = domstate.last_used_ts.value.lock().unwrap();
         *ts = self.timestamp();
-        domstate.usage_count.value.fetch_add(1, Ordering::Relaxed);
         Some(assigned_gid)
     }
 
