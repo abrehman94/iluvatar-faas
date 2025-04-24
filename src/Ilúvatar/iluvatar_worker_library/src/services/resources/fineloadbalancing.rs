@@ -52,6 +52,7 @@ pub const const_IMPACT_THRESHOLD: i32 = 2;
 
 lazy_static::lazy_static! {
   pub static ref FINESCHED_RECLAMATION_WORKER_TID: TransactionId = "FineSchedReclamationWorker".to_string();
+  pub static ref FINESCHED_WAKER_WORKER_TID: TransactionId = "FineSchedWakerWorker".to_string();
 }
 
 /// dynamic trait cannot have static functions to allow for dynamic dispatch
@@ -473,6 +474,8 @@ pub struct WarmCoreMaximusCL {
     forgn_req_limiter: DomConcurrencyLimiter, // per dom foreign request limiter
 
     _rec_worker_thread: std::thread::JoinHandle<()>,
+    _wak_worker_thread: std::thread::JoinHandle<()>,
+
     creation_time: Instant,
 }
 
@@ -508,6 +511,15 @@ impl WarmCoreMaximusCL {
             None,
             Some(1 as usize),
         ).unwrap();
+
+        // spawn waker worker
+        let (wak_handle, wak_tx) = tokio_runtime::<_,_, tokio::sync::futures::Notified<'static>>(
+            3000, // every second 
+            FINESCHED_WAKER_WORKER_TID.clone(),
+            Self::waker_worker,
+            None,
+            Some(1 as usize),
+        ).unwrap();
         
         let wcl = Arc::new(WarmCoreMaximusCL{
             shareddata,
@@ -520,10 +532,12 @@ impl WarmCoreMaximusCL {
             domlimiter,
             forgn_req_limiter,
             _rec_worker_thread: rec_handle,
+            _wak_worker_thread: wak_handle,
             creation_time: Instant::now(),
         });
 
         rec_tx.send( wcl.clone() ).unwrap();
+        wak_tx.send( wcl.clone() ).unwrap();
         wcl.clone()
     }
 
@@ -554,6 +568,11 @@ impl WarmCoreMaximusCL {
             return true;
         }
         false
+    }
+
+
+    async fn waker_worker( self: Arc<Self>, tid: TransactionId ) {
+        while self.domlimiter.return_group( consts_RESERVED_GID_UNASSIGNED ) != 0 {};
     }
 
     async fn reclamation_worker( self: Arc<Self>, tid: TransactionId ) {
@@ -909,10 +928,9 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
 
         // cleanup 
         self.tid_gid_map.map.remove( tid );
-        self.domlimiter.return_group( consts_RESERVED_GID_UNASSIGNED );
+        while self.domlimiter.return_group( consts_RESERVED_GID_UNASSIGNED ) != 0 {};
     }
 }
-
 
 ////////////////////////////////////
 /// Least Work Left - Invocation Based -  Load Balancing Policy
