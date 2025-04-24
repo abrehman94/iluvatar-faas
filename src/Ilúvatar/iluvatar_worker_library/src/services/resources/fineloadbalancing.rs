@@ -685,7 +685,7 @@ impl WarmCoreMaximusCL {
     }
 
     /// Checks with domlimiter before handing over the gid  
-    async fn find_available_dom( &self, 
+    fn find_available_dom( &self, 
             fqdn: &str,
         ) -> Option<SchedGroupID> {
 
@@ -721,12 +721,18 @@ impl WarmCoreMaximusCL {
             return None;
         }
 
-        // acquire whatever found from domlimiter and return 
-        let current = self.domlimiter.acquire_group(assigned_gid);
+        let update_domused_ts = || {
+            let mut ts = domstate.last_used_ts.value.lock().unwrap();
+            *ts = self.timestamp();
+        };
 
+        // acquire whatever found from domlimiter and  
         // check if concurrency of domilimiter is within limit 
+        let current = self.domlimiter.acquire_group(assigned_gid);
         let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
         if current > limit {
+            // we cannot use this dom 
+            self.domlimiter.return_group( assigned_gid );
            
             // check if we can make a foreign request without impact on our own slowdown 
             // this limit is on an fqdn making a request 
@@ -740,23 +746,18 @@ impl WarmCoreMaximusCL {
                 // it would have already acquired the foreign_gid from the domlimiter
                 let foreign_gid = self.pick_foreign_domain( fqdn );
                 if let Some(foreign_gid) = foreign_gid {
-                    self.domlimiter.return_group( assigned_gid );
-                    assigned_gid = foreign_gid;
-                    foreign_picked = true;
+                    update_domused_ts();
+                    return Some(foreign_gid);
                 }
-            }
-
-            if !foreign_picked {
+            } else {
                 fhist.frgn_reqs_count.value.fetch_sub(1, Ordering::SeqCst );
-                // if pick failed just wait for this domain to become available
-                debug!( fqdn=%fqdn, assigned_gid=%assigned_gid, current=%current, limit=%limit, "[finesched][warmcoremaximuscl][find_available_dom] waiting for assigned_gid to go below limit" );
-                // wait for it to become available
-                self.domlimiter.wait_for_group( assigned_gid ).await;
             }
+        }else{
+            update_domused_ts();
+            return Some(assigned_gid);
         }
-        let mut ts = domstate.last_used_ts.value.lock().unwrap();
-        *ts = self.timestamp();
-        Some(assigned_gid)
+
+        None
     }
 
     pub fn return_and_update_concurrency_limit( &self, fqdn: &str, gid: SchedGroupID ) {
@@ -883,7 +884,7 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
         debug!( tid=%tid, fqdn=%fqdn, "[finesched][warmcoremaximuscl] blocking handler ");
         
         let gid = loop {
-            let gid = self.find_available_dom( fqdn ).await;  
+            let gid = self.find_available_dom( fqdn );  
             if let Some(gid) = gid {
                 break gid;
             }
