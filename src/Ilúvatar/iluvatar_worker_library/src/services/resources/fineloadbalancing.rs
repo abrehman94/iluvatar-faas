@@ -612,7 +612,7 @@ impl WarmCoreMaximusCL {
                 drop(serving_fqdn);
                 domstate.reset();
             } else {
-                debug!( tid=%tid, domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl] reclamation worker - resetting usage count" );
+                debug!( tid=%tid, domid=%domid, serving_fqdn=%serving_fqdn, domserving_count=%domserving_count, dom_forgn_req_count=%dom_forgn_req_count, fqdn_forgn_req_count=%fqdn_forgn_req_count, "[finesched][warmcoremaximuscl] reclamation worker - resetting usage count" );
             }
         }
     }
