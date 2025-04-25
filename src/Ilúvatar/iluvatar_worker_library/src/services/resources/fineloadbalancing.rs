@@ -142,6 +142,11 @@ impl DomConcurrencyLimiter {
         }
         count
     }
+
+    pub fn return_group_nowakeup( &self, gid: SchedGroupID ) -> i32 {
+        self.local_gidstats.return_group( gid )
+    }
+
 }
 
 ////////////////////////////////////
@@ -768,7 +773,7 @@ impl WarmCoreMaximusCL {
                 // it would have already acquired the foreign_gid from the domlimiter
                 let foreign_gid = self.pick_foreign_domain( fqdn );
                 if let Some(foreign_gid) = foreign_gid {
-                    self.domlimiter.return_group( assigned_gid );
+                    self.domlimiter.return_group_nowakeup( assigned_gid );
                     assigned_gid = foreign_gid;
                     foreign_picked = true;
                 }
