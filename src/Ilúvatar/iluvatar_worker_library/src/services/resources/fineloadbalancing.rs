@@ -695,6 +695,7 @@ impl WarmCoreMaximusCL {
             let domid = kvref.key();
             let domstate = kvref.value();
             let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
+            debug!( domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl] traversing empty doms" );
             // 404 dom would always be empty
             if *domid != consts_RESERVED_GID_UNASSIGNED && serving_fqdn.len() == 0 {
                 return Some(domstate.clone());
@@ -706,23 +707,28 @@ impl WarmCoreMaximusCL {
     /// Checks with domlimiter before handing over the gid  
     async fn find_available_dom( &self, 
             fqdn: &str,
+            tid: &TransactionId,
         ) -> Option<SchedGroupID> {
 
         // first check if a dom is already allocated to fqdn in it's history 
         let fhist = self.func_history.get_or_create( &fqdn.to_string() );
 
         let (mut assigned_gid, domstate) = loop {
+            debug!( fqdn=%fqdn, tid=%tid, "[finesched][warmcoremaximuscl][lock] acquiring lock over last_dom" );
             let mut ladom = fhist.last_assigned_dom.value.lock().unwrap();
+            debug!( fqdn=%fqdn, tid=%tid, "[finesched][warmcoremaximuscl][lock] acquiring lock over assigned_dom" );
             let mut adom = fhist.assigned_dom.value.lock().unwrap();
             if adom.id == consts_RESERVED_GID_UNASSIGNED {
 
                 // reuse last assigned domain if it is not in use
                 if ladom.id != consts_RESERVED_GID_UNASSIGNED {
+                    debug!( fqdn=%fqdn, tid=%tid, "[finesched][warmcoremaximuscl][lock] acquiring lock over assigned_dom" );
                     if ladom.acquire_dom( fqdn ) {
                         break (ladom.id, ladom.clone());
                     }
                 }
                 
+                debug!( fqdn=%fqdn, tid=%tid, "[finesched][warmcoremaximuscl][lock] trying to find empty dom" );
                 if let Some(temp_dom) = self.find_empty_domain( fqdn ) {
                     if temp_dom.acquire_dom( fqdn ) {
                         *adom = temp_dom;
@@ -750,35 +756,37 @@ impl WarmCoreMaximusCL {
             // check if we can make a foreign request without impact on our own slowdown 
             // this limit is on an fqdn making a request 
             // it is different from dom enforcing a foreign request limit it can accomodate
-            let fcount = fhist.frgn_reqs_count.value.fetch_add(1, Ordering::SeqCst );
-            let flimit = fhist.frgn_reqs_limit.value.load( Ordering::SeqCst );
+            // let fcount = fhist.frgn_reqs_count.value.fetch_add(1, Ordering::SeqCst );
+            // let flimit = fhist.frgn_reqs_limit.value.load( Ordering::SeqCst );
+            
             let mut foreign_picked = false;
 
-            if fcount < flimit {
-                // try to pick a foreign domain
-                // it would have already acquired the foreign_gid from the domlimiter
-                let foreign_gid = self.pick_foreign_domain( fqdn );
-                if let Some(foreign_gid) = foreign_gid {
-                    self.domlimiter.return_group( assigned_gid );
-                    assigned_gid = foreign_gid;
-                    foreign_picked = true;
-                }
-            }
+            //if fcount < flimit {
+            //    // try to pick a foreign domain
+            //    // it would have already acquired the foreign_gid from the domlimiter
+            //    let foreign_gid = self.pick_foreign_domain( fqdn );
+            //    if let Some(foreign_gid) = foreign_gid {
+            //        self.domlimiter.return_group( assigned_gid );
+            //        assigned_gid = foreign_gid;
+            //        foreign_picked = true;
+            //    }
+            //}
 
             if !foreign_picked {
                 fhist.frgn_reqs_count.value.fetch_sub(1, Ordering::SeqCst );
                 // if pick failed just wait for this domain to become available
-                debug!( fqdn=%fqdn, assigned_gid=%assigned_gid, current=%current, limit=%limit, "[finesched][warmcoremaximuscl][find_available_dom] waiting for assigned_gid to go below limit" );
+                debug!( fqdn=%fqdn, tid=%tid, assigned_gid=%assigned_gid, current=%current, limit=%limit, "[finesched][warmcoremaximuscl][find_available_dom] waiting for assigned_gid to go below limit" );
                 // wait for it to become available
                 self.domlimiter.wait_for_group( assigned_gid ).await;
             }
         }
+        debug!( fqdn=%fqdn, tid=%tid, assigned_gid=%assigned_gid, "[finesched][warmcoremaximuscl][ts_update] acquiring lock over ts" );
         let mut ts = domstate.last_used_ts.value.lock().unwrap();
         *ts = self.timestamp();
         Some(assigned_gid)
     }
 
-    pub fn return_and_update_concurrency_limit( &self, fqdn: &str, gid: SchedGroupID ) {
+    pub fn return_and_update_concurrency_limit( &self, fqdn: &str, gid: SchedGroupID, tid: &TransactionId, ) {
 
         // fqdn -- this request fqdn 
         // gid -- foreign / local request gid 
@@ -902,13 +910,18 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
         debug!( tid=%tid, fqdn=%fqdn, "[finesched][warmcoremaximuscl] blocking handler ");
         
         let gid = loop {
-            let gid = self.find_available_dom( fqdn ).await;  
+            debug!( tid=%tid, fqdn=%fqdn, "[finesched][warmcoremaximuscl] blocking handler trying to find dom ");
+            let gid = self.find_available_dom( fqdn, tid ).await;  
             if let Some(gid) = gid {
                 break gid;
             }
             self.domlimiter.acquire_group( consts_RESERVED_GID_UNASSIGNED );
+            debug!( tid=%tid, fqdn=%fqdn, "[finesched][warmcoremaximuscl] blocking handler waiting 404 ");
             self.domlimiter.wait_for_group( consts_RESERVED_GID_UNASSIGNED ).await;
         };
+
+        debug!( tid=%tid, fqdn=%fqdn, gid=%gid, "[finesched][warmcoremaximuscl][got_gid] blocking handler ");
+
         // gid must always be a valid gid 
         assert!( 0 <= gid && gid < (self.shareddata.pgs.total_groups() as SchedGroupID) );
         self.tid_gid_map.map.insert( tid.clone(), Arc::new(gid) );
@@ -924,7 +937,7 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
 
         let gid = self.tid_gid_map.get( tid ).unwrap();
         
-        self.return_and_update_concurrency_limit( fqdn, *gid );
+        self.return_and_update_concurrency_limit( fqdn, *gid, tid );
 
         // cleanup 
         self.tid_gid_map.map.remove( tid );
