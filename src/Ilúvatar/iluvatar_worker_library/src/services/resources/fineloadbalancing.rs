@@ -759,20 +759,20 @@ impl WarmCoreMaximusCL {
             // this limit is on an fqdn making a request 
             // it is different from dom enforcing a foreign request limit it can accomodate
             let fcount = fhist.frgn_reqs_count.value.fetch_add(1, Ordering::SeqCst );
-            // let flimit = fhist.frgn_reqs_limit.value.load( Ordering::SeqCst );
+            let flimit = fhist.frgn_reqs_limit.value.load( Ordering::SeqCst );
             
             let mut foreign_picked = false;
 
-            //if fcount < flimit {
-            //    // try to pick a foreign domain
-            //    // it would have already acquired the foreign_gid from the domlimiter
-            //    let foreign_gid = self.pick_foreign_domain( fqdn );
-            //    if let Some(foreign_gid) = foreign_gid {
-            //        self.domlimiter.return_group( assigned_gid );
-            //        assigned_gid = foreign_gid;
-            //        foreign_picked = true;
-            //    }
-            //}
+            if fcount < flimit {
+                // try to pick a foreign domain
+                // it would have already acquired the foreign_gid from the domlimiter
+                let foreign_gid = self.pick_foreign_domain( fqdn );
+                if let Some(foreign_gid) = foreign_gid {
+                    self.domlimiter.return_group( assigned_gid );
+                    assigned_gid = foreign_gid;
+                    foreign_picked = true;
+                }
+            }
 
             if !foreign_picked {
                 fhist.frgn_reqs_count.value.fetch_sub(1, Ordering::SeqCst );
