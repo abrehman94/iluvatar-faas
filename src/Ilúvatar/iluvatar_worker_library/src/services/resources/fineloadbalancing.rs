@@ -498,7 +498,8 @@ impl WarmCoreMaximusCL {
     pub fn new( shareddata: SharedData, ) -> Arc<Self> {
         
         let local_gidstats = GidStats::new( shareddata.pgs.clone() );
-        let domlimiter = DomConcurrencyLimiter::new( local_gidstats.clone() );
+        let domlimiter = DomConcurrencyLimiter::new( local_gidstats );
+        let local_gidstats = GidStats::new( shareddata.pgs.clone() );
         let forgn_req_limiter = DomConcurrencyLimiter::new( local_gidstats );
 
         let doms = DomState::init_map( shareddata.pgs.clone() );
@@ -757,7 +758,7 @@ impl WarmCoreMaximusCL {
             // check if we can make a foreign request without impact on our own slowdown 
             // this limit is on an fqdn making a request 
             // it is different from dom enforcing a foreign request limit it can accomodate
-            // let fcount = fhist.frgn_reqs_count.value.fetch_add(1, Ordering::SeqCst );
+            let fcount = fhist.frgn_reqs_count.value.fetch_add(1, Ordering::SeqCst );
             // let flimit = fhist.frgn_reqs_limit.value.load( Ordering::SeqCst );
             
             let mut foreign_picked = false;
