@@ -724,6 +724,7 @@ impl WarmCoreMaximusCL {
                 if ladom.id != consts_RESERVED_GID_UNASSIGNED {
                     debug!( fqdn=%fqdn, tid=%tid, "[finesched][warmcoremaximuscl][lock] acquiring lock over assigned_dom" );
                     if ladom.acquire_dom( fqdn ) {
+                        *adom = (*ladom).clone();
                         break (ladom.id, ladom.clone());
                     }
                 }
