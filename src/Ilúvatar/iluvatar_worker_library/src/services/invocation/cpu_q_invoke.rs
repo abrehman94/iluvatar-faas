@@ -335,7 +335,7 @@ impl CpuQueueingInvoker {
         permit: Option<Box<dyn Drop + Send>>,
         ipermit: OwnedSemaphorePermit
     ) -> Result<(ParsedResult, Duration, Compute, ContainerState)> {
-        self.cpu.block_container_acquire( tid, reg.fqdn.as_str() ).await;
+        self.cpu.block_container_acquire( tid, (*reg).clone() ).await;
         debug!(tid=%tid, "Internal invocation starting");
         // take run time now because we may have to wait to get a container
         let remove_time = self.clock.now_str()?;
@@ -347,7 +347,7 @@ impl CpuQueueingInvoker {
             },
             EventualItem::Now(n) => n?,
         };
-        self.cpu.notify_cgroup_id( ctr_lock.container.cgroup_id(), tid, reg.fqdn.as_str() );
+        self.cpu.notify_cgroup_id( ctr_lock.container.cgroup_id(), tid, (*reg).clone() );
         self.running.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (data, duration, compute_type, state) = invoke_on_container(
             reg,
@@ -362,7 +362,7 @@ impl CpuQueueingInvoker {
         )
         .await?;
         self.running.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        self.cpu.notify_cgroup_id_done( ctr_lock.container.cgroup_id(), tid, reg.fqdn.as_str() );
+        self.cpu.notify_cgroup_id_done( ctr_lock.container.cgroup_id(), tid, (*reg).clone() );
         drop(permit);
         drop(ipermit);
         self.signal.notify_waiters();

@@ -29,6 +29,7 @@ use iluvatar_finesched::SchedGroup;
 use iluvatar_finesched::consts_RESERVED_GID_SWITCH_BACK;
 use iluvatar_library::clock::{get_unix_clock, Clock};
 
+use crate::services::registration::RegisteredFunction;
 use crate::services::resources::cpugroups::GidStats;
 use crate::services::resources::cpugroups::consts_RESERVED_GID_UNASSIGNED;
 use crate::services::resources::signal_analyzer::SignalAnalyzer;
@@ -58,11 +59,11 @@ lazy_static::lazy_static! {
 /// dynamic trait cannot have static functions to allow for dynamic dispatch
 #[async_trait]
 pub trait LoadBalancingPolicyT {
-    async fn block_container_acquire( &self, _tid: &TransactionId, fqdn: &str ){
-        debug!( _tid=%_tid, fqdn=%fqdn, "[finesched] default handler block container acquire in LoadBalancingPolicyT");
+    async fn block_container_acquire( &self, _tid: &TransactionId, reg: Arc<RegisteredFunction>, ){
+        debug!( _tid=%_tid, fqdn=%reg.fqdn, "[finesched] default handler block container acquire in LoadBalancingPolicyT");
     }
-    fn invoke( &self, _cgroup_id: &str, _tid: &TransactionId, fqdn: &str, ) -> Option<SchedGroupID>;
-    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId, fqdn: &str, ){}
+    fn invoke( &self, _cgroup_id: &str, _tid: &TransactionId, reg: Arc<RegisteredFunction>, ) -> Option<SchedGroupID>;
+    fn invoke_complete( &self, _cgroup_id: &str, _tid: &TransactionId, reg: Arc<RegisteredFunction>, ){}
 }
 
 pub type LoadBalancingPolicyTRef = Arc<dyn LoadBalancingPolicyT + Sync + Send>;
@@ -161,7 +162,7 @@ impl DomZero {
 }
 
 impl LoadBalancingPolicyT for DomZero {
-    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, fqdn: &str ) -> Option<SchedGroupID> {
+    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>, ) -> Option<SchedGroupID> {
         return Some(0) 
     }
 }
@@ -184,7 +185,7 @@ impl RoundRobin {
 }
 
 impl LoadBalancingPolicyT for RoundRobin {
-    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, fqdn: &str ) -> Option<SchedGroupID> {
+    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>, ) -> Option<SchedGroupID> {
         let mut gid = self.nextgid.value.fetch_add( 1, Ordering::Relaxed );
         let tgroups = self.shareddata.pgs.total_groups() as i32;
         if gid >= tgroups {
@@ -215,7 +216,7 @@ impl RoundRobinRL {
 }
 
 impl LoadBalancingPolicyT for RoundRobinRL {
-    fn invoke( &self, cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
+    fn invoke( &self, cgroup_id: &str, _tid: &TransactionId, reg: Arc<RegisteredFunction>, ) -> Option<SchedGroupID> {
         let lgid = self.lastgid.get(cgroup_id);
         if lgid.is_none() {
             let mut gid = self.nextgid.value.fetch_add( 1, Ordering::Relaxed );
@@ -256,7 +257,8 @@ fn match_pattern( pattern: &str, line: &str ) -> bool {
 }
 
 impl LoadBalancingPolicyT for StaticSelect {
-    fn invoke( &self, _cgroup_id: &str, tid: &TransactionId, fqdn: &str ) -> Option<SchedGroupID> {
+    fn invoke( &self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>, ) -> Option<SchedGroupID> {
+        let fqdn = reg.fqdn.as_str();
         let dur = self.shareddata.cmap.get_exec_time( fqdn );
         debug!( fqdn=%fqdn, cgroup_id=%_cgroup_id, tid=%tid, dur=%dur,  "[finesched] static select dispatch policy" );
         let tgroups = self.shareddata.pgs.total_groups() as i32;
@@ -321,10 +323,11 @@ impl StaticSelectCL {
 #[async_trait]
 impl LoadBalancingPolicyT for StaticSelectCL {
 
-    async fn block_container_acquire( &self, tid: &TransactionId, fqdn: &str ){
+    async fn block_container_acquire( &self, tid: &TransactionId, reg: Arc<RegisteredFunction>, ){
+        let fqdn = reg.fqdn.as_str();
 
         debug!( tid=%tid, fqdn=%fqdn, "[finesched][staticselcl] blocking handler ");
-        let gid = self.selpolicy.invoke( "", tid, fqdn ); 
+        let gid = self.selpolicy.invoke( "", tid, reg.clone() ); 
         if let Some(gid) = gid {
 
             // check if acquiring this gid is within concurrency limit
@@ -339,12 +342,13 @@ impl LoadBalancingPolicyT for StaticSelectCL {
 
     }
 
-    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, fqdn: &str ) -> Option<SchedGroupID> {
+    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>, ) -> Option<SchedGroupID> {
+        let fqdn = reg.fqdn.as_str();
         debug!( tid=%tid, fqdn=%fqdn, "[finesched][staticselcl] invoke handler ");
-        return self.selpolicy.invoke( cgroup_id, tid, fqdn ) 
+        return self.selpolicy.invoke( cgroup_id, tid, reg.clone() ) 
     }
 
-    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId, fqdn: &str, ){
+    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId, _reg: Arc<RegisteredFunction>, ){
         debug!( tid=%tid, "[finesched][staticselcl] invoke_complete handler ");
 
         let gid = self.selpolicy.shareddata.maptidstats.get( tid ).unwrap();
@@ -714,6 +718,7 @@ impl WarmCoreMaximusCL {
     async fn find_available_dom( &self, 
             fqdn: &str,
             tid: &TransactionId,
+            cpus: u32,
         ) -> Option<SchedGroupID> {
 
         // first check if a dom is already allocated to fqdn in it's history 
@@ -793,7 +798,9 @@ impl WarmCoreMaximusCL {
         Some(assigned_gid)
     }
 
-    pub fn return_and_update_concurrency_limit( &self, fqdn: &str, gid: SchedGroupID, tid: &TransactionId, ) {
+    pub fn return_and_update_concurrency_limit( &self, reg: Arc<RegisteredFunction>, gid: SchedGroupID, tid: &TransactionId, ) {
+
+        let fqdn = reg.fqdn.as_str();
 
         // fqdn -- this request fqdn 
         // gid -- foreign / local request gid 
@@ -913,12 +920,13 @@ impl WarmCoreMaximusCL {
 #[async_trait]
 impl LoadBalancingPolicyT for WarmCoreMaximusCL {
 
-    async fn block_container_acquire( &self, tid: &TransactionId, fqdn: &str ) {
+    async fn block_container_acquire( &self, tid: &TransactionId, reg: Arc<RegisteredFunction>, ) {
+        let fqdn = reg.fqdn.as_str();
         debug!( tid=%tid, fqdn=%fqdn, "[finesched][warmcoremaximuscl] blocking handler ");
         
         let gid = loop {
             debug!( tid=%tid, fqdn=%fqdn, "[finesched][warmcoremaximuscl] blocking handler trying to find dom ");
-            let gid = self.find_available_dom( fqdn, tid ).await;  
+            let gid = self.find_available_dom( fqdn, tid, reg.cpus ).await;  
             if let Some(gid) = gid {
                 break gid;
             }
@@ -934,17 +942,17 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
         self.tid_gid_map.map.insert( tid.clone(), Arc::new(gid) );
     }
 
-    fn invoke( &self, _cgroup_id: &str, tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
+    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>, ) -> Option<SchedGroupID> {
         debug!( tid=%tid, "[finesched][warmcoremaximuscl] invoke handler ");
         self.tid_gid_map.get( tid ).map(|v| *v)
     }
 
-    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId, fqdn: &str, ) {
+    fn invoke_complete( &self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>,  ) {
         debug!( tid=%tid, "[finesched][warmcoremaximuscl] invoke_complete handler ");
 
         let gid = self.tid_gid_map.get( tid ).unwrap();
         
-        self.return_and_update_concurrency_limit( fqdn, *gid, tid );
+        self.return_and_update_concurrency_limit( reg, *gid, tid );
 
         // cleanup 
         self.tid_gid_map.map.remove( tid );
@@ -969,7 +977,7 @@ impl LWLInvoc {
 
 impl LoadBalancingPolicyT for LWLInvoc {
 
-    fn invoke( &self, _cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
+    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>, ) -> Option<SchedGroupID> {
         let mut gid: Option<SchedGroupID> = None;  
         let mut min_count = i32::MAX;
         
@@ -1011,7 +1019,7 @@ impl SITA {
 
 impl LoadBalancingPolicyT for SITA {
 
-    fn invoke( &self, _cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ) -> Option<SchedGroupID> {
+    fn invoke( &self, cgroup_id: &str, tid: &TransactionId, _reg: Arc<RegisteredFunction>, ) -> Option<SchedGroupID> {
         let mut gid: Option<SchedGroupID> = None;  
         let mut min_count = i32::MAX;
         

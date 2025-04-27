@@ -188,12 +188,14 @@ impl CpuGroupsResourceTracker {
 #[async_trait]
 impl CpuResourceTrackerT for CpuGroupsResourceTracker {
 
-    async fn block_container_acquire( &self, _tid: &TransactionId, fqdn: &str ) {
-        self.lbpolicy.block_container_acquire( _tid, fqdn ).await;
+        
+    async fn block_container_acquire( &self, _tid: &TransactionId, reg: Arc<RegisteredFunction>, ) {
+        self.lbpolicy.block_container_acquire( _tid, reg ).await;
     }
 
-    fn notify_cgroup_id( &self, _cgroup_id: &str, _tid: &TransactionId, fqdn: &str ) {
-        let gid = self.lbpolicy.invoke( _cgroup_id, _tid, fqdn );
+    fn notify_cgroup_id( &self, _cgroup_id: &str, _tid: &TransactionId, reg: Arc<RegisteredFunction>, ) {
+        let fqdn = reg.fqdn.as_str();
+        let gid = self.lbpolicy.invoke( _cgroup_id, _tid, reg.clone() );
         if let Some(gid) = gid {
             self.maptidstats.insert( _tid.clone(), gid );
             self.mapgidstats.acquire_group( gid );
@@ -209,8 +211,8 @@ impl CpuResourceTrackerT for CpuGroupsResourceTracker {
         }
     }
 
-    fn notify_cgroup_id_done( &self, _cgroup_id: &str, _tid: &TransactionId, fqdn: &str ) {
-        self.lbpolicy.invoke_complete( _cgroup_id, _tid, fqdn );
+    fn notify_cgroup_id_done( &self, _cgroup_id: &str, _tid: &TransactionId, reg: Arc<RegisteredFunction>, ) {
+        self.lbpolicy.invoke_complete( _cgroup_id, _tid, reg );
         let gid = match self.maptidstats.get( _tid ) {
             Some(ent) => *ent.value(),
             None => {
@@ -236,5 +238,8 @@ impl CpuResourceTrackerT for CpuGroupsResourceTracker {
         };
     }
 }
+
+
+
 
 
