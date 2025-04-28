@@ -67,19 +67,30 @@ impl GidStats {
 
     // returns the number of times the group has been acquired
     // it will panic if gid was not populated with a zero counter on init  
-    pub fn acquire_group(&self, gid: SchedGroupID) -> i32 {
+    pub fn acquire_x_from_group(&self, gid: SchedGroupID, x: i32 ) -> i32 {
         let count = self.stats.get( &gid ).unwrap();
-        let ccount = count.value.fetch_add(1, Ordering::SeqCst);
+        let ccount = count.value.fetch_add(x, Ordering::SeqCst);
         debug!(gid=%gid, group_count=%ccount, "[finesched][GidStats] acquire_group( gid ) - acquired group id");
         ccount
     }
     
     // returns the group to the pool
-    pub fn return_group(&self, gid: SchedGroupID) -> i32 {
+    pub fn return_x_to_group(&self, gid: SchedGroupID, x: i32) -> i32 {
         let count = self.stats.get( &gid ).unwrap();
-        let ccount = count.sub_clamp_limited( 1, 0 );
+        let ccount = count.sub_clamp_limited( x, 0 );
         debug!(gid=%gid, group_count=%ccount, "[finesched][GidStats] return_group( gid ) - returned group id");
         ccount
+    }
+
+    // returns the number of times the group has been acquired
+    // it will panic if gid was not populated with a zero counter on init  
+    pub fn acquire_group(&self, gid: SchedGroupID) -> i32 {
+        self.acquire_x_from_group( gid, 1 )
+    }
+    
+    // returns the group to the pool
+    pub fn return_group(&self, gid: SchedGroupID) -> i32 {
+        self.return_x_to_group( gid, 1 )
     }
 
     pub fn fetch_current(&self, gid: SchedGroupID) -> Option<i32> {
@@ -188,7 +199,6 @@ impl CpuGroupsResourceTracker {
 #[async_trait]
 impl CpuResourceTrackerT for CpuGroupsResourceTracker {
 
-        
     async fn block_container_acquire( &self, _tid: &TransactionId, reg: Arc<RegisteredFunction>, ) {
         self.lbpolicy.block_container_acquire( _tid, reg ).await;
     }

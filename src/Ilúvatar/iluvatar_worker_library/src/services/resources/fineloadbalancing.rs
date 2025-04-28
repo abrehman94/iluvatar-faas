@@ -111,8 +111,39 @@ impl DomConcurrencyLimiter {
         }
     }
 
+    pub fn acquire_x_from_group( &self, gid: SchedGroupID, x: i32 ) -> i32 {
+        self.local_gidstats.acquire_x_from_group( gid, x )
+    }
+
+    pub fn return_x_to_group( &self, gid: SchedGroupID, x: i32 ) -> i32 {
+        let count = self.local_gidstats.return_x_to_group( gid, x );
+        // signal the conditional variable to wake up the thread
+        let notify = self.waiters.get( &gid );
+        match notify {
+            Some( notify ) => {
+                notify.notify_one();
+            },
+            None => {
+                error!( gid=%gid, "[finesched][DomConcurrencyLimiter] no waiters found" );
+            }
+        }
+        count
+    }
+
+    pub fn return_x_to_group_nowakeup( &self, gid: SchedGroupID, x: i32 ) -> i32 {
+        self.local_gidstats.return_x_to_group( gid, x )
+    }
+
     pub fn acquire_group( &self, gid: SchedGroupID ) -> i32 {
-        self.local_gidstats.acquire_group( gid )
+        self.acquire_x_from_group( gid, 1 )
+    }
+
+    pub fn return_group( &self, gid: SchedGroupID ) -> i32 {
+        self.return_x_to_group( gid, 1 )
+    }
+
+    pub fn return_group_nowakeup( &self, gid: SchedGroupID ) -> i32 {
+        self.return_x_to_group_nowakeup( gid, 1 )
     }
 
     pub async fn wait_for_group( &self, gid: SchedGroupID ) {
@@ -128,26 +159,6 @@ impl DomConcurrencyLimiter {
         self.waiters.insert( gid, notify.clone() );
         notify.notified().await;
     }
-
-    pub fn return_group( &self, gid: SchedGroupID ) -> i32 {
-        let count = self.local_gidstats.return_group( gid );
-        // signal the conditional variable to wake up the thread
-        let notify = self.waiters.get( &gid );
-        match notify {
-            Some( notify ) => {
-                notify.notify_one();
-            },
-            None => {
-                error!( gid=%gid, "[finesched][DomConcurrencyLimiter] no waiters found" );
-            }
-        }
-        count
-    }
-
-    pub fn return_group_nowakeup( &self, gid: SchedGroupID ) -> i32 {
-        self.local_gidstats.return_group( gid )
-    }
-
 }
 
 ////////////////////////////////////
@@ -629,8 +640,10 @@ impl WarmCoreMaximusCL {
 
     /// Checks with domlimiter before handing over the gid  
     fn pick_foreign_domain( &self, 
-            fqdn: &str,
+            reg: Arc<RegisteredFunction>,
         ) -> Option<SchedGroupID> {
+
+        let fqdn = reg.fqdn.as_str();
         
         let mut sel_dom = Arc::new(DomState::default()); 
         let fhist = self.func_history.get_or_create( &fqdn.to_string() );
@@ -667,12 +680,12 @@ impl WarmCoreMaximusCL {
         // acquire the selected dom, check limit and return if all good 
         if sel_dom.id != consts_RESERVED_GID_UNASSIGNED {
             // we must check if the dom can accomodate foreign requests 
-            let fcount = self.forgn_req_limiter.acquire_group( sel_dom.id );
+            let fcount = self.forgn_req_limiter.acquire_x_from_group( sel_dom.id, reg.cpus as i32 );
             let flimit = sel_dom.forgn_req_limit.value.load( Ordering::SeqCst );
             if fcount < flimit {
                 return Some(sel_dom.id);
             }
-            self.forgn_req_limiter.return_group( sel_dom.id );
+            self.forgn_req_limiter.return_x_to_group( sel_dom.id, reg.cpus as i32 );
         }
 
         None
@@ -716,10 +729,11 @@ impl WarmCoreMaximusCL {
 
     /// Checks with domlimiter before handing over the gid  
     async fn find_available_dom( &self, 
-            fqdn: &str,
+            reg: Arc<RegisteredFunction>,
             tid: &TransactionId,
-            cpus: u32,
         ) -> Option<SchedGroupID> {
+
+        let fqdn = reg.fqdn.as_str();
 
         // first check if a dom is already allocated to fqdn in it's history 
         let fhist = self.func_history.get_or_create( &fqdn.to_string() );
@@ -759,7 +773,7 @@ impl WarmCoreMaximusCL {
         }
 
         // acquire whatever found from domlimiter and return 
-        let current = self.domlimiter.acquire_group(assigned_gid);
+        let current = self.domlimiter.acquire_x_from_group(assigned_gid, reg.cpus as i32);
 
         // check if concurrency of domilimiter is within limit 
         let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
@@ -776,9 +790,9 @@ impl WarmCoreMaximusCL {
             if fcount < flimit {
                 // try to pick a foreign domain
                 // it would have already acquired the foreign_gid from the domlimiter
-                let foreign_gid = self.pick_foreign_domain( fqdn );
+                let foreign_gid = self.pick_foreign_domain( reg.clone() );
                 if let Some(foreign_gid) = foreign_gid {
-                    self.domlimiter.return_group_nowakeup( assigned_gid );
+                    self.domlimiter.return_x_to_group_nowakeup( assigned_gid, reg.cpus as i32);
                     assigned_gid = foreign_gid;
                     foreign_picked = true;
                 }
@@ -833,7 +847,7 @@ impl WarmCoreMaximusCL {
             // impact on other - delta slowdown of other domain 
             let other_dom = self.doms.get( &gid ).unwrap();
             let other_fqdn = other_dom.serving_fqdn.value.lock().unwrap();
-            let dom_frgn_reqs_count = self.forgn_req_limiter.return_group( gid ); // return dom foreign
+            let dom_frgn_reqs_count = self.forgn_req_limiter.return_x_to_group( gid, reg.cpus as i32 ); // return dom foreign
                                                                               // request 
             let fqdn_frgn_reqs_count = fhist.frgn_reqs_count.value.fetch_sub( 1, Ordering::SeqCst ); // return fqdn foreign request 
 
@@ -912,7 +926,7 @@ impl WarmCoreMaximusCL {
         } 
 
         // return group to domlimiter 
-        let dom_count = self.domlimiter.return_group( gid );
+        let dom_count = self.domlimiter.return_x_to_group( gid, reg.cpus as i32 );
         debug!( dom_count=%dom_count, gid=%gid, "[finesched][warmcoremaximuscl][domlimiter][count] returned group to domlimiter ");
     }
 }
@@ -926,7 +940,7 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
         
         let gid = loop {
             debug!( tid=%tid, fqdn=%fqdn, "[finesched][warmcoremaximuscl] blocking handler trying to find dom ");
-            let gid = self.find_available_dom( fqdn, tid, reg.cpus ).await;  
+            let gid = self.find_available_dom( reg.clone(), tid ).await;  
             if let Some(gid) = gid {
                 break gid;
             }
