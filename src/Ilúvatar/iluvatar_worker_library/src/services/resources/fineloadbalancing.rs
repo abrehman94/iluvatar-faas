@@ -771,41 +771,54 @@ impl WarmCoreMaximusCL {
             error!( fqdn=%fqdn, "[finesched][warmcoremaximuscl][find_available_dom] no available domain found" );
             return None;
         }
+        
+        // check if native dom can serve the request within limit or 
+        // we can find a foreign dom 
+        // if not just wait to be wokeup by a completed request
+        while true {
+            // acquire whatever found from domlimiter and return 
+            let current = self.domlimiter.acquire_x_from_group(assigned_gid, reg.cpus as i32);
 
-        // acquire whatever found from domlimiter and return 
-        let current = self.domlimiter.acquire_x_from_group(assigned_gid, reg.cpus as i32);
+            // check if concurrency of domilimiter is within limit 
+            let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
+            if current > limit {
+               
+                // check if we can make a foreign request without impact on our own slowdown 
+                // this limit is on an fqdn making a request 
+                // it is different from dom enforcing a foreign request limit it can accomodate
+                let fcount = fhist.frgn_reqs_count.value.fetch_add(1, Ordering::SeqCst );
+                let flimit = fhist.frgn_reqs_limit.value.load( Ordering::SeqCst );
+                
+                let mut foreign_picked = false;
 
-        // check if concurrency of domilimiter is within limit 
-        let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
-        if current > limit {
-           
-            // check if we can make a foreign request without impact on our own slowdown 
-            // this limit is on an fqdn making a request 
-            // it is different from dom enforcing a foreign request limit it can accomodate
-            let fcount = fhist.frgn_reqs_count.value.fetch_add(1, Ordering::SeqCst );
-            let flimit = fhist.frgn_reqs_limit.value.load( Ordering::SeqCst );
-            
-            let mut foreign_picked = false;
-
-            if fcount < flimit {
-                // try to pick a foreign domain
-                // it would have already acquired the foreign_gid from the domlimiter
-                let foreign_gid = self.pick_foreign_domain( reg.clone() );
-                if let Some(foreign_gid) = foreign_gid {
-                    self.domlimiter.return_x_to_group_nowakeup( assigned_gid, reg.cpus as i32);
-                    assigned_gid = foreign_gid;
-                    foreign_picked = true;
+                if fcount < flimit {
+                    // try to pick a foreign domain
+                    // it would have already acquired the foreign_gid from the domlimiter
+                    let foreign_gid = self.pick_foreign_domain( reg.clone() );
+                    if let Some(foreign_gid) = foreign_gid {
+                        self.domlimiter.return_x_to_group_nowakeup( assigned_gid, reg.cpus as i32);
+                        assigned_gid = foreign_gid;
+                        foreign_picked = true;
+                    }
                 }
-            }
 
-            if !foreign_picked {
-                fhist.frgn_reqs_count.value.fetch_sub(1, Ordering::SeqCst );
-                // if pick failed just wait for this domain to become available
-                debug!( fqdn=%fqdn, tid=%tid, assigned_gid=%assigned_gid, current=%current, limit=%limit, "[finesched][warmcoremaximuscl][find_available_dom] waiting for assigned_gid to go below limit" );
-                // wait for it to become available
-                self.domlimiter.wait_for_group( assigned_gid ).await;
+                if !foreign_picked {
+                    fhist.frgn_reqs_count.value.fetch_sub(1, Ordering::SeqCst );
+                    // if pick failed just wait for this domain to become available
+                    debug!( fqdn=%fqdn, tid=%tid, assigned_gid=%assigned_gid, current=%current, limit=%limit, "[finesched][warmcoremaximuscl][find_available_dom] waiting for assigned_gid to go below limit" );
+                    // wait for it to become available
+                    self.domlimiter.wait_for_group( assigned_gid ).await;
+                    self.domlimiter.return_x_to_group_nowakeup( assigned_gid, reg.cpus as i32);
+                }else{
+                    break;
+                }
+            }else{
+                // we have acquired the gid from domlimiter
+                // we can proceed to execute the function 
+                break;
             }
         }
+
         debug!( fqdn=%fqdn, tid=%tid, assigned_gid=%assigned_gid, "[finesched][warmcoremaximuscl][ts_update] acquiring lock over ts" );
         let mut ts = domstate.last_used_ts.value.lock().unwrap();
         *ts = self.timestamp();
