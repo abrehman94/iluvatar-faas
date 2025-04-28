@@ -48,7 +48,7 @@ use regex::Regex;
 
 pub const const_DOM_OVERCOMMIT: i32 = 48;
 pub const const_DOM_STARTING_LIMIT: i32 = 1;
-pub const const_SLOWDOWN_THRESHOLD: i32 = 5;
+pub const const_SLOWDOWN_THRESHOLD: i32 = 10; // 5 is too tight 
 pub const const_IMPACT_THRESHOLD: i32 = 2;
 
 lazy_static::lazy_static! {
