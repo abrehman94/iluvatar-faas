@@ -804,11 +804,20 @@ impl WarmCoreMaximusCL {
 
                 if !foreign_picked {
                     fhist.frgn_reqs_count.value.fetch_sub(1, Ordering::SeqCst );
+
                     // if pick failed just wait for this domain to become available
                     debug!( fqdn=%fqdn, tid=%tid, assigned_gid=%assigned_gid, current=%current, limit=%limit, "[finesched][warmcoremaximuscl][find_available_dom] waiting for assigned_gid to go below limit" );
+
                     // wait for it to become available
                     self.domlimiter.wait_for_group( assigned_gid ).await;
+
+                    // choose native dom before continuing to foreign dom 
+                    let current_count = self.shareddata.mapgidstats.fetch_current( assigned_gid ).unwrap_or( 0 );
+                    if current_count < limit {
+                        break;
+                    }
                     self.domlimiter.return_x_to_group_nowakeup( assigned_gid, reg.cpus as i32);
+
                 }else{
                     break;
                 }
