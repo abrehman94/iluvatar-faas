@@ -47,8 +47,8 @@ use regex::Regex;
 /// Shared or Global stuff across policies  
 
 pub const const_DOM_OVERCOMMIT: i32 = 48;
-pub const const_DOM_STARTING_LIMIT: i32 = 1;
-pub const const_SLOWDOWN_THRESHOLD: i32 = 10; // 5 is too tight 
+pub const const_DOM_STARTING_LIMIT: i32 = 6; // starting from limit equivalent to available cpus
+pub const const_SLOWDOWN_THRESHOLD: i32 = 3; // 5 is too tight for dd case, 10 is too loose for   
 pub const const_IMPACT_THRESHOLD: i32 = 2;
 
 lazy_static::lazy_static! {
@@ -812,6 +812,7 @@ impl WarmCoreMaximusCL {
                     self.domlimiter.wait_for_group( assigned_gid ).await;
 
                     // choose native dom before continuing to foreign dom 
+                    let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
                     let current_count = self.shareddata.mapgidstats.fetch_current( assigned_gid ).unwrap_or( 0 );
                     if current_count < limit {
                         break;

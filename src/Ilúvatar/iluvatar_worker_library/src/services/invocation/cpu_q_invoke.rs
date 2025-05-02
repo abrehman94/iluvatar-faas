@@ -362,9 +362,11 @@ impl CpuQueueingInvoker {
         )
         .await?;
         self.running.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        self.cpu.notify_cgroup_id_done( ctr_lock.container.cgroup_id(), tid, (*reg).clone() );
+        let cgroup_id = ctr_lock.container.cgroup_id().clone();
+        drop(ctr_lock);
         drop(permit);
         drop(ipermit);
+        self.cpu.notify_cgroup_id_done( cgroup_id.as_str(), tid, (*reg).clone() );
         self.signal.notify_waiters();
         Ok((data, duration, compute_type, state))
     }

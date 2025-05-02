@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-pub const const_DEFAULT_BUFFER_SIZE: usize = 6;
+pub const const_DEFAULT_BUFFER_SIZE: usize = 2; // 6 - is too long, signal has too much lag 
 
 trait ValueBounds<T> {
     fn maxval() -> T;
