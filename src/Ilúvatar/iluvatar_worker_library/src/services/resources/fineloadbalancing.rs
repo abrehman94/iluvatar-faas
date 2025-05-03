@@ -47,7 +47,7 @@ use regex::Regex;
 /// Shared or Global stuff across policies  
 
 pub const const_DOM_OVERCOMMIT: i32 = 48;
-pub const const_DOM_STARTING_LIMIT: i32 = 6; // starting from limit equivalent to available cpus
+pub const const_DOM_STARTING_LIMIT: i32 = 1; // starting from limit equivalent to available cpus
 pub const const_SLOWDOWN_THRESHOLD: i32 = 3; // 5 is too tight for dd case, 10 is too loose for   
 pub const const_IMPACT_THRESHOLD: i32 = 2;
 
@@ -786,20 +786,26 @@ impl WarmCoreMaximusCL {
                 // check if we can make a foreign request without impact on our own slowdown 
                 // this limit is on an fqdn making a request 
                 // it is different from dom enforcing a foreign request limit it can accomodate
-                let fcount = fhist.frgn_reqs_count.value.fetch_add(1, Ordering::SeqCst );
-                let flimit = fhist.frgn_reqs_limit.value.load( Ordering::SeqCst );
-                
-                let mut foreign_picked = false;
+                // let fcount = fhist.frgn_reqs_count.value.fetch_add(1, Ordering::SeqCst );
+                // let flimit = fhist.frgn_reqs_limit.value.load( Ordering::SeqCst );
+                // if fcount < flimit {}
+                //
+                // we don't check for the global limit anymore to avoid the slowdown limit update due to 
+                // dom size - since current implementation has static dom size that not overlapping 
+                // 
+                // functions like dd with global impact also impacts other functions so such
+                // functions should be limited by impact limit of each dom 
 
-                if fcount < flimit {
-                    // try to pick a foreign domain
-                    // it would have already acquired the foreign_gid from the domlimiter
-                    let foreign_gid = self.pick_foreign_domain( reg.clone() );
-                    if let Some(foreign_gid) = foreign_gid {
-                        self.domlimiter.return_x_to_group_nowakeup( assigned_gid, reg.cpus as i32);
-                        assigned_gid = foreign_gid;
-                        foreign_picked = true;
-                    }
+                let mut foreign_picked = false;
+                
+                // try to pick a foreign domain
+                // it would have already acquired the foreign_gid from the domlimiter
+                let foreign_gid = self.pick_foreign_domain( reg.clone() );
+                if let Some(foreign_gid) = foreign_gid {
+                    self.domlimiter.return_x_to_group_nowakeup( assigned_gid, reg.cpus as i32);
+                    assigned_gid = foreign_gid;
+                    foreign_picked = true;
+                    let fcount = fhist.frgn_reqs_count.value.fetch_add(1, Ordering::SeqCst );
                 }
 
                 if !foreign_picked {
@@ -814,6 +820,7 @@ impl WarmCoreMaximusCL {
                     // choose native dom before continuing to foreign dom 
                     let limit = domstate.concur_limit.value.load( Ordering::SeqCst );
                     let current_count = self.shareddata.mapgidstats.fetch_current( assigned_gid ).unwrap_or( 0 );
+                    debug!( fqdn=%fqdn, tid=%tid, assigned_gid=%assigned_gid, current=%current, limit=%limit, current_count=%current_count, "[finesched][warmcoremaximuscl][find_available_dom] woken up assigned_gid" );
                     if current_count < limit {
                         break;
                     }
@@ -951,6 +958,24 @@ impl WarmCoreMaximusCL {
         // return group to domlimiter 
         let dom_count = self.domlimiter.return_x_to_group( gid, reg.cpus as i32 );
         debug!( dom_count=%dom_count, gid=%gid, "[finesched][warmcoremaximuscl][domlimiter][count] returned group to domlimiter ");
+
+        // wakeup more requests if there is a pileup for assigned_gid 
+        let cur_limit = domstate.concur_limit.value.load( Ordering::SeqCst );
+        let factor = (dom_count - cur_limit)/cur_limit;
+        if factor >= 1 {
+            // there is pileup twice or more then the limit 
+            // to ease the pileup we need to wakeup more then one requests
+            // at a time so that they would try to find foreign doms 
+            let mut wakeups = 2; // total wakeups would be 3 for each done 
+                                 // so that there is a slow and stready 
+                                 // increase in concurrency
+            //let mut wakeups = (dom_count - cur_limit);
+            while wakeups > 0 {
+                self.domlimiter.acquire_x_from_group( gid, reg.cpus as i32 );
+                self.domlimiter.return_x_to_group( gid, reg.cpus as i32 );
+                wakeups -= 1;
+            }
+        }
     }
 }
 
