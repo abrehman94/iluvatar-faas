@@ -50,6 +50,7 @@ pub const const_DOM_OVERCOMMIT: i32 = 48;
 pub const const_DOM_STARTING_LIMIT: i32 = 1; // starting from limit equivalent to available cpus
 pub const const_SLOWDOWN_THRESHOLD: i32 = 3; // 5 is too tight for dd case, 10 is too loose for   
 pub const const_IMPACT_THRESHOLD: i32 = 2;
+pub const const_RECLAIM_TIMEOUT_THRESHOLD: u64 = 3; // seconds
 
 lazy_static::lazy_static! {
   pub static ref FINESCHED_RECLAMATION_WORKER_TID: TransactionId = "FineSchedReclamationWorker".to_string();
@@ -563,9 +564,7 @@ impl WarmCoreMaximusCL {
     }
 
     pub fn timestamp( &self ) -> u64 {
-        let elapsed = self.creation_time.elapsed();
-        let elapsed = elapsed.as_secs(); 
-        elapsed
+        self.creation_time.elapsed().as_secs()
     }
 
     pub fn timestamp_diff( &self, timestamp: u64 ) -> u64 {
@@ -618,7 +617,11 @@ impl WarmCoreMaximusCL {
                 // get time difference between last used ts and now 
                 let timesince = self.timestamp_diff( *domstate.last_used_ts.value.lock().unwrap() ); // in
                                                                                                      // secs
-                too_old = self.time_within_factor( timesince*1000, iat as u64 );
+                // too_old = self.time_within_factor( timesince*1000, iat as u64 ); // iat can be
+                // too small if function has bursts or too long otherwise - therefore having a
+                // fixed parameter seems better 
+                too_old = timesince > const_RECLAIM_TIMEOUT_THRESHOLD;
+                debug!( tid=%tid, domid=%domid, serving_fqdn=%serving_fqdn, timesince=%timesince, "[finesched][warmcoremaximuscl] reclamation worker - time since last used" );
             } 
 
             let domserving_count = self.domlimiter.local_gidstats.fetch_current( *domid ).unwrap_or(0);
