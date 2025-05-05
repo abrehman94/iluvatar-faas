@@ -156,6 +156,18 @@ impl SignalAnalyzer<i32>
             data: Mutex::new(data),
         }
     }
+    
+    pub fn reset(&self){
+        let mut data = self.data.lock().unwrap();
+        data.buffer.clear();
+        data.windows.clear();
+        data.avgs.clear();
+        data.mins.clear();
+        data.maxs.clear();
+        data.avgs_norm_min.clear();
+        data.avgs_norm_max.clear();
+        data.buffer_filled_win_init = false;
+    }
 
     pub fn push(&self, val: i32) {
         let mut data = self.data.lock().unwrap();
