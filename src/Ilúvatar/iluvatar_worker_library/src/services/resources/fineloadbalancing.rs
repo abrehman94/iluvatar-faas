@@ -112,7 +112,7 @@ impl Default for DynamicLimit {
             dur_buffer: SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE ),
             concur_buffer: SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE ),
             updated: ClonableAtomicI32::new(0),
-            limit: ClonableAtomicI32::new(0),
+            limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT),
         }
     }
 }
@@ -163,7 +163,7 @@ impl DynamicLimit {
         self.dur_buffer.reset();
         self.concur_buffer.reset();
         self.updated.value.store(0, Ordering::Relaxed);
-        self.limit.value.store(0, Ordering::Relaxed);
+        self.limit.value.store(const_DOM_STARTING_LIMIT, Ordering::Relaxed);
     }
 }
 
@@ -847,7 +847,7 @@ impl WarmCoreMaximusCL {
 
             // check if concurrency of domilimiter is within limit 
             let limit = fhist.native_dom_limit.get_or_create( &assigned_gid ).get_limit();
-            if current > limit {
+            if current >= limit {
                 // pick has to check for foriegn limit itself  
                 let foreign_gid = self.pick_foreign_domain( reg.clone() );
                 if let Some(foreign_gid) = foreign_gid {
