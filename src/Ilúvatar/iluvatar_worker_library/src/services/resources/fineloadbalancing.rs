@@ -500,6 +500,7 @@ struct FuncHistory {
 
     pub native_dom_limit: ArcMap<SchedGroupID, DynamicLimit>,
     pub foreign_dom_limit: ArcMap<SchedGroupID, DynamicLimit>,
+    pub pileup_allowance: ClonableAtomicI32,
 
     pub assigned_dom: ClonableMutex<Arc<DomState>>,
     pub last_assigned_dom: ClonableMutex<Arc<DomState>>,
@@ -510,6 +511,7 @@ impl Default for FuncHistory {
         FuncHistory {
             iat_buffer: Arc::new(SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE )),
 
+            pileup_allowance: ClonableAtomicI32::new(0),
             native_dom_limit: ArcMap::new(),
             foreign_dom_limit: ArcMap::new(),
             
@@ -746,6 +748,9 @@ impl WarmCoreMaximusCL {
             // we must check if the dom can accomodate foreign requests 
             let fcount = self.forgn_req_limiter.acquire_x_from_group( sel_dom.id, reg.cpus as i32 );
             let flimit = fhist.foreign_dom_limit.get_or_create( &sel_dom.id ).get_limit();
+            let pileup_allowance = fhist.pileup_allowance.value.load( Ordering::SeqCst );
+            let flimit = flimit + pileup_allowance;
+
             if fcount < flimit {
                 return Some(sel_dom.id);
             }
@@ -768,7 +773,11 @@ impl WarmCoreMaximusCL {
             } else {
                 // only doms which have capacity within their native limits are considered fillable 
                 let concur = self.domlimiter.local_gidstats.fetch_current( *domid ).unwrap();
-                let limit = self.func_history.get_or_create(&(serving_fqdn.to_string())).native_dom_limit.get_or_create(domid).get_limit();
+                let fhist = self.func_history.get_or_create(&(serving_fqdn.to_string()));
+                let limit = fhist.native_dom_limit.get_or_create(domid).get_limit();
+                let pileup_allowance = fhist.pileup_allowance.value.load( Ordering::SeqCst );
+                let limit = limit + pileup_allowance;
+
                 if concur < limit {
                     doms.push( (*domstate).clone() );
                 }
@@ -847,6 +856,9 @@ impl WarmCoreMaximusCL {
 
             // check if concurrency of domilimiter is within limit 
             let limit = fhist.native_dom_limit.get_or_create( &assigned_gid ).get_limit();
+            let pileup_allowance = fhist.pileup_allowance.value.load( Ordering::SeqCst );
+            let limit = limit + pileup_allowance;
+
             if current >= limit {
                 // pick has to check for foriegn limit itself  
                 let foreign_gid = self.pick_foreign_domain( reg.clone() );
@@ -863,6 +875,9 @@ impl WarmCoreMaximusCL {
 
                     // choose native dom before continuing to foreign dom 
                     let limit = fhist.native_dom_limit.get_or_create( &assigned_gid ).get_limit();
+                    let pileup_allowance = fhist.pileup_allowance.value.load( Ordering::SeqCst );
+                    let limit = limit + pileup_allowance;
+
                     let current_count = self.shareddata.mapgidstats.fetch_current( assigned_gid ).unwrap_or( 0 );
                     debug!( fqdn=%fqdn, tid=%tid, assigned_gid=%assigned_gid, current=%current, limit=%limit, current_count=%current_count, "[finesched][warmcoremaximuscl][find_available_dom] woken up assigned_gid" );
                     if current_count < limit {
@@ -964,6 +979,10 @@ impl WarmCoreMaximusCL {
             let cur_limit = fhist.native_dom_limit.get_or_create( &gid ).get_limit();
             let factor = (dom_count - cur_limit)/cur_limit;
             if factor >= 2 {
+                
+                let allowed = (dom_count - cur_limit)/2; 
+                fhist.pileup_allowance.value.store( allowed, Ordering::Relaxed );
+
                 // there is pileup twice or more then the limit 
                 // to ease the pileup we need to wakeup more then one requests
                 // at a time so that they would try to find foreign doms 
@@ -976,7 +995,12 @@ impl WarmCoreMaximusCL {
                     self.domlimiter.return_x_to_group( gid, reg.cpus as i32 );
                     wakeups -= 1;
                 }
+            }else{
+                // no pileup 
+                fhist.pileup_allowance.value.store( 0, Ordering::Relaxed );
             }
+
+            debug!( dom_count=%dom_count, gid=%gid, pileup_allowance=%fhist.pileup_allowance.value.load( Ordering::Relaxed ), "[finesched][warmcoremaximuscl][pileup] updated pileup_allowance on native req completion ");
         }
     }
 }
