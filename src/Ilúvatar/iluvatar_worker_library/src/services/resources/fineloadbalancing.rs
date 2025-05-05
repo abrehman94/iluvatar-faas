@@ -47,8 +47,8 @@ use regex::Regex;
 /// Shared or Global stuff across policies  
 
 pub const const_DOM_OVERCOMMIT: i32 = 48;
-pub const const_DOM_STARTING_LIMIT: i32 = 1; // starting from limit equivalent to available cpus
-pub const const_SLOWDOWN_THRESHOLD: i32 = 3; // 5 is too tight for dd case, 10 is too loose for   
+pub const const_DOM_STARTING_LIMIT: i32 = 1; // starting from limit equivalent to available cpus 
+pub const const_SLOWDOWN_THRESHOLD: i32 = 1; // 3, 5 is too tight for dd case, 10 is too loose for   
 pub const const_IMPACT_THRESHOLD: i32 = 2;
 pub const const_RECLAIM_TIMEOUT_THRESHOLD: u64 = 3; // seconds
 
@@ -376,6 +376,7 @@ impl LoadBalancingPolicyT for StaticSelectCL {
 struct DomState {
     bpfdom_config: SchedGroup,
     concur_limit: ClonableAtomicI32,
+    concur_update_count: ClonableAtomicI32,
     forgn_req_limit: ClonableAtomicI32,
     serving_fqdn: ClonableMutex<String>, // it also serves as a lock for the domain
     last_used_ts: ClonableMutex<u64>,
@@ -390,6 +391,7 @@ impl Default for DomState {
             concur_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
                                                                             // overprovisioned
                                                                             // state 
+            concur_update_count: ClonableAtomicI32::new(0), 
             forgn_req_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
             serving_fqdn: ClonableMutex::new("".to_string()),
             last_used_ts: ClonableMutex::new(0),
@@ -412,6 +414,7 @@ impl DomState {
                 concur_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
                                                                             // overprovisioned
                                                                             // state 
+                concur_update_count: ClonableAtomicI32::new(0),
                 forgn_req_limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT), // starting from
                 serving_fqdn: ClonableMutex::new("".to_string()),
                 last_used_ts: ClonableMutex::new(0),
@@ -507,6 +510,25 @@ fn wcmcl_update_concur_limit_inc_dec(concur_limit: &ClonableAtomicI32, slowdown:
         old_concur = concur_limit.sub_clamp_limited( 1, 1 );
     } else {
         if limit < limit_upper_clamp {
+            old_concur = concur_limit.value.fetch_add( 1, Ordering::Relaxed );
+        } else {
+            old_concur = concur_limit.value.load( Ordering::Relaxed );
+        }
+    }
+    old_concur
+}
+
+fn wcmcl_update_concur_limit_inc_dec_uneven(concur_limit: &ClonableAtomicI32, concur_update_count: &ClonableAtomicI32, slowdown: i32, slw_threshold: i32, limit_upper_clamp: i32) -> i32 {
+    let limit = concur_limit.value.load( Ordering::SeqCst );
+    let count = concur_update_count.value.load( Ordering::SeqCst );
+    let old_concur; 
+    if slowdown > slw_threshold {
+        old_concur = concur_limit.sub_clamp_limited( 1, 1 );
+        concur_update_count.value.store( 0, Ordering::Relaxed );
+    } else {
+        concur_update_count.value.fetch_add(1, Ordering::Relaxed );
+        if count > 3 && limit < limit_upper_clamp {
+            concur_update_count.value.store( 0, Ordering::Relaxed );
             old_concur = concur_limit.value.fetch_add( 1, Ordering::Relaxed );
         } else {
             old_concur = concur_limit.value.load( Ordering::Relaxed );
@@ -812,7 +834,6 @@ impl WarmCoreMaximusCL {
                 }
 
                 if !foreign_picked {
-                    fhist.frgn_reqs_count.value.fetch_sub(1, Ordering::SeqCst );
 
                     // if pick failed just wait for this domain to become available
                     debug!( fqdn=%fqdn, tid=%tid, assigned_gid=%assigned_gid, current=%current, limit=%limit, "[finesched][warmcoremaximuscl][find_available_dom] waiting for assigned_gid to go below limit" );
@@ -954,7 +975,25 @@ impl WarmCoreMaximusCL {
 
             let mut lts = domstate.last_limit_up_ts.value.lock().unwrap();
             *lts = self.timestamp();
-            let concur_limit = wcmcl_update_concur_limit_inc_dec( &domstate.concur_limit, slowdown, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
+            //let concur_limit = wcmcl_update_concur_limit_inc_dec( &domstate.concur_limit, slowdown, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
+            //let concur_limit = wcmcl_update_concur_limit_inc_dec_uneven( &domstate.concur_limit, &domstate.concur_update_count, slowdown, const_SLOWDOWN_THRESHOLD, const_DOM_OVERCOMMIT );
+            let concur_update_count = domstate.concur_update_count.value.load( Ordering::SeqCst );
+            let mut concur_limit = domstate.concur_limit.value.load( Ordering::SeqCst );
+            if concur_update_count == 0 && slowdown < 2 {
+                if max_concur >= 0 {
+                    domstate.concur_limit.value.store( max_concur/100 + 1, Ordering::Relaxed );
+                }else{
+                    concur_limit = domstate.concur_limit.value.fetch_add( 1, Ordering::Relaxed );
+                }
+            } else {
+                if concur_update_count == 0 && max_concur > 0 {
+                    concur_limit = max_concur/100;
+                    domstate.concur_limit.value.store( concur_limit, Ordering::Relaxed );
+                    domstate.concur_update_count.value.store( 1, Ordering::Relaxed );
+                } 
+                // otherwise just no update to anything! wait to find the max_concur 
+            }
+            
             debug!( fqdn=%fqdn, gid=%domstate.id, concur_limit=%concur_limit, "[finesched][warmcoremaximuscl][concur] updated concurrency limit");
         } 
 
@@ -965,11 +1004,11 @@ impl WarmCoreMaximusCL {
         // wakeup more requests if there is a pileup for assigned_gid 
         let cur_limit = domstate.concur_limit.value.load( Ordering::SeqCst );
         let factor = (dom_count - cur_limit)/cur_limit;
-        if factor >= 1 {
+        if factor >= 2 {
             // there is pileup twice or more then the limit 
             // to ease the pileup we need to wakeup more then one requests
             // at a time so that they would try to find foreign doms 
-            let mut wakeups = 2; // total wakeups would be 3 for each done 
+            let mut wakeups = 1; // total wakeups would be 3 for each done 
                                  // so that there is a slow and stready 
                                  // increase in concurrency
             //let mut wakeups = (dom_count - cur_limit);

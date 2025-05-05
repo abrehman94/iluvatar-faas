@@ -632,7 +632,10 @@ impl ContainerManager {
         self.order_pool_eviction(tid, &mut ordered);
         *self.prioritized_gpu_list.write() = ordered;
     }
-
+    
+    /// has to produce a total ordering of containers
+    /// it can be broken if container last used is updated during sorting
+    /// especially true during a burst 
     fn lru_eviction(c1: &Container, c2: &Container) -> Ordering {
         c1.last_used().cmp(&c2.last_used())
     }
