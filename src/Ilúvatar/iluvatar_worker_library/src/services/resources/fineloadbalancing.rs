@@ -102,6 +102,7 @@ impl SharedData {
 struct DynamicLimit {
     dur_buffer: SignalAnalyzer<i32>,
     concur_buffer: SignalAnalyzer<i32>,
+    limit_buffer: SignalAnalyzer<i32>,
     updated: ClonableAtomicI32,
     limit: ClonableAtomicI32,
 }
@@ -111,6 +112,7 @@ impl Default for DynamicLimit {
         DynamicLimit {
             dur_buffer: SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE ),
             concur_buffer: SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE ),
+            limit_buffer: SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE ),
             updated: ClonableAtomicI32::new(0),
             limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT),
         }
@@ -138,30 +140,26 @@ impl DynamicLimit {
         self.dur_buffer.push( dur );
         self.concur_buffer.push( concur*100 ); // changing to 2 decimal place
         let slowdown = self.dur_buffer.get_nth_minnorm_avg( -1 );
-        let max_concur = self.concur_buffer.get_nth_max( -2 ); 
+        let slowdown = if slowdown == 0 {1} else {slowdown};
+        let avg_concur = self.concur_buffer.get_nth_avg( -1 );
 
-        let concur_update_count = self.updated.value.load( Ordering::SeqCst );
-        let mut concur_limit = self.limit.value.load( Ordering::SeqCst );
-        if concur_update_count == 0 && slowdown < 2 {
-            if max_concur >= 0 {
-                self.limit.value.store( max_concur/100 + 1, Ordering::Relaxed );
-            }else{
-                concur_limit = self.limit.value.fetch_add( 1, Ordering::Relaxed );
-            }
-        } else {
-            if concur_update_count == 0 && max_concur > 0 {
-                concur_limit = max_concur/100;
-                self.limit.value.store( concur_limit, Ordering::Relaxed );
-                self.updated.value.store( 1, Ordering::Relaxed );
-            } 
-            // otherwise just no update to anything! wait to find the max_concur 
+        let limit = ( avg_concur + slowdown*100 )/slowdown; 
+        let mut limit = limit/100;
+
+        self.limit_buffer.push( limit );
+        let avg_limit = self.limit_buffer.get_nth_avg( -1 );
+        if avg_limit > 0 {
+            limit = avg_limit;
         }
-        concur_limit
+
+        self.limit.value.store( limit, Ordering::Relaxed );
+        limit
     }
 
     pub fn reset(&self){
         self.dur_buffer.reset();
         self.concur_buffer.reset();
+        self.limit_buffer.reset();
         self.updated.value.store(0, Ordering::Relaxed);
         self.limit.value.store(const_DOM_STARTING_LIMIT, Ordering::Relaxed);
     }
@@ -953,7 +951,8 @@ impl WarmCoreMaximusCL {
             let native_limit = fhist.native_dom_limit.get_or_create( &gid );
             let concur = self.shareddata.mapgidstats.fetch_current( gid ).unwrap();
 
-            native_limit.push( dur, concur );
+            native_limit.push( dur, concur*2 ); // x2 because we want twice native requests as
+                                                // compared to foreign requests 
             let max_concur = native_limit.get_max_concur( -2 );
 
             let slowdown = native_limit.get_slowdown( -1 ); // latest slowdown 
@@ -973,35 +972,38 @@ impl WarmCoreMaximusCL {
         // return group to domlimiter 
         let dom_count = self.domlimiter.return_x_to_group( gid, reg.cpus as i32 );
         debug!( dom_count=%dom_count, gid=%gid, "[finesched][warmcoremaximuscl][domlimiter][count] returned group to domlimiter ");
-    
-        if !was_foreign {
-            // wakeup more requests if there is a pileup for assigned_gid 
-            let cur_limit = fhist.native_dom_limit.get_or_create( &gid ).get_limit();
-            let factor = (dom_count - cur_limit)/cur_limit;
-            if factor >= 2 {
-                
-                let allowed = (dom_count - cur_limit)/2; 
-                fhist.pileup_allowance.value.store( allowed, Ordering::Relaxed );
-
-                // there is pileup twice or more then the limit 
-                // to ease the pileup we need to wakeup more then one requests
-                // at a time so that they would try to find foreign doms 
-                let mut wakeups = 1; // total wakeups would be 3 for each done 
-                                     // so that there is a slow and stready 
-                                     // increase in concurrency
-                //let mut wakeups = (dom_count - cur_limit);
-                while wakeups > 0 {
-                    self.domlimiter.acquire_x_from_group( gid, reg.cpus as i32 );
-                    self.domlimiter.return_x_to_group( gid, reg.cpus as i32 );
-                    wakeups -= 1;
-                }
-            }else{
-                // no pileup 
-                fhist.pileup_allowance.value.store( 0, Ordering::Relaxed );
-            }
-
-            debug!( dom_count=%dom_count, gid=%gid, pileup_allowance=%fhist.pileup_allowance.value.load( Ordering::Relaxed ), "[finesched][warmcoremaximuscl][pileup] updated pileup_allowance on native req completion ");
+        
+        let mut pgid = gid;
+        if was_foreign {
+            pgid = domstate.id;
         }
+
+        // wakeup more requests if there is a pileup for assigned_gid 
+        let cur_limit = fhist.native_dom_limit.get_or_create( &pgid ).get_limit();
+        let dom_count = self.domlimiter.local_gidstats.fetch_current( pgid ).unwrap_or(0);
+        let factor = dom_count/cur_limit;
+        if factor >= 2 {
+            
+            let allowed = dom_count/2; 
+            fhist.pileup_allowance.value.store( allowed, Ordering::Relaxed );
+
+            // there is pileup twice or more then the limit 
+            // to ease the pileup we need to wakeup more then one requests
+            // at a time so that they would try to find foreign doms 
+            let mut wakeups = 1; // total wakeups would be 2 for each done 
+                                 // so that there is a slow and steady 
+                                 // increase in concurrency
+            while wakeups > 0 {
+                self.domlimiter.acquire_x_from_group( gid, reg.cpus as i32 );
+                self.domlimiter.return_x_to_group( gid, reg.cpus as i32 );
+                wakeups -= 1;
+            }
+        }else{
+            // no pileup 
+            fhist.pileup_allowance.value.store( 0, Ordering::Relaxed );
+        }
+
+        debug!( dom_count=%dom_count, gid=%pgid, pileup_allowance=%fhist.pileup_allowance.value.load( Ordering::Relaxed ), "[finesched][warmcoremaximuscl][pileup] updated pileup_allowance on native req completion ");
     }
 }
 
