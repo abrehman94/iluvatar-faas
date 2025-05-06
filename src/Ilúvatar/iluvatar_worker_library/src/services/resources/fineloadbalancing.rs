@@ -498,7 +498,7 @@ struct FuncHistory {
 
     pub native_dom_limit: ArcMap<SchedGroupID, DynamicLimit>,
     pub foreign_dom_limit: ArcMap<SchedGroupID, DynamicLimit>,
-    pub pileup_allowance: ClonableAtomicI32,
+    pub pileup_allowance: Arc<DynamicLimit>,
 
     pub assigned_dom: ClonableMutex<Arc<DomState>>,
     pub last_assigned_dom: ClonableMutex<Arc<DomState>>,
@@ -509,7 +509,7 @@ impl Default for FuncHistory {
         FuncHistory {
             iat_buffer: Arc::new(SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE )),
 
-            pileup_allowance: ClonableAtomicI32::new(0),
+            pileup_allowance: Arc::new( DynamicLimit::new() ),
             native_dom_limit: ArcMap::new(),
             foreign_dom_limit: ArcMap::new(),
             
@@ -746,7 +746,7 @@ impl WarmCoreMaximusCL {
             // we must check if the dom can accomodate foreign requests 
             let fcount = self.forgn_req_limiter.acquire_x_from_group( sel_dom.id, reg.cpus as i32 );
             let flimit = fhist.foreign_dom_limit.get_or_create( &sel_dom.id ).get_limit();
-            let pileup_allowance = fhist.pileup_allowance.value.load( Ordering::SeqCst );
+            let pileup_allowance = fhist.pileup_allowance.get_limit();
             let flimit = flimit + pileup_allowance;
 
             if fcount < flimit {
@@ -773,7 +773,7 @@ impl WarmCoreMaximusCL {
                 let concur = self.domlimiter.local_gidstats.fetch_current( *domid ).unwrap();
                 let fhist = self.func_history.get_or_create(&(serving_fqdn.to_string()));
                 let limit = fhist.native_dom_limit.get_or_create(domid).get_limit();
-                let pileup_allowance = fhist.pileup_allowance.value.load( Ordering::SeqCst );
+                let pileup_allowance = fhist.pileup_allowance.get_limit();
                 let limit = limit + pileup_allowance;
 
                 if concur < limit {
@@ -854,7 +854,7 @@ impl WarmCoreMaximusCL {
 
             // check if concurrency of domilimiter is within limit 
             let limit = fhist.native_dom_limit.get_or_create( &assigned_gid ).get_limit();
-            let pileup_allowance = fhist.pileup_allowance.value.load( Ordering::SeqCst );
+            let pileup_allowance = fhist.pileup_allowance.get_limit();
             let limit = limit + pileup_allowance;
 
             if current >= limit {
@@ -873,7 +873,7 @@ impl WarmCoreMaximusCL {
 
                     // choose native dom before continuing to foreign dom 
                     let limit = fhist.native_dom_limit.get_or_create( &assigned_gid ).get_limit();
-                    let pileup_allowance = fhist.pileup_allowance.value.load( Ordering::SeqCst );
+                    let pileup_allowance = fhist.pileup_allowance.get_limit();
                     let limit = limit + pileup_allowance;
 
                     let current_count = self.shareddata.mapgidstats.fetch_current( assigned_gid ).unwrap_or( 0 );
@@ -909,6 +909,9 @@ impl WarmCoreMaximusCL {
         let domstate = fhist.assigned_dom.value.lock().unwrap();
         let dur = self.shareddata.cmap.get_exec_time( fqdn ) * 1000.0;
         let dur = dur as i32; // ms 
+        
+        let e2e_dur = self.shareddata.cmap.latest_cpu_e2e_t( fqdn ) * 1000.0;
+        let e2e_dur = e2e_dur as i32; // ms 
 
         // updating iat 
         let idb = fhist.iat_buffer.clone();
@@ -981,29 +984,23 @@ impl WarmCoreMaximusCL {
         // wakeup more requests if there is a pileup for assigned_gid 
         let cur_limit = fhist.native_dom_limit.get_or_create( &pgid ).get_limit();
         let dom_count = self.domlimiter.local_gidstats.fetch_current( pgid ).unwrap_or(0);
-        let factor = dom_count/cur_limit;
-        if factor >= 2 {
-            
-            let allowed = dom_count/2; 
-            fhist.pileup_allowance.value.store( allowed, Ordering::Relaxed );
+        let act_count = self.shareddata.mapgidstats.fetch_current( pgid ).unwrap();
+        let blocked = dom_count - act_count; // -ve can happen if just serving foreign requests
+        let blocked = if blocked < 0 { 0 } else { blocked };
+        let pileup_allowance = fhist.pileup_allowance.clone();
+        pileup_allowance.push( e2e_dur, blocked );
+        let limit = pileup_allowance.get_limit();
 
-            // there is pileup twice or more then the limit 
-            // to ease the pileup we need to wakeup more then one requests
-            // at a time so that they would try to find foreign doms 
-            let mut wakeups = 1; // total wakeups would be 2 for each done 
-                                 // so that there is a slow and steady 
-                                 // increase in concurrency
+        if blocked >= limit {
+            let mut wakeups = limit;  
             while wakeups > 0 {
-                self.domlimiter.acquire_x_from_group( gid, reg.cpus as i32 );
-                self.domlimiter.return_x_to_group( gid, reg.cpus as i32 );
+                self.domlimiter.acquire_x_from_group( pgid, reg.cpus as i32 );
+                self.domlimiter.return_x_to_group( pgid, reg.cpus as i32 );
                 wakeups -= 1;
             }
-        }else{
-            // no pileup 
-            fhist.pileup_allowance.value.store( 0, Ordering::Relaxed );
         }
 
-        debug!( dom_count=%dom_count, gid=%pgid, pileup_allowance=%fhist.pileup_allowance.value.load( Ordering::Relaxed ), "[finesched][warmcoremaximuscl][pileup] updated pileup_allowance on native req completion ");
+        debug!( dom_count=%dom_count, gid=%pgid, pileup_allowance=%limit, "[finesched][warmcoremaximuscl][pileup] updated pileup_allowance on native req completion ");
     }
 }
 
