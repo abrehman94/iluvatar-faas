@@ -98,38 +98,45 @@ impl SharedData {
     }
 }
 
+
 #[derive(Clone)]
-struct DynamicLimit {
+struct DynamicVal<F>
+    where F: Fn( i32, i32 ) -> i32
+{
     dur_buffer: SignalAnalyzer<i32>,
     concur_buffer: SignalAnalyzer<i32>,
-    limit_buffer: SignalAnalyzer<i32>,
+    val_buffer: SignalAnalyzer<i32>,
     updated: ClonableAtomicI32,
-    limit: ClonableAtomicI32,
+    val: ClonableAtomicI32,
+    start_val: i32,
+    calc_closure: F,
 }
 
-impl Default for DynamicLimit {
-    fn default() -> Self {
-        DynamicLimit {
+impl<F> DynamicVal<F> 
+    where F: Fn( i32, i32 ) -> i32
+{
+    pub fn new(f: F, start_val: i32) -> Self {
+        DynamicVal {
             dur_buffer: SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE ),
             concur_buffer: SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE ),
-            limit_buffer: SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE ),
+            val_buffer: SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE ),
             updated: ClonableAtomicI32::new(0),
-            limit: ClonableAtomicI32::new(const_DOM_STARTING_LIMIT),
+            val: ClonableAtomicI32::new(start_val),
+            start_val,
+            calc_closure: f,
         }
     }
-}
 
-impl DynamicLimit {
-    pub fn new() -> Self {
-        DynamicLimit::default()
-    }
-
-    pub fn get_limit( &self ) -> i32 {
-        self.limit.value.load( Ordering::Relaxed )
+    pub fn get_val( &self ) -> i32 {
+        self.val.value.load( Ordering::Relaxed )
     }
 
     pub fn get_slowdown(&self, idx: isize) -> i32 {
         self.dur_buffer.get_nth_minnorm_avg( idx )
+    }
+
+    pub fn get_nth_concur(&self, idx: isize) -> i32 {
+        self.concur_buffer.get_nth_avg( idx )
     }
 
     pub fn get_max_concur(&self, idx: isize) -> i32 {
@@ -139,29 +146,90 @@ impl DynamicLimit {
     pub fn push( &self, dur: i32, concur: i32 ) -> i32 {
         self.dur_buffer.push( dur );
         self.concur_buffer.push( concur*100 ); // changing to 2 decimal place
+                                               
         let slowdown = self.dur_buffer.get_nth_minnorm_avg( -1 );
         let slowdown = if slowdown == 0 {1} else {slowdown};
         let avg_concur = self.concur_buffer.get_nth_avg( -1 );
 
-        let limit = ( avg_concur + slowdown*100 )/slowdown; 
-        let mut limit = limit/100;
+        let mut val = (self.calc_closure)( avg_concur, slowdown*100 ); 
 
-        self.limit_buffer.push( limit );
-        let avg_limit = self.limit_buffer.get_nth_avg( -1 );
-        if avg_limit > 0 {
-            limit = avg_limit;
+        self.val_buffer.push( val );
+        let avg_val = self.val_buffer.get_nth_avg( -1 );
+        if self.val_buffer.get_nth_max( -1 ) != i32::MIN {
+            val = avg_val;
         }
 
-        self.limit.value.store( limit, Ordering::Relaxed );
-        limit
+        self.val.value.store( val, Ordering::Relaxed );
+        val
     }
 
     pub fn reset(&self){
         self.dur_buffer.reset();
         self.concur_buffer.reset();
-        self.limit_buffer.reset();
+        self.val_buffer.reset();
         self.updated.value.store(0, Ordering::Relaxed);
-        self.limit.value.store(const_DOM_STARTING_LIMIT, Ordering::Relaxed);
+        self.val.value.store(self.start_val, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct DynamicLimit {
+    pub val: DynamicVal<fn(i32, i32) -> i32>,
+}
+
+impl Default for DynamicLimit {
+    fn default() -> Self {
+        DynamicLimit {
+            val: DynamicVal::new(DynamicLimit::slowdown_limit, const_DOM_STARTING_LIMIT),
+        }
+    }
+}
+
+impl DynamicLimit {
+    // slowdown is guranteed to be >= 1 
+    const fn slowdown_limit( avg_concur: i32, slowdown: i32 ) -> i32 {
+        ( avg_concur + slowdown) / slowdown 
+    }
+    pub fn new() -> Self {
+        DynamicLimit::default()
+    }
+    pub fn push( &self, dur: i32, concur: i32 ) -> i32 {
+        self.val.push( dur, concur )
+    }
+    pub fn get_limit( &self ) -> i32 {
+        self.val.get_val() 
+    }
+}
+
+#[derive(Clone)]
+struct DynamicAllowance {
+    val: DynamicVal<fn(i32, i32) -> i32>,
+}
+
+impl Default for DynamicAllowance {
+    fn default() -> Self {
+        DynamicAllowance {
+            val: DynamicVal::new(DynamicAllowance::slowdown_limit, const_DOM_STARTING_LIMIT),
+        }
+    }
+}
+
+impl DynamicAllowance {
+    // slowdown is guranteed to be >= 1 
+    // blocked and slowdown are in 2 decimal places
+    // blocked is in 100s
+    // slowdown is in 100s
+    const fn slowdown_limit( blocked: i32, e2e_slowdown: i32 ) -> i32 {
+        ( blocked * e2e_slowdown ) / 30000 
+    }
+    pub fn new() -> Self {
+        DynamicAllowance::default()
+    }
+    pub fn push( &self, e2e_dur: i32, blocked: i32 ) -> i32 {
+        self.val.push( e2e_dur, blocked )
+    }
+    pub fn get_allowed( &self ) -> i32 {
+        self.val.get_val() 
     }
 }
 
@@ -498,7 +566,7 @@ struct FuncHistory {
 
     pub native_dom_limit: ArcMap<SchedGroupID, DynamicLimit>,
     pub foreign_dom_limit: ArcMap<SchedGroupID, DynamicLimit>,
-    pub pileup_allowance: Arc<DynamicLimit>,
+    pub pileup_allowance: Arc<DynamicAllowance>,
 
     pub assigned_dom: ClonableMutex<Arc<DomState>>,
     pub last_assigned_dom: ClonableMutex<Arc<DomState>>,
@@ -509,7 +577,7 @@ impl Default for FuncHistory {
         FuncHistory {
             iat_buffer: Arc::new(SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE )),
 
-            pileup_allowance: Arc::new( DynamicLimit::new() ),
+            pileup_allowance: Arc::new( DynamicAllowance::new() ),
             native_dom_limit: ArcMap::new(),
             foreign_dom_limit: ArcMap::new(),
             
@@ -651,9 +719,17 @@ impl WarmCoreMaximusCL {
         false
     }
 
-
     async fn waker_worker( self: Arc<Self>, tid: TransactionId ) {
         while self.domlimiter.return_group( consts_RESERVED_GID_UNASSIGNED ) != 0 {};
+        for kvref in self.doms.map.iter() {
+            let domid = kvref.key();
+            let domstate = kvref.value();
+            let serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
+            if serving_fqdn.len() > 0 {
+                self.domlimiter.acquire_x_from_group( *domid, 1 );
+                self.domlimiter.return_x_to_group( *domid, 1 );
+            }
+        }
     }
 
     async fn reclamation_worker( self: Arc<Self>, tid: TransactionId ) {
@@ -724,7 +800,7 @@ impl WarmCoreMaximusCL {
                 let ofqdn = dom.serving_fqdn.value.lock().unwrap();
                 let key = (dom.id,ofqdn.to_string());
                 let foreign_limit =  fhist.foreign_dom_limit.get_or_create( &dom.id );
-                let lslw = foreign_limit.get_slowdown( -1 ); 
+                let lslw = foreign_limit.val.get_slowdown( -1 ); 
                 if lslw < lowest_slowdown {
                     lowest_slowdown = lslw;
                     lowest_dom = dom.clone();
@@ -746,7 +822,7 @@ impl WarmCoreMaximusCL {
             // we must check if the dom can accomodate foreign requests 
             let fcount = self.forgn_req_limiter.acquire_x_from_group( sel_dom.id, reg.cpus as i32 );
             let flimit = fhist.foreign_dom_limit.get_or_create( &sel_dom.id ).get_limit();
-            let pileup_allowance = fhist.pileup_allowance.get_limit();
+            let pileup_allowance = fhist.pileup_allowance.get_allowed();
             let flimit = flimit + pileup_allowance;
 
             if fcount < flimit {
@@ -773,7 +849,7 @@ impl WarmCoreMaximusCL {
                 let concur = self.domlimiter.local_gidstats.fetch_current( *domid ).unwrap();
                 let fhist = self.func_history.get_or_create(&(serving_fqdn.to_string()));
                 let limit = fhist.native_dom_limit.get_or_create(domid).get_limit();
-                let pileup_allowance = fhist.pileup_allowance.get_limit();
+                let pileup_allowance = fhist.pileup_allowance.get_allowed();
                 let limit = limit + pileup_allowance;
 
                 if concur < limit {
@@ -854,7 +930,7 @@ impl WarmCoreMaximusCL {
 
             // check if concurrency of domilimiter is within limit 
             let limit = fhist.native_dom_limit.get_or_create( &assigned_gid ).get_limit();
-            let pileup_allowance = fhist.pileup_allowance.get_limit();
+            let pileup_allowance = fhist.pileup_allowance.get_allowed();
             let limit = limit + pileup_allowance;
 
             if current >= limit {
@@ -873,7 +949,7 @@ impl WarmCoreMaximusCL {
 
                     // choose native dom before continuing to foreign dom 
                     let limit = fhist.native_dom_limit.get_or_create( &assigned_gid ).get_limit();
-                    let pileup_allowance = fhist.pileup_allowance.get_limit();
+                    let pileup_allowance = fhist.pileup_allowance.get_allowed();
                     let limit = limit + pileup_allowance;
 
                     let current_count = self.shareddata.mapgidstats.fetch_current( assigned_gid ).unwrap_or( 0 );
@@ -938,8 +1014,8 @@ impl WarmCoreMaximusCL {
             let fqdn_frgn_reqs_count = dom_frgn_reqs_count;
             
             let frgn_limit = fhist.foreign_dom_limit.get_or_create( &gid );
-            frgn_limit.push( dur, dom_frgn_reqs_count );
-            let frgn_slw = frgn_limit.get_slowdown( -1 );
+            frgn_limit.push( e2e_dur, dom_frgn_reqs_count );
+            let frgn_slw = frgn_limit.val.get_slowdown( -1 );
             let frgn_limit = frgn_limit.get_limit();
             let dom_frgn_limit = 0; // no longer using 
             let impact_delta = 0; // no longer using 
@@ -954,11 +1030,11 @@ impl WarmCoreMaximusCL {
             let native_limit = fhist.native_dom_limit.get_or_create( &gid );
             let concur = self.shareddata.mapgidstats.fetch_current( gid ).unwrap();
 
-            native_limit.push( dur, concur*2 ); // x2 because we want twice native requests as
-                                                // compared to foreign requests 
-            let max_concur = native_limit.get_max_concur( -2 );
+            native_limit.push( dur, concur ); 
+                                             
+            let max_concur = native_limit.val.get_max_concur( -2 );
 
-            let slowdown = native_limit.get_slowdown( -1 ); // latest slowdown 
+            let slowdown = native_limit.val.get_slowdown( -1 ); // latest slowdown 
             let min_dur = 0;
             let avg_dur = 0;
 
@@ -967,7 +1043,7 @@ impl WarmCoreMaximusCL {
             let mut lts = domstate.last_limit_up_ts.value.lock().unwrap();
             *lts = self.timestamp();
 
-            debug!( fqdn=%fqdn, dur=%dur, slowdown=%slowdown, min_dur=%min_dur, avg_dur=%avg_dur, "[finesched][warmcoremaximuscl][slowdown] invoke_complete handler ");
+            debug!( fqdn=%fqdn, dur=%e2e_dur, slowdown=%slowdown, min_dur=%min_dur, avg_dur=%avg_dur, "[finesched][warmcoremaximuscl][slowdown] invoke_complete handler ");
             debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] invoke_complete handler ");
             debug!( fqdn=%fqdn, gid=%domstate.id, concur_limit=%concur_limit, "[finesched][warmcoremaximuscl][concur] updated concurrency limit");
         } 
@@ -988,11 +1064,11 @@ impl WarmCoreMaximusCL {
         let blocked = dom_count - act_count; // -ve can happen if just serving foreign requests
         let blocked = if blocked < 0 { 0 } else { blocked };
         let pileup_allowance = fhist.pileup_allowance.clone();
-        pileup_allowance.push( e2e_dur, blocked );
-        let limit = pileup_allowance.get_limit();
+        pileup_allowance.push( 0, blocked );
+        let allowed = pileup_allowance.get_allowed();
 
-        if blocked >= limit {
-            let mut wakeups = limit;  
+        if blocked >= allowed {
+            let mut wakeups = allowed;  
             while wakeups > 0 {
                 self.domlimiter.acquire_x_from_group( pgid, reg.cpus as i32 );
                 self.domlimiter.return_x_to_group( pgid, reg.cpus as i32 );
@@ -1000,7 +1076,7 @@ impl WarmCoreMaximusCL {
             }
         }
 
-        debug!( dom_count=%dom_count, gid=%pgid, pileup_allowance=%limit, "[finesched][warmcoremaximuscl][pileup] updated pileup_allowance on native req completion ");
+        debug!( dom_count=%dom_count, gid=%pgid, pileup_allowance=%allowed, e2e_slowdown=%pileup_allowance.val.get_slowdown(-1), blocked=%pileup_allowance.val.get_nth_concur(-1)/100, "[finesched][warmcoremaximuscl][pileup] updated pileup_allowance on native req completion ");
     }
 }
 
