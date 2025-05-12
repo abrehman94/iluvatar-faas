@@ -187,8 +187,11 @@ impl Default for DynamicLimit {
 
 impl DynamicLimit {
     // slowdown is guranteed to be >= 1 
+    // avg_concur is in 100s
+    // slowdown is in 100s
+    // limit generated has to be exact 
     const fn slowdown_limit( avg_concur: i32, slowdown: i32 ) -> i32 {
-        ( avg_concur + slowdown) / slowdown 
+        (avg_concur/slowdown) + (slowdown/300) + 1
     }
     pub fn new() -> Self {
         DynamicLimit::default()
@@ -564,9 +567,7 @@ impl DomState {
 struct FuncHistory {
     pub iat_buffer: Arc<SignalAnalyzer<i32>>,
 
-    pub native_dom_limit: ArcMap<SchedGroupID, DynamicLimit>,
-    pub foreign_dom_limit: ArcMap<SchedGroupID, DynamicLimit>,
-    pub pileup_allowance: Arc<DynamicAllowance>,
+    pub dom_limits: ArcMap<SchedGroupID, DynamicLimit>,
 
     pub assigned_dom: ClonableMutex<Arc<DomState>>,
     pub last_assigned_dom: ClonableMutex<Arc<DomState>>,
@@ -577,9 +578,7 @@ impl Default for FuncHistory {
         FuncHistory {
             iat_buffer: Arc::new(SignalAnalyzer::new( const_DEFAULT_BUFFER_SIZE )),
 
-            pileup_allowance: Arc::new( DynamicAllowance::new() ),
-            native_dom_limit: ArcMap::new(),
-            foreign_dom_limit: ArcMap::new(),
+            dom_limits: ArcMap::new(),
             
             assigned_dom: ClonableMutex::new(Arc::new(DomState::default())),
             last_assigned_dom: ClonableMutex::new(Arc::new(DomState::default())),
@@ -601,7 +600,6 @@ pub struct WarmCoreMaximusCL {
     tid_gid_map: ArcMap<TransactionId, SchedGroupID>,
     
     domlimiter: DomConcurrencyLimiter, // per dom concurrncy limiter
-    forgn_req_limiter: DomConcurrencyLimiter, // per dom foreign request limiter
 
     _rec_worker_thread: std::thread::JoinHandle<()>,
     _wak_worker_thread: std::thread::JoinHandle<()>,
@@ -650,7 +648,6 @@ impl WarmCoreMaximusCL {
         let local_gidstats = GidStats::new( shareddata.pgs.clone() );
         let domlimiter = DomConcurrencyLimiter::new( local_gidstats );
         let local_gidstats = GidStats::new( shareddata.pgs.clone() );
-        let forgn_req_limiter = DomConcurrencyLimiter::new( local_gidstats );
 
         let doms = DomState::init_map( shareddata.pgs.clone() );
 
@@ -681,7 +678,6 @@ impl WarmCoreMaximusCL {
             
             tid_gid_map: ArcMap::new(),
             domlimiter,
-            forgn_req_limiter,
             _rec_worker_thread: rec_handle,
             _wak_worker_thread: wak_handle,
             creation_time: Instant::now(),
@@ -762,9 +758,7 @@ impl WarmCoreMaximusCL {
             } 
 
             let domserving_count = self.domlimiter.local_gidstats.fetch_current( *domid ).unwrap_or(0);
-            let dom_forgn_req_count = self.forgn_req_limiter.local_gidstats.fetch_current( *domid ).unwrap_or(0);
-            let usage = domserving_count + dom_forgn_req_count;
-            if usage == 0 && too_old {
+            if domserving_count == 0 && too_old {
                 if adom.id != consts_RESERVED_GID_UNASSIGNED {
                     *adom = Default::default();
                 }
@@ -772,8 +766,7 @@ impl WarmCoreMaximusCL {
                 drop(serving_fqdn);
                 domstate.reset();
             } else {
-                let fqdn_forgn_req_count = dom_forgn_req_count;
-                debug!( tid=%tid, domid=%domid, serving_fqdn=%serving_fqdn, domserving_count=%domserving_count, dom_forgn_req_count=%dom_forgn_req_count, fqdn_forgn_req_count=%fqdn_forgn_req_count, "[finesched][warmcoremaximuscl] reclamation worker - resetting usage count" );
+                debug!( tid=%tid, domid=%domid, serving_fqdn=%serving_fqdn, domserving_count=%domserving_count, dom_forgn_req_count=%0, fqdn_forgn_req_count=%0, "[finesched][warmcoremaximuscl] reclamation worker - resetting usage count" );
             }
         }
     }
@@ -799,8 +792,8 @@ impl WarmCoreMaximusCL {
             for dom in doms.iter() {
                 let ofqdn = dom.serving_fqdn.value.lock().unwrap();
                 let key = (dom.id,ofqdn.to_string());
-                let foreign_limit =  fhist.foreign_dom_limit.get_or_create( &dom.id );
-                let lslw = foreign_limit.val.get_slowdown( -1 ); 
+                let dom_limit =  fhist.dom_limits.get_or_create( &dom.id );
+                let lslw = dom_limit.val.get_slowdown( -1 ); 
                 if lslw < lowest_slowdown {
                     lowest_slowdown = lslw;
                     lowest_dom = dom.clone();
@@ -820,15 +813,12 @@ impl WarmCoreMaximusCL {
         // acquire the selected dom, check limit and return if all good 
         if sel_dom.id != consts_RESERVED_GID_UNASSIGNED {
             // we must check if the dom can accomodate foreign requests 
-            let fcount = self.forgn_req_limiter.acquire_x_from_group( sel_dom.id, reg.cpus as i32 );
-            let flimit = fhist.foreign_dom_limit.get_or_create( &sel_dom.id ).get_limit();
-            let pileup_allowance = fhist.pileup_allowance.get_allowed();
-            let flimit = flimit + pileup_allowance;
-
+            let fcount = self.domlimiter.acquire_x_from_group( sel_dom.id, reg.cpus as i32 );
+            let flimit = fhist.dom_limits.get_or_create( &sel_dom.id ).get_limit();
             if fcount < flimit {
                 return Some(sel_dom.id);
             }
-            self.forgn_req_limiter.return_x_to_group( sel_dom.id, reg.cpus as i32 );
+            self.domlimiter.return_x_to_group( sel_dom.id, reg.cpus as i32 );
         }
 
         None
@@ -848,10 +838,7 @@ impl WarmCoreMaximusCL {
                 // only doms which have capacity within their native limits are considered fillable 
                 let concur = self.domlimiter.local_gidstats.fetch_current( *domid ).unwrap();
                 let fhist = self.func_history.get_or_create(&(serving_fqdn.to_string()));
-                let limit = fhist.native_dom_limit.get_or_create(domid).get_limit();
-                let pileup_allowance = fhist.pileup_allowance.get_allowed();
-                let limit = limit + pileup_allowance;
-
+                let limit = fhist.dom_limits.get_or_create(domid).get_limit();
                 if concur < limit {
                     doms.push( (*domstate).clone() );
                 }
@@ -929,10 +916,7 @@ impl WarmCoreMaximusCL {
             let current = self.domlimiter.acquire_x_from_group(assigned_gid, reg.cpus as i32);
 
             // check if concurrency of domilimiter is within limit 
-            let limit = fhist.native_dom_limit.get_or_create( &assigned_gid ).get_limit();
-            let pileup_allowance = fhist.pileup_allowance.get_allowed();
-            let limit = limit + pileup_allowance;
-
+            let limit = fhist.dom_limits.get_or_create( &assigned_gid ).get_limit();
             if current >= limit {
                 // pick has to check for foriegn limit itself  
                 let foreign_gid = self.pick_foreign_domain( reg.clone() );
@@ -948,10 +932,7 @@ impl WarmCoreMaximusCL {
                     self.domlimiter.wait_for_group( assigned_gid ).await;
 
                     // choose native dom before continuing to foreign dom 
-                    let limit = fhist.native_dom_limit.get_or_create( &assigned_gid ).get_limit();
-                    let pileup_allowance = fhist.pileup_allowance.get_allowed();
-                    let limit = limit + pileup_allowance;
-
+                    let limit = fhist.dom_limits.get_or_create( &assigned_gid ).get_limit();
                     let current_count = self.shareddata.mapgidstats.fetch_current( assigned_gid ).unwrap_or( 0 );
                     debug!( fqdn=%fqdn, tid=%tid, assigned_gid=%assigned_gid, current=%current, limit=%limit, current_count=%current_count, "[finesched][warmcoremaximuscl][find_available_dom] woken up assigned_gid" );
                     if current_count < limit {
@@ -1005,20 +986,33 @@ impl WarmCoreMaximusCL {
         let avg_iat = idb.get_nth_avg( -1 );
         debug!( fqdn=%fqdn, iat=%iat, asfrequent=%asfrequent, min_iat=%min_iat, avg_iat=%avg_iat, "[finesched][warmcoremaximuscl][iat] invoke_complete handler ");
 
+
+        // return group to domlimiter 
+        let concur = self.shareddata.mapgidstats.fetch_current( gid ).unwrap(); // actual count
+                                                                                // executing on a
+                                                                                // domain 
+        let dom_count = self.domlimiter.return_x_to_group( gid, reg.cpus as i32 ); // includes the
+                                                                                   // blocked
+                                                                                   // requests as
+                                                                                   // well 
+        debug!( dom_count=%dom_count, gid=%gid, "[finesched][warmcoremaximuscl][domlimiter][count] returned group to domlimiter ");
+        let dom_limit = fhist.dom_limits.get_or_create( &gid );
+
         let was_foreign = domstate.id != gid;
         if was_foreign {
 
+            dom_limit.push( e2e_dur, concur );
             let other_dom = self.doms.get( &gid ).unwrap();
             let other_fqdn = other_dom.serving_fqdn.value.lock().unwrap();
-            let dom_frgn_reqs_count = self.forgn_req_limiter.return_x_to_group( gid, reg.cpus as i32 ); 
-            let fqdn_frgn_reqs_count = dom_frgn_reqs_count;
             
-            let frgn_limit = fhist.foreign_dom_limit.get_or_create( &gid );
-            frgn_limit.push( e2e_dur, dom_frgn_reqs_count );
-            let frgn_slw = frgn_limit.val.get_slowdown( -1 );
-            let frgn_limit = frgn_limit.get_limit();
+            // just for logging purposes for plotting 
+            // keeping it compatible to plethora of scripts written 
+            let frgn_limit = dom_limit.get_limit();
+            let frgn_slw = dom_limit.val.get_slowdown( -1 ); // latest slowdown
             let dom_frgn_limit = 0; // no longer using 
             let impact_delta = 0; // no longer using 
+            let dom_frgn_reqs_count = dom_count; 
+            let fqdn_frgn_reqs_count = dom_frgn_reqs_count;
 
             debug!( fqdn=%fqdn, self_id=%domstate.id, other_id=%gid, other_fqdn=%other_fqdn, impact_delta=%impact_delta, frgn_slw=%frgn_slw,
                 frgn_limit=%frgn_limit, dom_frgn_limit=%dom_frgn_limit, dom_frgn_reqs_count=%dom_frgn_reqs_count, 
@@ -1027,56 +1021,30 @@ impl WarmCoreMaximusCL {
 
         } else {
 
-            let native_limit = fhist.native_dom_limit.get_or_create( &gid );
-            let concur = self.shareddata.mapgidstats.fetch_current( gid ).unwrap();
+            dom_limit.push( dur, concur ); 
 
-            native_limit.push( dur, concur ); 
-                                             
-            let max_concur = native_limit.val.get_max_concur( -2 );
-
-            let slowdown = native_limit.val.get_slowdown( -1 ); // latest slowdown 
+            let concur_limit = dom_limit.get_limit();
+            let max_concur = dom_limit.val.get_max_concur( -2 );
+            let slowdown = dom_limit.val.get_slowdown( -1 ); // latest slowdown 
             let min_dur = 0;
             let avg_dur = 0;
-
-            let concur_limit = native_limit.get_limit();
-
-            let mut lts = domstate.last_limit_up_ts.value.lock().unwrap();
-            *lts = self.timestamp();
 
             debug!( fqdn=%fqdn, dur=%e2e_dur, slowdown=%slowdown, min_dur=%min_dur, avg_dur=%avg_dur, "[finesched][warmcoremaximuscl][slowdown] invoke_complete handler ");
             debug!( fqdn=%fqdn, concur=%concur, max_concur=%max_concur, "[finesched][warmcoremaximuscl][concur] invoke_complete handler ");
             debug!( fqdn=%fqdn, gid=%domstate.id, concur_limit=%concur_limit, "[finesched][warmcoremaximuscl][concur] updated concurrency limit");
         } 
 
-        // return group to domlimiter 
-        let dom_count = self.domlimiter.return_x_to_group( gid, reg.cpus as i32 );
-        debug!( dom_count=%dom_count, gid=%gid, "[finesched][warmcoremaximuscl][domlimiter][count] returned group to domlimiter ");
-        
-        let mut pgid = gid;
-        if was_foreign {
-            pgid = domstate.id;
+        let mut lts = domstate.last_limit_up_ts.value.lock().unwrap();
+        *lts = self.timestamp();
+
+        // wakeup two f_i_r.assigned_dom requests 
+        let mut wakeups = 2; 
+        while wakeups {
+            self.domlimiter.acquire_group( domstate.id ); // acquire the group 
+            self.domlimiter.return_x_to_group( domstate.id, reg.cpus as i32 ); // return to wakeup  
         }
 
-        // wakeup more requests if there is a pileup for assigned_gid 
-        let cur_limit = fhist.native_dom_limit.get_or_create( &pgid ).get_limit();
-        let dom_count = self.domlimiter.local_gidstats.fetch_current( pgid ).unwrap_or(0);
-        let act_count = self.shareddata.mapgidstats.fetch_current( pgid ).unwrap();
-        let blocked = dom_count - act_count; // -ve can happen if just serving foreign requests
-        let blocked = if blocked < 0 { 0 } else { blocked };
-        let pileup_allowance = fhist.pileup_allowance.clone();
-        pileup_allowance.push( 0, blocked );
-        let allowed = pileup_allowance.get_allowed();
-
-        if blocked >= allowed {
-            let mut wakeups = allowed;  
-            while wakeups > 0 {
-                self.domlimiter.acquire_x_from_group( pgid, reg.cpus as i32 );
-                self.domlimiter.return_x_to_group( pgid, reg.cpus as i32 );
-                wakeups -= 1;
-            }
-        }
-
-        debug!( dom_count=%dom_count, gid=%pgid, pileup_allowance=%allowed, e2e_slowdown=%pileup_allowance.val.get_slowdown(-1), blocked=%pileup_allowance.val.get_nth_concur(-1)/100, "[finesched][warmcoremaximuscl][pileup] updated pileup_allowance on native req completion ");
+        debug!( dom_count=%dom_count, gid=%gid, pileup_allowance=%0, e2e_slowdown=%dom_limit.val.get_slowdown(-1), blocked=%dom_limit.val.get_nth_concur(-1)/100, "[finesched][warmcoremaximuscl][pileup] updated pileup_allowance on native req completion ");
     }
 }
 
