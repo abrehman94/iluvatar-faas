@@ -191,7 +191,7 @@ impl DynamicLimit {
     // slowdown is in 100s
     // limit generated has to be exact 
     const fn slowdown_limit( avg_concur: i32, slowdown: i32 ) -> i32 {
-        (avg_concur/slowdown) + (slowdown/300) + 1
+        (avg_concur/slowdown) + (slowdown/500) + 1
     }
     pub fn new() -> Self {
         DynamicLimit::default()
@@ -1039,9 +1039,11 @@ impl WarmCoreMaximusCL {
 
         // wakeup two f_i_r.assigned_dom requests 
         let mut wakeups = 2; 
-        while wakeups {
+        while wakeups > 0 {
             self.domlimiter.acquire_group( domstate.id ); // acquire the group 
             self.domlimiter.return_x_to_group( domstate.id, reg.cpus as i32 ); // return to wakeup  
+            
+            wakeups -= 1;
         }
 
         debug!( dom_count=%dom_count, gid=%gid, pileup_allowance=%0, e2e_slowdown=%dom_limit.val.get_slowdown(-1), blocked=%dom_limit.val.get_nth_concur(-1)/100, "[finesched][warmcoremaximuscl][pileup] updated pileup_allowance on native req completion ");
