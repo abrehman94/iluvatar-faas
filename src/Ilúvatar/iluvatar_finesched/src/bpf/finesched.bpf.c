@@ -34,6 +34,13 @@ private(FINESCHED) struct bpf_cpumask __kptr *cpumask_node1;
 u8 cores_node1[] = { 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47 };
 
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, MAX_CPUS);
+} HardwareCpuCyclesMap SEC(".maps");
+
 // cgroup characteristics shared map copy  
 // to avoid missed lookup when user is writing  
 // while bpf side is trying to read. 
@@ -261,12 +268,19 @@ static int usersched_timer_init(void) {
 }
 
 
+
+SEC("perf_event")
+int perf_sample_handler(struct bpf_perf_event_data *ctx)
+{
+  return 0;
+}
+
 //////////////////////////////
 // Scx Callbacks  
 
 
 // task ran out of timeslice, @p is in need of dispatch
-// select the cpu for it and scx_bpf_dispatch( SCX_DSQ_LOCAL )
+// select the cpu for it and scx_bpf_dsq_insert( SCX_DSQ_LOCAL )
 // cpu would be selected by the cpu returned
 s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags) {
     info("[callback][select_cpu] prev_cpu %d task %d - %s", prev_cpu, p->pid, p->comm);
@@ -285,7 +299,7 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
         if (err < 0) {
             goto out_no_dispatch;
         }
-        scx_bpf_dispatch(p, SCX_DSQ_LOCAL, ts * NSEC_PER_MSEC, 0);
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, ts * NSEC_PER_MSEC, 0);
         return cpu;
     }
 
@@ -300,7 +314,7 @@ out_no_dispatch:
 // enq_flags can be
 // see enum scx_enq_flags in ext.c for details
 //
-//  Can dispatch using scx_bpf_dispatch() to a Q
+//  Can dispatch using scx_bpf_dsq_insert() to a Q
 //    custom DSQ_id
 //    global SCX_DSQ_GLOBAL
 //    can target specific CPU using SCX_DSQ_LOCAL_ON
@@ -324,7 +338,7 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
         if (err < 0) {
             goto out_no_dispatch;
         }
-        scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, ts * NSEC_PER_MSEC, 0);
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, ts * NSEC_PER_MSEC, 0);
     }
     
     // task must have been dispatched by this point 
@@ -348,22 +362,22 @@ void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
     }
 
     if (cctx->prio_dsqid != -1 && cctx->prio_dsqid != 0) {
-        if (scx_bpf_consume(cctx->prio_dsqid)) {
-            scx_bpf_consume(cctx->prio_dsqid); // two consumes 
+        if (scx_bpf_dsq_move_to_local(cctx->prio_dsqid)) {
+            scx_bpf_dsq_move_to_local(cctx->prio_dsqid); // two consumes 
             info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
-        }else if ( (s32)(cctx->prio_dsqid -1) >= DSQ_PRIO_GRPS_START && scx_bpf_consume(cctx->prio_dsqid - 1) ) {
+        }else if ( (s32)(cctx->prio_dsqid -1) >= DSQ_PRIO_GRPS_START && scx_bpf_dsq_move_to_local(cctx->prio_dsqid - 1) ) {
             info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
-        }else if ( (s32)(cctx->prio_dsqid -2) >= DSQ_PRIO_GRPS_START && scx_bpf_consume(cctx->prio_dsqid - 2) ) {
+        }else if ( (s32)(cctx->prio_dsqid -2) >= DSQ_PRIO_GRPS_START && scx_bpf_dsq_move_to_local(cctx->prio_dsqid - 2) ) {
             info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
-        }else if ( (s32)(cctx->prio_dsqid -3) >= DSQ_PRIO_GRPS_START && scx_bpf_consume(cctx->prio_dsqid - 3) ) {
+        }else if ( (s32)(cctx->prio_dsqid -3) >= DSQ_PRIO_GRPS_START && scx_bpf_dsq_move_to_local(cctx->prio_dsqid - 3) ) {
             info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
         }
     }
 
-    scx_bpf_consume(SCX_DSQ_GLOBAL);
-    scx_bpf_consume(DSQ_INACTIVE_GRPS_N1);
+    scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL);
+    scx_bpf_dsq_move_to_local(DSQ_INACTIVE_GRPS_N1);
     if (cores_inact_grp_mask && bpf_cpumask_test_cpu(cpu, cores_inact_grp_mask)) {
-        if (scx_bpf_consume(DSQ_INACTIVE_GRPS_N0)) {
+        if (scx_bpf_dsq_move_to_local(DSQ_INACTIVE_GRPS_N0)) {
             info("[info][dispatch] consumed a task from inactive groups DSQ on cpu %d", cpu);
         }
     }

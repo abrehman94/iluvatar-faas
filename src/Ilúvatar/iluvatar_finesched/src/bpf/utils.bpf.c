@@ -281,11 +281,11 @@ static void __noinline q_inactive_task( struct task_struct *p ) {
     // check if p is allowed on inactive group cores - Q accordingly 
     if( cores_inact_grp_mask && !bpf_cpumask_intersects(cores_inact_grp_mask, p->cpus_ptr) ){
       // Q that consumes on all cores 
-      scx_bpf_dispatch(p, DSQ_INACTIVE_GRPS_N1, INACTIVE_GRPS_TS, 0);
+      scx_bpf_dsq_insert(p, DSQ_INACTIVE_GRPS_N1, INACTIVE_GRPS_TS, 0);
       info("[info][dispatch][inactive] to DSQ_INACTIVE_GRPS_N1 task %d - %s", p->pid, p->comm);
     }else{
       // Q that consumes on only inactive group cores 
-      scx_bpf_dispatch(p, DSQ_INACTIVE_GRPS_N0, INACTIVE_GRPS_TS, 0);
+      scx_bpf_dsq_insert(p, DSQ_INACTIVE_GRPS_N0, INACTIVE_GRPS_TS, 0);
       info("[info][dispatch][inactive] to DSQ_INACTIVE_GRPS_N0 task %d - %s", p->pid, p->comm);
     }
 
@@ -721,7 +721,7 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
     }
 
     if (sched_chrs->fifo) {
-        scx_bpf_dispatch(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, 0);
+        scx_bpf_dsq_insert(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, 0);
     } else {
         if (sched_chrs->prio == QEnqPrioINVOC) {
 
@@ -762,7 +762,7 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
             error("[enqueue_prio_dsq][sched_chrs] bad priority sched_chrs->prio: %d", sched_chrs->prio);
         }
 
-        scx_bpf_dispatch_vtime(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, tctx->vtime, 0);
+        scx_bpf_dsq_insert_vtime(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, tctx->vtime, 0);
     }
 
     info("[enqueue_prio_dsq][task_stats] task %d - %s to dsq %d invo_t: %lld act_t: %lld "
@@ -1005,20 +1005,20 @@ static void __noinline stats_update_global() {
         }
     }
 
-    bpf_for(gid, 0, prio_dsq_count) {
-        stats = get_schedgroup_stats( gid );
-        chrs = get_schedgroup_chrs( gid );
-        if( chrs && stats && 0 <= gid && gid < DSQ_MAX_COUNT ) {
+    bpf_for(gid, 0, DSQ_MAX_COUNT) {
+        stats = get_schedgroup_stats(gid);
+        chrs = get_schedgroup_chrs(gid);
+        if (chrs && stats) {
             dom_util[gid] /= chrs->core_count;
             stats->util = dom_util[gid] ;
 
             dom_autil[gid] /= chrs->core_count;
             stats->avg_util = dom_autil[gid] ;
 
-            info( "[stats][dev] found stats for gid: %llu util: %llu autil: %llu", gid, stats->util, stats->avg_util );
+            info("[stats][dev] found stats for gid: %llu util: %llu autil: %llu core_count %llu", gid,
+                 stats->util, stats->avg_util, chrs->core_count);
         }
     }
-
     util /= 48;
     autil /= 48;
     info("[stats][cpu] across 48 cores util: %llu avg util: %llu", util, autil);
