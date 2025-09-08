@@ -38,6 +38,10 @@ debug:
 	@echo "Building debug"
 	@RUSTFLAGS=$(RUST_FLAGS) $(RUST_C) build $(DEBUG_FLAGS) $(CARGO_ARGS)
 	@chmod a+rw -R ./target
+finesched:
+	@echo "Building debug"
+	@RUSTFLAGS=$(RUST_FLAGS) $(RUST_C) build --bin finesched $(DEBUG_FLAGS) $(CARGO_ARGS)
+	@chmod a+rw -R ./target
 in_docker:
 	@./build_in_a_container.sh
 spans:
