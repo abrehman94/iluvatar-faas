@@ -1,11 +1,18 @@
+#ifdef LSP
+#ifndef __bpf__
+#define __bpf__
+#endif
+#define LSP_INC
+#include "../../../include/scx/common.bpf.h"
+#else
+#include <scx/common.bpf.h>
+#endif
 
 #include "intf.h"
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <errno.h>
-#include <scx/common.bpf.h>
-#include <stdbool.h>
 #include <string.h>
 
 // we don't want licence of hashmap to be included for the scheduler
@@ -36,12 +43,26 @@ private(FINESCHED) struct bpf_cpumask __kptr *cpumask_node1;
 u8 cores_node1[] = {24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
                     36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47};
 
+struct cpucycles_ctx {
+    u64 last_timestamp;
+    u64 cycles_counter;
+    u64 cycles_per_sec;
+};
+
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, u32);
-    __type(value, u32);
-    __uint(max_entries, MAX_CPUS);
+    __type(value, struct cpucycles_ctx);
+    __uint(max_entries, 1);
 } HardwareCpuCyclesMap SEC(".maps");
+
+/*
+ * Return per CPU Perf context.
+ */
+__always_inline struct cpucycles_ctx *try_lookup_cpucycles_ctx(s32 cpu) {
+    const u32 idx = 0;
+    return bpf_map_lookup_percpu_elem(&HardwareCpuCyclesMap, &idx, cpu);
+}
 
 // cgroup characteristics shared map copy
 // to avoid missed lookup when user is writing
@@ -231,7 +252,7 @@ static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer) {
     }
 
     stats_update_global();
-    // capture_stats_for_gmap();
+    capture_stats_for_gmap();
 
     if (cpu_boost_config) {
         boost_cpus();
@@ -267,7 +288,38 @@ static int usersched_timer_init(void) {
 }
 
 SEC("perf_event")
-int perf_sample_handler(struct bpf_perf_event_data *ctx) { return 0; }
+int perf_sample_handler(struct bpf_perf_event_data *ctx) {
+    struct bpf_perf_event_value perf_event_value;
+    s32 this_cpu = bpf_get_smp_processor_id();
+    int err;
+
+    err = bpf_perf_prog_read_value(ctx, &perf_event_value, sizeof(perf_event_value));
+    if (err != 0) {
+        info("[perf_event] cpu: %d failed with err: %d ", bpf_get_smp_processor_id(), err);
+        return err;
+    }
+
+    struct cpucycles_ctx *lcpucycles_ctx;
+    lcpucycles_ctx = try_lookup_cpucycles_ctx(this_cpu);
+    if (!lcpucycles_ctx) {
+        return -ENOMEM;
+    }
+
+    u64 time_now = bpf_ktime_get_tai_ns();
+    u64 time_elapsed = time_now - lcpucycles_ctx->last_timestamp;
+
+    lcpucycles_ctx->cycles_counter += 1;
+    if (time_elapsed > NSEC_PER_SEC) {
+        lcpucycles_ctx->last_timestamp = time_now;
+        lcpucycles_ctx->cycles_per_sec =
+            (lcpucycles_ctx->cycles_counter * NSEC_PER_SEC) / time_elapsed;
+        lcpucycles_ctx->cycles_counter = 0;
+    }
+
+    info("[perf_event] cpu: %d Mhz: %lld ", this_cpu, lcpucycles_ctx->cycles_per_sec);
+
+    return 0;
+}
 
 //////////////////////////////
 // Scx Callbacks

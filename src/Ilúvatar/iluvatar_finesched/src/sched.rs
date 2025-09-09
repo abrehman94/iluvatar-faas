@@ -54,7 +54,7 @@ fn attach_perf_hw_cycles_event<'a>(skel: &mut BpfSkel<'a>) -> Result<Vec<Link>> 
         attr.set_disabled(0);
         attr.set_exclude_kernel(0);
         attr.set_exclude_hv(0);
-        attr.set_inherit(1); // inherit to all processes
+        attr.set_inherit(0);
         attr.set_pinned(1);
 
         // Use scx_utils perf event helper to open the perf event
@@ -94,7 +94,10 @@ fn attach_perf_hw_cycles_event<'a>(skel: &mut BpfSkel<'a>) -> Result<Vec<Link>> 
     Ok(perf_links)
 }
 
-fn load_bpf_scheduler(verbose: u8, open_object: &mut MaybeUninit<OpenObject>) -> Result<(Link, BpfSkel, Vec<Link>)> {
+fn load_bpf_scheduler(
+    verbose: u8,
+    open_object: &mut MaybeUninit<OpenObject>,
+) -> Result<(Link, BpfSkel, Vec<Link>)> {
     // Increase MEMLOCK size since the BPF scheduler might use
     // more than the current limit
     try_set_rlimit_infinity();

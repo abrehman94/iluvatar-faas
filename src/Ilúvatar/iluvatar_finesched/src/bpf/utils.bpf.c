@@ -826,23 +826,51 @@ static long __noinline callback_gmap_capture_stats_cpus_iter(struct bpf_map *map
     // costly to use bit_iterator helpers here
     s32 cpu;
     s32 cpucount = 0;
+    u64 temp_val;
     struct cpu_ctx *cctx = NULL;
+    struct cpucycles_ctx *lcpucycles_ctx;
+
+    sched_stats->avg_freq_mhz = 0;
+    sched_stats->util = 0;
+    sched_stats->avg_util = 0;
+
+    cpucount = 0;
     bpf_for(cpu, 0, MAX_CPUS) {
-        cctx = try_lookup_cpu_ctx(cpu);
-        if (!cctx) {
-            break;
-        }
+
         if (bpf_cpumask_test_cpu(cpu, &chrs->corebitmask)) {
+
+            lcpucycles_ctx = try_lookup_cpucycles_ctx(cpu);
+            if (!lcpucycles_ctx) {
+                break;
+            }
+
+            cctx = try_lookup_cpu_ctx(cpu);
+            if (!cctx) {
+                break;
+            }
+
             sched_stats->util += cctx->util;
             sched_stats->avg_util += cctx->avg_util;
+
+            sched_stats->avg_freq_mhz += lcpucycles_ctx->cycles_per_sec;
+
             cpucount += 1;
         }
     }
+
+    cpucount = 0;
+    bpf_for(cpu, 0, MAX_CPUS) {
+        if (bpf_cpumask_test_cpu(cpu, &chrs->corebitmask)) {
+            cpucount += 1;
+        }
+    }
+
     if (cpucount > 0) {
         sched_stats->util /= cpucount;
         sched_stats->avg_util /= cpucount;
-        info("[stats][gstats] sched domain %d util: %llu avg util: %llu", *gid, sched_stats->util,
-             sched_stats->avg_util);
+        sched_stats->avg_freq_mhz /= cpucount;
+        info("[stats][gstats] sched domain %d util: %llu avg util: %llu avg freq: %llu", *gid,
+             sched_stats->util, sched_stats->avg_util, sched_stats->avg_freq_mhz);
     }
 
     return 0;

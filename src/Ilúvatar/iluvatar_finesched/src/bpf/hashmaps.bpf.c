@@ -1,9 +1,17 @@
+#ifdef LSP
+#ifndef __bpf__
+#define __bpf__
+#endif
+#define LSP_INC
+#include "../../../include/scx/common.bpf.h"
+#else
+#include <scx/common.bpf.h>
+#endif
 
 // TODO: investigate why using scx causes mmap ptr look up failure
 // reproducible by running example_hashmap
 //#include <scx/common.bpf.h>
 #include "intf.h"
-#include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 
 // the control plane and the bpf scheduler.

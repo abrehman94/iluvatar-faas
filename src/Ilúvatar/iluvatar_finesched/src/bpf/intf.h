@@ -108,6 +108,7 @@ typedef struct SchedGroupStats {
     u64 util;
     u64 avg_util;
     u64 dsqlen;
+    u64 avg_freq_mhz;
 } SchedGroupStats_t;
 
 // Group Characteristics Structure
