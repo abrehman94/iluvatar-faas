@@ -2,22 +2,23 @@
 pub use crate::bpf_skel::bpf_hashmaps::*;
 use anyhow::Result;
 
+use std::fmt::{Debug, Error, Formatter};
 use std::fs;
 use std::mem::MaybeUninit;
 use std::path::Path;
-use std::fmt::{Debug, Error, Formatter};
 
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::SkelBuilder;
+use libbpf_rs::MapCore;
+use libbpf_rs::MapFlags;
 use libbpf_rs::MapMut;
 use libbpf_rs::OpenMapMut;
 use libbpf_rs::OpenObject;
-use libbpf_rs::MapFlags;
-use libbpf_rs::MapCore;
 
 use crate::CgroupChrs;
 use crate::SchedGroupChrs;
 use crate::SchedGroupID;
+use crate::SchedGroupStats;
 
 use crate::bpf_intf::consts_MAX_PATH;
 use crate::bpf_intf::cpumask;
@@ -68,7 +69,7 @@ pub unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
 }
 
 pub trait CMAP {
-    fn insert(&mut self, key: &str, value: &CgroupChrs); 
+    fn insert(&mut self, key: &str, value: &CgroupChrs);
     fn lookup(&self, key: &str) -> Option<CgroupChrs>;
 }
 
@@ -77,14 +78,17 @@ pub trait GMAP {
     fn lookup(&self, key: &SchedGroupID) -> Option<SchedGroupChrs>;
 }
 
+pub trait GStats {
+    fn lookup(&self, key: &SchedGroupID) -> Option<SchedGroupStats>;
+}
+
 pub struct SharedMaps<'obj> {
     skel: BpfHashmapsSkel<'obj>,
 }
 
 impl Debug for SharedMaps<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BpfHashmapsSkel")
-         .finish()
+        f.debug_struct("BpfHashmapsSkel").finish()
     }
 }
 
@@ -102,23 +106,21 @@ impl CMAP for SharedMaps<'_> {
         }
     }
 
-    fn lookup(&self, key: &str) -> Option<CgroupChrs>{
+    fn lookup(&self, key: &str) -> Option<CgroupChrs> {
         println!("looking up {}", key);
         let map = &self.skel.maps.cMap;
         let key = &str_to_clipped_cstr(key);
         match map.lookup(key, MapFlags::ANY) {
-            Ok(byts) => {
-                match byts{
-                    Some(byts) => {
-                        let cgroup_chrs: CgroupChrs = unsafe { *(byts.as_ptr() as *const CgroupChrs) };
-                        Some(cgroup_chrs)
-                    }
-                    None => {
-                        println!("error: didn't find {:?}", key);
-                        None
-                    }
+            Ok(byts) => match byts {
+                Some(byts) => {
+                    let cgroup_chrs: CgroupChrs = unsafe { *(byts.as_ptr() as *const CgroupChrs) };
+                    Some(cgroup_chrs)
                 }
-            }
+                None => {
+                    println!("error: didn't find {:?}", key);
+                    None
+                }
+            },
             Err(e) => {
                 println!("error: didn't find {:?} error {:?}", key, e);
                 None
@@ -128,7 +130,6 @@ impl CMAP for SharedMaps<'_> {
 }
 
 impl GMAP for SharedMaps<'_> {
-
     fn insert(&mut self, key: &SchedGroupID, value: &SchedGroupChrs) {
         println!("inserting {:?} {:?}", key, value);
         let map = &mut self.skel.maps.gMap;
@@ -147,18 +148,40 @@ impl GMAP for SharedMaps<'_> {
         let map = &self.skel.maps.gMap;
         let key: &[u8] = unsafe { any_as_u8_slice(key) };
         match map.lookup(key, MapFlags::ANY) {
-            Ok(byts) => {
-                match byts{
-                    Some(byts) => {
-                        let schedg_chrs: SchedGroupChrs = unsafe { *(byts.as_ptr() as *const SchedGroupChrs) };
-                        Some(schedg_chrs)
-                    }
-                    None => {
-                        println!("error: didn't find {:?}", key);
-                        None
-                    }
+            Ok(byts) => match byts {
+                Some(byts) => {
+                    let schedg_chrs: SchedGroupChrs = unsafe { *(byts.as_ptr() as *const SchedGroupChrs) };
+                    Some(schedg_chrs)
                 }
+                None => {
+                    println!("error: didn't find {:?}", key);
+                    None
+                }
+            },
+            Err(e) => {
+                println!("error: didn't find {:?} error {:?}", key, e);
+                None
             }
+        }
+    }
+}
+
+impl GStats for SharedMaps<'_> {
+    fn lookup(&self, key: &SchedGroupID) -> Option<SchedGroupStats> {
+        println!("looking up {}", key);
+        let map = &self.skel.maps.gStats;
+        let key: &[u8] = unsafe { any_as_u8_slice(key) };
+        match map.lookup(key, MapFlags::ANY) {
+            Ok(byts) => match byts {
+                Some(byts) => {
+                    let stats: SchedGroupStats = unsafe { *(byts.as_ptr() as *const SchedGroupStats) };
+                    Some(stats)
+                }
+                None => {
+                    println!("error: didn't find {:?}", key);
+                    None
+                }
+            },
             Err(e) => {
                 println!("error: didn't find {:?} error {:?}", key, e);
                 None
@@ -169,20 +192,19 @@ impl GMAP for SharedMaps<'_> {
 
 impl SharedMaps<'_> {
     pub fn new() -> Self {
-
         let mut skel_builder = BpfHashmapsSkelBuilder::default();
         skel_builder.obj_builder.debug(true);
         let mut open_skel = unsafe { skel_builder.open(&mut open_object).unwrap() };
 
-        rm_pinned_map( CGROUP_MAP_PATH );
-        rm_pinned_map( SCHED_GROUP_MAP_PATH );
+        rm_pinned_map(CGROUP_MAP_PATH);
+        rm_pinned_map(SCHED_GROUP_MAP_PATH);
 
-        // reuse at this point if available 
-        let cp = reuse_pinned_map( &mut open_skel.maps.cMap, CGROUP_MAP_PATH );
-        let gp = reuse_pinned_map( &mut open_skel.maps.gMap, SCHED_GROUP_MAP_PATH );
+        // reuse at this point if available
+        let cp = reuse_pinned_map(&mut open_skel.maps.cMap, CGROUP_MAP_PATH);
+        let gp = reuse_pinned_map(&mut open_skel.maps.gMap, SCHED_GROUP_MAP_PATH);
 
         let mut skel = open_skel.load().unwrap();
-        
+
         if !cp {
             pin_map(&mut skel.maps.cMap, CGROUP_MAP_PATH);
         }
@@ -190,13 +212,6 @@ impl SharedMaps<'_> {
             pin_map(&mut skel.maps.gMap, SCHED_GROUP_MAP_PATH);
         }
 
-        SharedMaps {
-            skel: skel,
-        }
+        SharedMaps { skel: skel }
     }
 }
-
-
-
-
-
