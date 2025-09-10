@@ -17,7 +17,7 @@
 // the control plane and the bpf scheduler.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_MAP_ENTRIES);
+    __uint(max_entries, MAX_GROUPS);
     __uint(key_size, sizeof(SchedGroupID)); // key: Scheduling Group ID
     __uint(value_size,
            sizeof(SchedGroupStats_t)); // value: Characteristics of
@@ -28,7 +28,7 @@ struct {
 // the control plane and the bpf scheduler.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_MAP_ENTRIES);
+    __uint(max_entries, MAX_GROUPS);
     __uint(key_size, sizeof(SchedGroupID)); // key: Scheduling Group ID
     __uint(value_size,
            sizeof(SchedGroupChrs_t)); // value: Characteristics of
@@ -39,7 +39,7 @@ struct {
 // the control plane and the bpf scheduler.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_MAP_ENTRIES);
+    __uint(max_entries, MAX_MAP_ENTRIES_CMAP);
     __uint(key_size, sizeof(char) * MAX_PATH); // key: cgroup name
     __uint(value_size, sizeof(CgroupChrs_t));  // value: cgroup characteristics
 } cMap SEC(".maps");

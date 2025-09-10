@@ -8,6 +8,7 @@ pub use hashmaps::CGROUP_MAP_PATH;
 pub use hashmaps::CMAP;
 pub use hashmaps::GMAP;
 pub use hashmaps::SCHED_GROUP_MAP_PATH;
+pub use hashmaps::SCHED_GROUP_STATS_MAP_PATH;
 
 mod hashmaps_safe;
 pub use hashmaps_safe::SharedMapsSafe;

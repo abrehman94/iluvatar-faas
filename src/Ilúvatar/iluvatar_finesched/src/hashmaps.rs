@@ -27,6 +27,7 @@ static mut open_object: MaybeUninit<OpenObject> = MaybeUninit::<OpenObject>::uni
 
 pub static CGROUP_MAP_PATH: &str = "/sys/fs/bpf/cMap";
 pub static SCHED_GROUP_MAP_PATH: &str = "/sys/fs/bpf/gMap";
+pub static SCHED_GROUP_STATS_MAP_PATH: &str = "/sys/fs/bpf/gStats";
 
 pub fn rm_pinned_map<'obj>(path: &str) -> bool {
     if Path::new(path).exists() {
@@ -198,19 +199,13 @@ impl SharedMaps<'_> {
 
         rm_pinned_map(CGROUP_MAP_PATH);
         rm_pinned_map(SCHED_GROUP_MAP_PATH);
-
-        // reuse at this point if available
-        let cp = reuse_pinned_map(&mut open_skel.maps.cMap, CGROUP_MAP_PATH);
-        let gp = reuse_pinned_map(&mut open_skel.maps.gMap, SCHED_GROUP_MAP_PATH);
+        rm_pinned_map(SCHED_GROUP_STATS_MAP_PATH);
 
         let mut skel = open_skel.load().unwrap();
 
-        if !cp {
-            pin_map(&mut skel.maps.cMap, CGROUP_MAP_PATH);
-        }
-        if !gp {
-            pin_map(&mut skel.maps.gMap, SCHED_GROUP_MAP_PATH);
-        }
+        pin_map(&mut skel.maps.cMap, CGROUP_MAP_PATH);
+        pin_map(&mut skel.maps.gMap, SCHED_GROUP_MAP_PATH);
+        pin_map(&mut skel.maps.gStats, SCHED_GROUP_STATS_MAP_PATH);
 
         SharedMaps { skel: skel }
     }

@@ -69,7 +69,7 @@ __always_inline struct cpucycles_ctx *try_lookup_cpucycles_ctx(s32 cpu) {
 // while bpf side is trying to read.
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
-    __uint(max_entries, MAX_MAP_ENTRIES);
+    __uint(max_entries, MAX_MAP_ENTRIES_CMAP);
     __uint(key_size, sizeof(char) * MAX_PATH); // key: cgroup name
     __uint(value_size, sizeof(CgroupChrs_t));  // value: cgroup characteristics
 } cMapLast SEC(".maps");
@@ -164,7 +164,7 @@ typedef struct cgroup_ctx {
 /* Map that contains task-local storage. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_MAP_ENTRIES);
+    __uint(max_entries, MAX_MAP_ENTRIES_CMAP);
     __uint(key_size, sizeof(char) * MAX_PATH); // key: cgroup name
     __uint(value_size, sizeof(cgroup_ctx_t));  // value: context
 } cgroup_ctx_stor SEC(".maps");
@@ -194,14 +194,14 @@ static cgroup_ctx_t *__noinline try_lookup_cgroup_ctx(const char *name, u32 max_
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_MAP_ENTRIES);
+    __uint(max_entries, MAX_MAP_ENTRIES_CMAP);
     __uint(key_size, sizeof(pid_t));
     __uint(value_size, sizeof(char) * MAX_PATH);
 } pid_cname_cache SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_MAP_ENTRIES);
+    __uint(max_entries, MAX_MAP_ENTRIES_CMAP);
     __uint(key_size, sizeof(pid_t));
     __uint(value_size, sizeof(SchedGroupChrs_t));
 } pid_chrs_cache SEC(".maps");

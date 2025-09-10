@@ -152,7 +152,7 @@ static s32 __noinline populate_cpu_to_dsq() {
 
 static SchedGroupChrs_t *__noinline get_schedgroup_chrs(SchedGroupID gid) {
 
-    if (gid > MAX_MAP_ENTRIES) {
+    if (gid > MAX_GROUPS) {
         goto out_not_found;
     }
 
@@ -193,7 +193,7 @@ static CgroupChrs_t *__noinline get_cgroup_chrs(const char *name, u32 max_len) {
 }
 
 static SchedGroupStats_t *__noinline get_schedgroup_stats(SchedGroupID gid) {
-    if (gid > MAX_MAP_ENTRIES) {
+    if (gid > MAX_GROUPS) {
         goto out_not_found;
     }
 
@@ -245,7 +245,7 @@ static long callback_print_gMap_element(struct bpf_map *map, SchedGroupID *gid,
 static void __noinline dump_gMap() {
     // TODO: use bpf_for_each_map_elem(...)
     s32 key;
-    bpf_for(key, 0, MAX_MAP_ENTRIES) {
+    bpf_for(key, 0, MAX_GROUPS) {
         SchedGroupChrs_t *val = bpf_map_lookup_elem(&gMap, (const void *)&key);
         callback_print_gMap_element(NULL, &key, val, NULL);
     }

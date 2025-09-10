@@ -4,6 +4,7 @@ use crate::pin_map;
 use crate::reuse_pinned_map;
 use crate::CGROUP_MAP_PATH;
 use crate::SCHED_GROUP_MAP_PATH;
+use crate::SCHED_GROUP_STATS_MAP_PATH;
 
 use std::io;
 use std::mem;
@@ -94,10 +95,7 @@ fn attach_perf_hw_cycles_event<'a>(skel: &mut BpfSkel<'a>) -> Result<Vec<Link>> 
     Ok(perf_links)
 }
 
-fn load_bpf_scheduler(
-    verbose: u8,
-    open_object: &mut MaybeUninit<OpenObject>,
-) -> Result<(Link, BpfSkel, Vec<Link>)> {
+fn load_bpf_scheduler(verbose: u8, open_object: &mut MaybeUninit<OpenObject>) -> Result<(Link, BpfSkel, Vec<Link>)> {
     // Increase MEMLOCK size since the BPF scheduler might use
     // more than the current limit
     try_set_rlimit_infinity();
@@ -111,18 +109,12 @@ fn load_bpf_scheduler(
     // none needed at the moment - can set cpu later
 
     // reuse the pinned map
-    let gru = reuse_pinned_map(&mut skel.maps.gMap, SCHED_GROUP_MAP_PATH);
-    let cru = reuse_pinned_map(&mut skel.maps.cMap, CGROUP_MAP_PATH);
+    assert!(reuse_pinned_map(&mut skel.maps.gMap, SCHED_GROUP_MAP_PATH));
+    assert!(reuse_pinned_map(&mut skel.maps.cMap, CGROUP_MAP_PATH));
+    assert!(reuse_pinned_map(&mut skel.maps.gStats, SCHED_GROUP_STATS_MAP_PATH));
 
     // load the scheduler
     let mut skel = scx_ops_load!(skel, finesched_ops, uei)?;
-
-    if !gru {
-        pin_map(&mut skel.maps.gMap, SCHED_GROUP_MAP_PATH);
-    }
-    if !cru {
-        pin_map(&mut skel.maps.cMap, CGROUP_MAP_PATH);
-    }
 
     let perf_hw_cycles_links = attach_perf_hw_cycles_event(&mut skel).unwrap();
 
