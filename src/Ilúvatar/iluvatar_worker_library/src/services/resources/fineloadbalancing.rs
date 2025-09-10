@@ -1075,6 +1075,7 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
 
         if let Some(group_scheduler_stats) = self.shareddata.pgs.get_domain_scheduler_stats(gid) {
             debug!( tid=%tid, fqdn=%fqdn, group_freq=%group_scheduler_stats.avg_freq_mhz, "[finesched][warmcoremaximuscl][gstats]");
+            self.shareddata.pgs.update_domain_perf_target(gid, 512);
         }
         self.tid_gid_map.map.insert(tid.clone(), Arc::new(gid));
     }

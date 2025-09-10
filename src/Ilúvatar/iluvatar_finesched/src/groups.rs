@@ -81,7 +81,7 @@ impl PreAllocatedGroups {
                 timeslice: group.ts, // in ms
                 fifo: group.fifo,
                 prio: enqprio_name_to_val(&group.prio),
-                perf: 3,
+                perf: 1024, // Max perf target for schedutils.
             };
             sm.gmap_insert(&gid, &sg);
         });
@@ -104,6 +104,14 @@ impl PreAllocatedGroups {
         };
         self.cid_map.insert(cgroup_id.to_string(), cval);
         self.sm.cmap_insert(cgroup_id, &cval);
+    }
+
+    pub fn update_domain_timeslice(&self, gid: i32, timeslice: u64) {
+        let _ = self.sm.gmap_update_timeslice(&gid, timeslice);
+    }
+
+    pub fn update_domain_perf_target(&self, gid: i32, perf_target: u32) {
+        let _ = self.sm.gmap_update_perf_target(&gid, perf_target);
     }
 
     pub fn get_domain_scheduler_stats(&self, gid: i32) -> Option<SchedGroupStats> {

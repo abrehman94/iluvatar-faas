@@ -694,6 +694,8 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
         }
     }
 
+    scx_bpf_cpuperf_set(cpu, sched_chrs->perf);
+
     if (sched_chrs->fifo) {
         scx_bpf_dsq_insert(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, 0);
     } else {

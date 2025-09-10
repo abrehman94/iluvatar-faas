@@ -9,6 +9,9 @@ use crate::SchedGroupChrs;
 use crate::SchedGroupID;
 use crate::SchedGroupStats;
 
+use anyhow::bail;
+use anyhow::Result;
+
 // an arc reference can be shared among multiple threads
 #[derive(Debug)]
 pub struct SharedMapsSafe {
@@ -38,6 +41,26 @@ impl SharedMapsSafe {
     pub fn gmap_lookup(&self, key: &SchedGroupID) -> Option<SchedGroupChrs> {
         let gMap: &mut dyn GMAP = deref_sm_lock!(self.sm.lock().unwrap());
         gMap.lookup(key)
+    }
+
+    pub fn gmap_update_timeslice(&self, key: &SchedGroupID, timeslice: u64) -> Result<()> {
+        let gMap: &mut dyn GMAP = deref_sm_lock!(self.sm.lock().unwrap());
+        if let Some(mut group_characteristics) = gMap.lookup(key) {
+            group_characteristics.timeslice = timeslice;
+            gMap.insert(key, &group_characteristics);
+            return Ok(());
+        }
+        bail!("key: {key} not found")
+    }
+
+    pub fn gmap_update_perf_target(&self, key: &SchedGroupID, perf_target: u32) -> Result<()> {
+        let gMap: &mut dyn GMAP = deref_sm_lock!(self.sm.lock().unwrap());
+        if let Some(mut group_characteristics) = gMap.lookup(key) {
+            group_characteristics.perf = perf_target;
+            gMap.insert(key, &group_characteristics);
+            return Ok(());
+        }
+        bail!("key: {key} not found")
     }
 
     pub fn gstats_lookup(&self, key: &SchedGroupID) -> Option<SchedGroupStats> {
