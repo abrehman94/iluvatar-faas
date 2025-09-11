@@ -167,34 +167,29 @@ pub struct FunctionLimits {
     pub timeout_sec: u64,
 }
 
-
-
 #[derive(Debug, Deserialize, Default)]
 /// Fine scheduling configuration
 pub struct FineSchedConfig {
-    
-    /// PreallocGroupsConfig 
+    /// PreallocGroupsConfig
     ///     schedgroup
-    ///         sched domain - single queue 
-    ///             fifo 
-    ///             prio queue 
+    ///         sched domain - single queue
+    ///             fifo
+    ///             prio queue
     ///                 arrival
     ///                 srpt
     ///                 invoc
     pub preallocated_groups: PreallocGroupsConfig,
-    
+
     /// Dispatch policy fqdn -> schedgroup
-    ///   roundrobin, staticselect, sizebucketassign, leastworkleft, 
+    ///   roundrobin, staticselect, sizebucketassign, leastworkleft,
     pub dispatchpolicy: String,
 
     /// "e2e_buckets":  [  ],
     pub e2e_buckets: Vec<i32>,
 
-
-
     /// "static_sel_conc_limit"         : {
     ///      "torch_rnn"       : 0,
-    ///      "float_operation" : 1 
+    ///      "float_operation" : 1
     ///  },
     pub static_sel_conc_limit: HashMap<String, i32>,
 
@@ -206,8 +201,13 @@ pub struct FineSchedConfig {
 
     /// at least two to circumvent the latency of group switch and keep cores warm    
     pub concur_limit: u32,
-    
-    /// verbose logs from bpf skeleton load 
+
+    /// Global frequency target [0,1024].
+    /// 0 -> Use default schedutil.
+    /// [1,1024] -> Provide perf target to schedutil using scx_bpf_cpuperf_set.
+    pub freq_target: u32,
+
+    /// verbose logs from bpf skeleton load
     pub bpf_verbose: u8,
 }
 
@@ -264,7 +264,10 @@ pub struct StatusConfig {
 pub type WorkerConfig = Arc<Configuration>;
 
 impl Configuration {
-    pub fn new(config_fpath: &Option<&str>, overrides: Option<Vec<(String, String)>>) -> anyhow::Result<Self> {
+    pub fn new(
+        config_fpath: &Option<&str>,
+        overrides: Option<Vec<(String, String)>>,
+    ) -> anyhow::Result<Self> {
         let mut sources = vec!["worker/src/worker.json", "worker/src/worker.dev.json"];
         if let Some(config_fpath) = config_fpath {
             sources.push(config_fpath);

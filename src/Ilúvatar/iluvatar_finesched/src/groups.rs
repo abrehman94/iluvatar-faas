@@ -81,7 +81,7 @@ impl PreAllocatedGroups {
                 timeslice: group.ts, // in ms
                 fifo: group.fifo,
                 prio: enqprio_name_to_val(&group.prio),
-                perf: 1024, // Max perf target for schedutils.
+                perf: 0, // 0 means don't set the target. Max perf target for schedutils is 1024.
             };
             sm.gmap_insert(&gid, &sg);
         });

@@ -62,8 +62,19 @@ pub trait LoadBalancingPolicyT {
     async fn block_container_acquire(&self, _tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         debug!( _tid=%_tid, fqdn=%reg.fqdn, "[finesched] default handler block container acquire in LoadBalancingPolicyT");
     }
-    fn invoke(&self, _cgroup_id: &str, _tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Option<SchedGroupID>;
-    fn invoke_complete(&self, _cgroup_id: &str, _tid: &TransactionId, reg: Arc<RegisteredFunction>) {}
+    fn invoke(
+        &self,
+        _cgroup_id: &str,
+        _tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID>;
+    fn invoke_complete(
+        &self,
+        _cgroup_id: &str,
+        _tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) {
+    }
 }
 
 pub type LoadBalancingPolicyTRef = Arc<dyn LoadBalancingPolicyT + Sync + Send>;
@@ -238,7 +249,7 @@ impl DynamicAllowance {
 
 struct DomConcurrencyLimiter {
     waiters: DashMap<SchedGroupID, Arc<Notify>>, // tid -> waiting primitive
-    local_gidstats: GidStats,                    // it needs it's own gitstats tracking to avoid race conditions
+    local_gidstats: GidStats, // it needs it's own gitstats tracking to avoid race conditions
 }
 
 impl DomConcurrencyLimiter {
@@ -307,7 +318,12 @@ impl DomZero {
 }
 
 impl LoadBalancingPolicyT for DomZero {
-    fn invoke(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Option<SchedGroupID> {
+    fn invoke(
+        &self,
+        cgroup_id: &str,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
         return Some(0);
     }
 }
@@ -330,7 +346,12 @@ impl RoundRobin {
 }
 
 impl LoadBalancingPolicyT for RoundRobin {
-    fn invoke(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Option<SchedGroupID> {
+    fn invoke(
+        &self,
+        cgroup_id: &str,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
         let mut gid = self.nextgid.value.fetch_add(1, Ordering::Relaxed);
         let tgroups = self.shareddata.pgs.total_groups() as i32;
         if gid >= tgroups {
@@ -361,7 +382,12 @@ impl RoundRobinRL {
 }
 
 impl LoadBalancingPolicyT for RoundRobinRL {
-    fn invoke(&self, cgroup_id: &str, _tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Option<SchedGroupID> {
+    fn invoke(
+        &self,
+        cgroup_id: &str,
+        _tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
         let lgid = self.lastgid.get(cgroup_id);
         if lgid.is_none() {
             let mut gid = self.nextgid.value.fetch_add(1, Ordering::Relaxed);
@@ -402,7 +428,12 @@ fn match_pattern(pattern: &str, line: &str) -> bool {
 }
 
 impl LoadBalancingPolicyT for StaticSelect {
-    fn invoke(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Option<SchedGroupID> {
+    fn invoke(
+        &self,
+        _cgroup_id: &str,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
         let fqdn = reg.fqdn.as_str();
         let dur = self.shareddata.cmap.get_exec_time(fqdn);
         debug!( fqdn=%fqdn, cgroup_id=%_cgroup_id, tid=%tid, dur=%dur,  "[finesched] static select dispatch policy" );
@@ -488,13 +519,125 @@ impl LoadBalancingPolicyT for StaticSelectCL {
         }
     }
 
-    fn invoke(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Option<SchedGroupID> {
+    fn invoke(
+        &self,
+        cgroup_id: &str,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
         let fqdn = reg.fqdn.as_str();
         debug!( tid=%tid, fqdn=%fqdn, "[finesched][staticselcl] invoke handler ");
         return self.selpolicy.invoke(cgroup_id, tid, reg.clone());
     }
 
-    fn invoke_complete(&self, _cgroup_id: &str, tid: &TransactionId, _reg: Arc<RegisteredFunction>) {
+    fn invoke_complete(
+        &self,
+        _cgroup_id: &str,
+        tid: &TransactionId,
+        _reg: Arc<RegisteredFunction>,
+    ) {
+        debug!( tid=%tid, "[finesched][staticselcl] invoke_complete handler ");
+
+        let gid = self.selpolicy.shareddata.maptidstats.get(tid).unwrap();
+        self.domlimiter.return_group(*gid.value());
+    }
+}
+
+////////////////////////////////////
+/// Static Select Proactive Frequency Target Load Balancing Policy
+
+pub struct LBStaticFrequencyTarget {
+    selpolicy: StaticSelect,
+
+    _conlimit_org: HashMap<String, i32>, // func -> conlimit - as per config
+    conlimit: HashMap<i32, i32>,         // gid -> conlimit
+
+    domlimiter: DomConcurrencyLimiter,
+
+    freq_target: u32,
+}
+
+impl LBStaticFrequencyTarget {
+    pub fn new(
+        shareddata: SharedData,
+        static_sel_buckets: HashMap<String, i32>,
+        static_con_limit: HashMap<String, i32>,
+        freq_target: u32,
+    ) -> Self {
+        let mut conlimit = HashMap::new();
+        for (func, cl) in static_con_limit.iter() {
+            let cl = *cl;
+            let gid = static_sel_buckets.get(func).unwrap();
+            let clo = conlimit.get(gid);
+            if let Some(clo) = clo {
+                conlimit.insert(*gid, cl + clo);
+            } else {
+                conlimit.insert(*gid, cl);
+            }
+        }
+
+        let local_gidstats = GidStats::new(shareddata.pgs.clone());
+        let domlimiter = DomConcurrencyLimiter::new(local_gidstats);
+
+        LBStaticFrequencyTarget {
+            selpolicy: StaticSelect {
+                shareddata,
+                static_sel_buckets,
+            },
+
+            _conlimit_org: static_con_limit,
+            conlimit,
+
+            domlimiter,
+
+            freq_target,
+        }
+    }
+}
+
+#[async_trait]
+impl LoadBalancingPolicyT for LBStaticFrequencyTarget {
+    async fn block_container_acquire(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        let fqdn = reg.fqdn.as_str();
+
+        debug!( tid=%tid, fqdn=%fqdn, "[finesched][staticselcl] blocking handler ");
+        let gid = self.selpolicy.invoke("", tid, reg.clone());
+        if let Some(gid) = gid {
+            // check if acquiring this gid is within concurrency limit
+            let current = self.domlimiter.acquire_group(gid);
+            let climit = self.conlimit.get(&gid).unwrap();
+
+            if current >= *climit {
+                debug!( tid=%tid, fqdn=%fqdn, gid=%gid, current=%current, climit=%climit, "[finesched][staticselcl] blocking given tid until a gid becomes available");
+                self.domlimiter.wait_for_group(gid).await;
+            }
+
+            if (self.freq_target != 0) {
+                self.selpolicy
+                    .shareddata
+                    .pgs
+                    .update_domain_perf_target(gid, self.freq_target);
+            }
+        }
+    }
+
+    fn invoke(
+        &self,
+        cgroup_id: &str,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
+        let fqdn = reg.fqdn.as_str();
+        debug!( tid=%tid, fqdn=%fqdn, "[finesched][staticselcl] invoke handler ");
+        return self.selpolicy.invoke(cgroup_id, tid, reg.clone());
+    }
+
+    fn invoke_complete(
+        &self,
+        _cgroup_id: &str,
+        tid: &TransactionId,
+        _reg: Arc<RegisteredFunction>,
+    ) {
         debug!( tid=%tid, "[finesched][staticselcl] invoke_complete handler ");
 
         let gid = self.selpolicy.shareddata.maptidstats.get(tid).unwrap();
@@ -765,7 +908,11 @@ impl WarmCoreMaximusCL {
                 debug!( tid=%tid, domid=%domid, serving_fqdn=%serving_fqdn, timesince=%timesince, "[finesched][warmcoremaximuscl] reclamation worker - time since last used" );
             }
 
-            let domserving_count = self.domlimiter.local_gidstats.fetch_current(*domid).unwrap_or(0);
+            let domserving_count = self
+                .domlimiter
+                .local_gidstats
+                .fetch_current(*domid)
+                .unwrap_or(0);
             if domserving_count == 0 && too_old {
                 if adom.id != consts_RESERVED_GID_UNASSIGNED {
                     *adom = Default::default();
@@ -818,12 +965,15 @@ impl WarmCoreMaximusCL {
         // acquire the selected dom, check limit and return if all good
         if sel_dom.id != consts_RESERVED_GID_UNASSIGNED {
             // we must check if the dom can accomodate foreign requests
-            let fcount = self.domlimiter.acquire_x_from_group(sel_dom.id, reg.cpus as i32);
+            let fcount = self
+                .domlimiter
+                .acquire_x_from_group(sel_dom.id, reg.cpus as i32);
             let flimit = fhist.dom_limits.get_or_create(&sel_dom.id).get_limit();
             if fcount < flimit {
                 return Some(sel_dom.id);
             }
-            self.domlimiter.return_x_to_group(sel_dom.id, reg.cpus as i32);
+            self.domlimiter
+                .return_x_to_group(sel_dom.id, reg.cpus as i32);
         }
 
         None
@@ -840,7 +990,11 @@ impl WarmCoreMaximusCL {
                 doms.push((*domstate).clone());
             } else {
                 // only doms which have capacity within their native limits are considered fillable
-                let concur = self.domlimiter.local_gidstats.fetch_current(*domid).unwrap();
+                let concur = self
+                    .domlimiter
+                    .local_gidstats
+                    .fetch_current(*domid)
+                    .unwrap();
                 let fhist = self.func_history.get_or_create(&(serving_fqdn.to_string()));
                 let limit = fhist.dom_limits.get_or_create(domid).get_limit();
                 if concur < limit {
@@ -868,7 +1022,11 @@ impl WarmCoreMaximusCL {
     }
 
     /// Checks with domlimiter before handing over the gid  
-    async fn find_available_dom(&self, reg: Arc<RegisteredFunction>, tid: &TransactionId) -> Option<SchedGroupID> {
+    async fn find_available_dom(
+        &self,
+        reg: Arc<RegisteredFunction>,
+        tid: &TransactionId,
+    ) -> Option<SchedGroupID> {
         let fqdn = reg.fqdn.as_str();
 
         // first check if a dom is already allocated to fqdn in it's history
@@ -912,7 +1070,9 @@ impl WarmCoreMaximusCL {
         // if not just wait to be wokeup by a completed request
         while true {
             // acquire whatever found from domlimiter and return
-            let current = self.domlimiter.acquire_x_from_group(assigned_gid, reg.cpus as i32);
+            let current = self
+                .domlimiter
+                .acquire_x_from_group(assigned_gid, reg.cpus as i32);
 
             // check if concurrency of domilimiter is within limit
             let limit = fhist.dom_limits.get_or_create(&assigned_gid).get_limit();
@@ -933,7 +1093,11 @@ impl WarmCoreMaximusCL {
 
                     // choose native dom before continuing to foreign dom
                     let limit = fhist.dom_limits.get_or_create(&assigned_gid).get_limit();
-                    let current_count = self.shareddata.mapgidstats.fetch_current(assigned_gid).unwrap_or(0);
+                    let current_count = self
+                        .shareddata
+                        .mapgidstats
+                        .fetch_current(assigned_gid)
+                        .unwrap_or(0);
                     debug!( fqdn=%fqdn, tid=%tid, assigned_gid=%assigned_gid, current=%current, limit=%limit, current_count=%current_count, "[finesched][warmcoremaximuscl][find_available_dom] woken up assigned_gid" );
                     if current_count < limit {
                         break;
@@ -1042,7 +1206,8 @@ impl WarmCoreMaximusCL {
         let mut wakeups = 2;
         while wakeups > 0 {
             self.domlimiter.acquire_group(domstate.id); // acquire the group
-            self.domlimiter.return_x_to_group(domstate.id, reg.cpus as i32); // return to wakeup
+            self.domlimiter
+                .return_x_to_group(domstate.id, reg.cpus as i32); // return to wakeup
 
             wakeups -= 1;
         }
@@ -1063,9 +1228,12 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
             if let Some(gid) = gid {
                 break gid;
             }
-            self.domlimiter.acquire_group(consts_RESERVED_GID_UNASSIGNED);
+            self.domlimiter
+                .acquire_group(consts_RESERVED_GID_UNASSIGNED);
             debug!( tid=%tid, fqdn=%fqdn, "[finesched][warmcoremaximuscl] blocking handler waiting 404 ");
-            self.domlimiter.wait_for_group(consts_RESERVED_GID_UNASSIGNED).await;
+            self.domlimiter
+                .wait_for_group(consts_RESERVED_GID_UNASSIGNED)
+                .await;
         };
 
         debug!( tid=%tid, fqdn=%fqdn, gid=%gid, "[finesched][warmcoremaximuscl][got_gid] blocking handler ");
@@ -1075,12 +1243,17 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
 
         if let Some(group_scheduler_stats) = self.shareddata.pgs.get_domain_scheduler_stats(gid) {
             debug!( tid=%tid, fqdn=%fqdn, group_freq=%group_scheduler_stats.avg_freq_mhz, "[finesched][warmcoremaximuscl][gstats]");
-            self.shareddata.pgs.update_domain_perf_target(gid, 512);
+            self.shareddata.pgs.update_domain_perf_target(gid, 250);
         }
         self.tid_gid_map.map.insert(tid.clone(), Arc::new(gid));
     }
 
-    fn invoke(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Option<SchedGroupID> {
+    fn invoke(
+        &self,
+        cgroup_id: &str,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
         debug!( tid=%tid, "[finesched][warmcoremaximuscl] invoke handler ");
         self.tid_gid_map.get(tid).map(|v| *v)
     }
@@ -1112,7 +1285,12 @@ impl LWLInvoc {
 }
 
 impl LoadBalancingPolicyT for LWLInvoc {
-    fn invoke(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Option<SchedGroupID> {
+    fn invoke(
+        &self,
+        cgroup_id: &str,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
         let mut gid: Option<SchedGroupID> = None;
         let mut min_count = i32::MAX;
 
@@ -1150,7 +1328,12 @@ impl SITA {
 }
 
 impl LoadBalancingPolicyT for SITA {
-    fn invoke(&self, cgroup_id: &str, tid: &TransactionId, _reg: Arc<RegisteredFunction>) -> Option<SchedGroupID> {
+    fn invoke(
+        &self,
+        cgroup_id: &str,
+        tid: &TransactionId,
+        _reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
         let mut gid: Option<SchedGroupID> = None;
         let mut min_count = i32::MAX;
 
