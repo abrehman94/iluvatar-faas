@@ -205,7 +205,14 @@ pub struct FineSchedConfig {
     /// Global frequency target [0,1024].
     /// 0 -> Use default schedutil.
     /// [1,1024] -> Provide perf target to schedutil using scx_bpf_cpuperf_set.
+    #[serde(default)]
     pub freq_target: u32,
+
+    /// Guardrails tightness [1..].
+    pub guardrails_tightness: u32,
+
+    /// Guardrails log_base_c [2..].
+    pub guardrails_log_base_c: u32,
 
     /// verbose logs from bpf skeleton load
     pub bpf_verbose: u8,

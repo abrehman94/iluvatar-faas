@@ -675,15 +675,15 @@ impl DomState {
         for gid in 0..pgs.total_groups() {
             let gid = gid as SchedGroupID;
             let bpfdom_config = pgs.get_schedgroup(gid).unwrap();
-            doms.map.insert(
+            doms.insert(
                 gid,
-                Arc::new(DomState {
+                DomState {
                     bpfdom_config: bpfdom_config.clone(),
                     serving_fqdn: ClonableMutex::new("".to_string()),
                     last_used_ts: ClonableMutex::new(0),
                     last_limit_up_ts: ClonableMutex::new(0),
                     id: gid,
-                }),
+                },
             );
         }
         doms
@@ -868,9 +868,8 @@ impl WarmCoreMaximusCL {
 
     async fn waker_worker(self: Arc<Self>, tid: TransactionId) {
         while self.domlimiter.return_group(consts_RESERVED_GID_UNASSIGNED) != 0 {}
-        for kvref in self.doms.map.iter() {
-            let domid = kvref.key();
-            let domstate = kvref.value();
+        for kvref in self.doms.immutable_clone().iter() {
+            let (domid, domstate) = kvref;
             let serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
             if serving_fqdn.len() > 0 {
                 self.domlimiter.acquire_x_from_group(*domid, 1);
@@ -885,9 +884,8 @@ impl WarmCoreMaximusCL {
         let doms = &self.doms;
 
         // reclaim domains that have been unused since last time
-        for kvref in doms.map.iter() {
-            let domid = kvref.key();
-            let domstate = kvref.value();
+        for kvref in self.doms.immutable_clone().iter() {
+            let (domid, domstate) = kvref;
             let serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
             let fhist = self.func_history.get_or_create(&serving_fqdn);
             let mut adom = fhist.assigned_dom.value.lock().unwrap();
@@ -981,9 +979,8 @@ impl WarmCoreMaximusCL {
 
     fn set_of_domains_fillable(&self) -> Vec<Arc<DomState>> {
         let mut doms = vec![];
-        for kvref in self.doms.map.iter() {
-            let domid = kvref.key();
-            let domstate = kvref.value();
+        for kvref in self.doms.immutable_clone().iter() {
+            let (domid, domstate) = kvref;
             let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
             // unassigned
             if *domid != consts_RESERVED_GID_UNASSIGNED && serving_fqdn.len() == 0 {
@@ -1008,9 +1005,8 @@ impl WarmCoreMaximusCL {
 
     fn find_empty_domain(&self, fqdn: &str) -> Option<Arc<DomState>> {
         // iterate over available domains and find an empty one
-        for kvref in self.doms.map.iter() {
-            let domid = kvref.key();
-            let domstate = kvref.value();
+        for kvref in self.doms.immutable_clone().iter() {
+            let (domid, domstate) = kvref;
             let mut serving_fqdn = domstate.serving_fqdn.value.lock().unwrap();
             debug!( domid=%domid, serving_fqdn=%serving_fqdn, "[finesched][warmcoremaximuscl] traversing empty doms" );
             // 404 dom would always be empty
@@ -1245,7 +1241,7 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
             debug!( tid=%tid, fqdn=%fqdn, group_freq=%group_scheduler_stats.avg_freq_mhz, "[finesched][warmcoremaximuscl][gstats]");
             self.shareddata.pgs.update_domain_perf_target(gid, 250);
         }
-        self.tid_gid_map.map.insert(tid.clone(), Arc::new(gid));
+        self.tid_gid_map.insert(tid.clone(), gid);
     }
 
     fn invoke(
@@ -1266,7 +1262,7 @@ impl LoadBalancingPolicyT for WarmCoreMaximusCL {
         self.return_and_update_concurrency_limit(reg, *gid, tid);
 
         // cleanup
-        self.tid_gid_map.map.remove(tid);
+        self.tid_gid_map.remove(tid);
         while self.domlimiter.return_group(consts_RESERVED_GID_UNASSIGNED) != 0 {}
     }
 }
@@ -1358,74 +1354,189 @@ impl LoadBalancingPolicyT for SITA {
 }
 
 ////////////////////////////////////
-/// MQFQ - produce a set of domain ids
+/// Guardrails
 
-pub struct MQFQ {
-    shareddata: SharedData,
-    tranks: u32,        // total ranks
-    c: f64,             // log_c -- 1.3 for row 0.8
-    g: u32,             // tightness bound uptil next rank - g >= 1
-    grs: Vec<Vec<u32>>, // counter for each rank within each sched domain
+type GRRankID = u32;
+
+#[derive(Clone, Default)]
+pub struct GRRankStats {
+    sched_domain_counters: ClonableMutex<Vec<u32>>,
 }
 
-// impl MQFQ {
-//     pub fn new( shareddata: SharedData ) -> Self {
-//         MQFQ {
-//             shareddata,
-//             c
-//         }
-//     }
-//
-//     /// dur in ms to rank
-//     fn get_rank( &self, dur: f64 ) -> f64 {
-//         // ceil( log_c( dur ) )
-//         0.0
-//     }
-//
-//     /// min counter for a given rank across all domains
-//     fn min_counter( &self, rank: u32 ) -> u32 {
-//         0
-//     }
-//
-//     /// set of domains that satisfy the tight bound
-//     /// G
-//     fn get_safe_domains( &self, min_count: u32, rank: u32 ){
-//     }
-//
-//     pub fn set_of_domains(&self, _cgroup_id: &str, _tid: &TransactionId, _fqdn: &str ) -> Vec<SchedGroupID> {
-//         let mut gids: Vec<SchedGroupID> = Vec::new();
-//         let mut min_count = u32::MAX;
-//
-//         // directly iterating over self.shareddata.mapgidstats produces random order
-//         // due to the randomized hashing of dashmap
-//         // we want to prefer lower numbered domai[1;38;5;9merror[internal][0m: [1mleft behind trailing whitespace[0m
-//         for lgid in 0..self.shareddata.pgs.total_groups() {
-//             let lgid = lgid as SchedGroupID;
-//             let lcount = self.shareddata.mapgidstats.get(&lgid).unwrap();
-//
-//             if *lcount == 0 {
-//                 gids.push(lgid);
-//             } else if *lcount < min_count {
-//                 min_count = *lcount;
-//                 gids.clear();
-//                 gids.push(lgid);
-//             }
-//         }
-//
-//         gids
-//     }
-// }
-//
-//
-// #[cfg(test)]
-// mod testsfineloadbalancing {
-//     use super::*;
-//     use libm::log2;
-//
-//     #[test]
-//     fn basic_logc_test() {
-//         let y = log2( 4.0 );
-//         print!( "y = {} \n", y );
-//         assert_eq!( 1.0, 2.0 );
-//     }
-// }
+#[derive(Clone, Default)]
+pub struct GRSchedDomainStats {
+    scheduled_invocations: ClonableAtomicU32,
+}
+
+#[derive(Clone, Default)]
+pub struct GRTransactionStats {
+    domain_id: SchedGroupID,
+}
+
+pub struct Guardrails {
+    shareddata: SharedData,
+
+    tightness: u32,  // g
+    log_base_c: u32, // c, execution time cutoff in ms > 2
+
+    domain_stats_map: ArcMap<SchedGroupID, GRSchedDomainStats>,
+    transaction_stats_map: ArcMap<TransactionId, GRTransactionStats>,
+    rank_stats_map: ArcMap<GRRankID, GRRankStats>,
+}
+
+impl Guardrails {
+    pub fn new(shareddata: SharedData, tightness: u32, log_base_c: u32) -> Self {
+        Guardrails {
+            shareddata,
+
+            tightness,
+            log_base_c,
+
+            domain_stats_map: ArcMap::new(),
+            transaction_stats_map: ArcMap::new(),
+            rank_stats_map: ArcMap::new(),
+        }
+    }
+
+    fn execution_duration_to_rank(&self, dur_ms: u32) -> u32 {
+        if dur_ms == 0 {
+            return 0;
+        }
+
+        dur_ms.ilog2() / self.log_base_c.ilog2()
+    }
+
+    fn expand_counters(&self, sched_domain_counters: &mut Vec<u32>, max_domain_id: SchedGroupID) {
+        while (sched_domain_counters.len() <= max_domain_id as usize) {
+            sched_domain_counters.push(0);
+        }
+    }
+
+    fn get_rank_stats(&self, rank: GRRankID) -> Arc<GRRankStats> {
+        match self.rank_stats_map.get(&rank) {
+            Some(stats) => stats,
+            None => {
+                for lrank in self.rank_stats_map.len()..(rank as usize + 1) {
+                    let lrank = lrank as GRRankID;
+
+                    let rank_stats = self.rank_stats_map.get_or_create(&lrank);
+                    let mut sched_domain_counters =
+                        rank_stats.sched_domain_counters.value.lock().unwrap();
+                    self.expand_counters(
+                        &mut sched_domain_counters,
+                        self.shareddata.pgs.total_groups() as SchedGroupID,
+                    );
+                }
+
+                self.rank_stats_map.get(&rank).unwrap()
+            }
+        }
+    }
+
+    fn set_of_safe_domains(&self, rank: GRRankID, dur_ms: u32) -> Vec<SchedGroupID> {
+        let rank_stats = self.get_rank_stats(rank);
+        let mut sched_domain_counters = rank_stats.sched_domain_counters.value.lock().unwrap();
+
+        let rank_min_counter = *sched_domain_counters.iter().min().unwrap();
+
+        let is_safe_domain = move |arg: &(usize, &u32)| {
+            let (index, domain_counter) = arg;
+            *domain_counter + dur_ms
+                <= rank_min_counter + self.tightness * self.log_base_c.pow(rank + 1)
+        };
+
+        let type_cast = |arg: (usize, &u32)| {
+            let (index, domain_counter) = arg;
+            index as i32
+        };
+
+        sched_domain_counters
+            .iter()
+            .enumerate()
+            .filter(is_safe_domain)
+            .map(type_cast)
+            .collect()
+    }
+
+    fn reset_domain(&self, domain_id: SchedGroupID) {
+        let total_ranks = self.rank_stats_map.len();
+        for rank in 0..total_ranks {
+            let rank = rank as GRRankID;
+            let rank_stats = self.get_rank_stats(rank);
+
+            let mut sched_domain_counters = rank_stats.sched_domain_counters.value.lock().unwrap();
+
+            sched_domain_counters[domain_id as usize] =
+                *sched_domain_counters.iter().min().unwrap();
+        }
+    }
+}
+
+impl LoadBalancingPolicyT for Guardrails {
+    fn invoke(
+        &self,
+        _cgroup_id: &str,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
+        let fqdn = reg.fqdn.as_str();
+
+        let execution_dur_ms = (self.shareddata.cmap.get_exec_time(fqdn) * 1000.0) as u32;
+        let rank = self.execution_duration_to_rank(execution_dur_ms);
+        debug!( tid=%tid, fqdn=%fqdn, execution_dur_ms=%execution_dur_ms, rank=%rank, "[finesched][guardrails] execution duration to rank");
+
+        let safe_domains = self.set_of_safe_domains(rank, execution_dur_ms);
+        debug!( tid=%tid, fqdn=%fqdn, execution_dur_ms=%execution_dur_ms, rank=%rank, safe_domains=?safe_domains, "[finesched][guardrails] set of safe domains");
+        assert!(safe_domains.len() != 0);
+
+        let mut domain_id: SchedGroupID = safe_domains[0];
+
+        let domain_stats = self.domain_stats_map.get_or_create(&domain_id);
+        let _ = domain_stats
+            .scheduled_invocations
+            .value
+            .fetch_add(1, Ordering::Relaxed);
+
+        let rank_stats = self.get_rank_stats(rank);
+        let mut sched_domain_counters = rank_stats.sched_domain_counters.value.lock().unwrap();
+
+        sched_domain_counters[domain_id as usize] += execution_dur_ms;
+        debug!( tid=%tid, fqdn=%fqdn, execution_dur_ms=%execution_dur_ms, rank=%rank, domain_id=%domain_id, sched_domain_counters=?sched_domain_counters, "[finesched][guardrails] rank counters");
+
+        self.transaction_stats_map
+            .insert(tid.clone(), GRTransactionStats { domain_id });
+
+        Some(domain_id)
+    }
+
+    fn invoke_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        let fqdn = reg.fqdn.as_str();
+
+        let transaction_stats = self.transaction_stats_map.get(&tid).unwrap();
+
+        let domain_stats = self
+            .domain_stats_map
+            .get(&transaction_stats.domain_id)
+            .unwrap();
+
+        let _ = domain_stats
+            .scheduled_invocations
+            .value
+            .fetch_sub(1, Ordering::Relaxed);
+
+        debug!( tid=%tid, fqdn=%fqdn, domain_id=%transaction_stats.domain_id, remaining_invocations=%domain_stats
+            .scheduled_invocations
+            .value
+            .load(Ordering::Relaxed), "[finesched][guardrails] invocation complete");
+
+        if (domain_stats
+            .scheduled_invocations
+            .value
+            .load(Ordering::Relaxed)
+            == 0)
+        {
+            debug!( tid=%tid, fqdn=%fqdn, domain_id=%transaction_stats.domain_id, "[finesched][guardrails] domain reset");
+            self.reset_domain(transaction_stats.domain_id);
+        }
+    }
+}

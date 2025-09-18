@@ -23,8 +23,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::services::resources::arc_map::ClonableAtomicI32;
 use crate::services::resources::fineloadbalancing::{
-    DomZero, LBStaticFrequencyTarget, LWLInvoc, LoadBalancingPolicyTRef, RoundRobin, RoundRobinRL,
-    SharedData, StaticSelect, StaticSelectCL, WarmCoreMaximusCL,
+    DomZero, Guardrails, LBStaticFrequencyTarget, LWLInvoc, LoadBalancingPolicyTRef, RoundRobin,
+    RoundRobinRL, SharedData, StaticSelect, StaticSelectCL, WarmCoreMaximusCL,
 };
 use iluvatar_finesched::consts_RESERVED_GID_SWITCH_BACK;
 use iluvatar_finesched::PreAllocatedGroups;
@@ -155,6 +155,14 @@ impl CpuGroupsResourceTracker {
             .to_lowercase()
             .as_str()
         {
+            "guardrails" => {
+                debug!( tid=%tid, "[finesched] using guardrails dispatch policy" );
+                Arc::new(Guardrails::new(
+                    shareddata,
+                    config.guardrails_tightness,
+                    config.guardrails_log_base_c,
+                ))
+            }
             "warmcoremaximuscl" => {
                 debug!( tid=%tid, "[finesched] using warmcoremaximuscl dispatch policy" );
                 WarmCoreMaximusCL::new(shareddata)

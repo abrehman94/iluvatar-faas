@@ -1,19 +1,20 @@
-
-use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::sync::Mutex;
-use dashmap::DashMap;
 
-pub struct ClonableMutex<T> 
-    where T: Clone + Default
+pub struct ClonableMutex<T>
+where
+    T: Clone + Default,
 {
     pub value: Mutex<T>,
 }
 
-impl <T> Default for ClonableMutex<T> 
-    where T: Clone + Default
+impl<T> Default for ClonableMutex<T>
+where
+    T: Clone + Default,
 {
     fn default() -> Self {
         ClonableMutex {
@@ -22,8 +23,9 @@ impl <T> Default for ClonableMutex<T>
     }
 }
 
-impl<T> ClonableMutex<T> 
-    where T: Clone + Default
+impl<T> ClonableMutex<T>
+where
+    T: Clone + Default,
 {
     pub fn new(value: T) -> Self {
         ClonableMutex {
@@ -32,8 +34,9 @@ impl<T> ClonableMutex<T>
     }
 }
 
-impl<T> Clone for ClonableMutex<T> 
-    where T: Clone + Default
+impl<T> Clone for ClonableMutex<T>
+where
+    T: Clone + Default,
 {
     fn clone(&self) -> Self {
         ClonableMutex {
@@ -44,7 +47,7 @@ impl<T> Clone for ClonableMutex<T>
 
 /////////////////////////////////////////////////////////////////////////
 /// Ugly Code - Can use procedural macros to generate clonable atomics for
-/// each atomic type - needs it's own crate - maybe some other time 
+/// each atomic type - needs it's own crate - maybe some other time
 
 pub struct ClonableAtomicU32 {
     pub value: AtomicU32,
@@ -95,9 +98,10 @@ impl ClonableAtomicI32 {
             let sub = if val > current { current } else { val };
             let new = current - sub;
 
-            if self.value
+            if self
+                .value
                 .compare_exchange(current, new, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
+                .is_ok()
             {
                 break current;
             }
@@ -121,79 +125,98 @@ impl Clone for ClonableAtomicI32 {
     }
 }
 
-
-
-
-/// Ugly Code ends 
+/// Ugly Code ends
 ///////////////////////////////////////
 
-
-
 #[derive(Debug)]
-pub struct ArcMap<K,V> 
-    where K: Eq + std::hash::Hash + Clone,
-          V: Clone + Default
+pub struct ArcMap<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: Clone + Default,
 {
-    pub map: DashMap<K, Arc<V>>,
+    map: Mutex<HashMap<K, Arc<V>>>,
 }
 
-impl<K,V> Clone for ArcMap<K, V> 
-    where K: Eq + std::hash::Hash + Clone,
-          V: Clone + Default
+impl<K, V> Clone for ArcMap<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: Clone + Default,
 {
     fn clone(&self) -> Self {
         ArcMap {
-            map: self.map.clone(),
+            map: Mutex::new(self.map.lock().unwrap().clone()),
         }
     }
 }
 
-impl <K, V> ArcMap<K, V> 
-    where K: Eq + std::hash::Hash + Clone,
-          V: Clone + Default
+impl<K, V> ArcMap<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: Clone + Default,
 {
     pub fn new() -> Self {
         ArcMap {
-            map: DashMap::new(),
+            map: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn get(&self, key: &K) -> Option<Arc<V>> {
-        self.map.get(key).map(|v| v.value().clone())
+        self.map.lock().unwrap().get(key).map(|v| v.clone())
     }
 
-    pub fn get_or_create( &self, key: &K ) -> Arc<V> {
-        match self.map.get( key ) {
-            Some( v ) => (*v.value()).clone(),
+    pub fn get_or_create(&self, key: &K) -> Arc<V> {
+        let mut map = self.map.lock().unwrap();
+        match map.get(key) {
+            Some(v) => v.clone(),
             None => {
                 let val: Arc<V> = Arc::new(Default::default());
-                self.map.insert( (*key).clone(), val.clone() );
-                val 
+                map.insert((*key).clone(), val.clone());
+                val
             }
         }
     }
 
-    pub fn get_or_insert( &self, key: &K, value: V ) -> Arc<V> {
-        match self.map.get( key ) {
-            Some( v ) => (*v.value()).clone(),
+    pub fn get_or_insert(&self, key: &K, value: V) -> Arc<V> {
+        let mut map = self.map.lock().unwrap();
+        match map.get(key) {
+            Some(v) => v.clone(),
             None => {
                 let val: Arc<V> = Arc::new(value);
-                self.map.insert( (*key).clone(), val.clone() );
-                val 
+                map.insert((*key).clone(), val.clone());
+                val
             }
         }
+    }
+
+    pub fn remove(&self, key: &K) -> Option<Arc<V>> {
+        let mut map = self.map.lock().unwrap();
+
+        map.remove(key)
+    }
+
+    pub fn insert(&self, key: K, value: V) -> Option<Arc<V>> {
+        let mut map = self.map.lock().unwrap();
+
+        map.insert(key, Arc::new(value))
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+
+    pub fn immutable_clone(&self) -> HashMap<K, Arc<V>> {
+        self.map.lock().unwrap().clone()
     }
 }
 
-impl<K,V> Default for ArcMap<K, V>
-    where K: Eq + std::hash::Hash + Clone,
-          V: Clone + Default
+impl<K, V> Default for ArcMap<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: Clone + Default,
 {
     fn default() -> Self {
         ArcMap {
-            map: DashMap::new(),
+            map: Mutex::new(HashMap::new()),
         }
     }
 }
-
-
