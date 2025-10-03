@@ -1,5 +1,7 @@
 use crate::services::resources::gpu::ProtectedGpuRef;
-use crate::services::{containers::containermanager::ContainerManager, registration::RegisteredFunction};
+use crate::services::{
+    containers::containermanager::ContainerManager, registration::RegisteredFunction,
+};
 use anyhow::Result;
 use iluvatar_library::{
     bail_error,
@@ -15,11 +17,15 @@ use tracing::debug;
 #[allow(dyn_drop)]
 pub trait ContainerT: ToAny + Send + Sync {
     /// Invoke the function within the container, passing the json args to it
-    async fn invoke(&self, json_args: &str, tid: &TransactionId) -> Result<(ParsedResult, Duration)>;
+    async fn invoke(
+        &self,
+        json_args: &str,
+        tid: &TransactionId,
+    ) -> Result<(ParsedResult, Duration)>;
 
     /// indicate that the container as been "used" or internal datatsructures should be updated such that it has
     fn touch(&self);
-     /// the kernfs cgroup name for this container
+    /// the kernfs cgroup name for this container
     fn cgroup_id(&self) -> &String;
     /// the unique ID for this container
     fn container_id(&self) -> &String;
@@ -134,7 +140,11 @@ pub struct ContainerLock {
 }
 
 impl ContainerLock {
-    pub fn new(container: Container, container_mrg: &Arc<ContainerManager>, tid: &TransactionId) -> Self {
+    pub fn new(
+        container: Container,
+        container_mrg: &Arc<ContainerManager>,
+        tid: &TransactionId,
+    ) -> Self {
         ContainerLock {
             container,
             container_mrg: container_mrg.clone(),

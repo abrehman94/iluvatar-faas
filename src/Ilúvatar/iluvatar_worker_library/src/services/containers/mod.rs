@@ -1,6 +1,8 @@
 use self::{docker::DockerIsolation, structs::ToAny};
 use super::{registration::RegisteredFunction, resources::gpu::GPU};
-use crate::services::containers::{containerd::ContainerdIsolation, simulator::SimulatorIsolation, structs::Container};
+use crate::services::containers::{
+    containerd::ContainerdIsolation, simulator::SimulatorIsolation, structs::Container,
+};
 use crate::services::network::namespace_manager::NamespaceManager;
 use crate::worker_api::worker_config::WorkerConfig;
 use anyhow::Result;
@@ -45,7 +47,12 @@ pub trait ContainerIsolationService: ToAny + Send + Sync + std::fmt::Debug {
     ) -> ResultErrorVal<Container, Option<GPU>>;
 
     /// removes a specific container, and all the related resources
-    async fn remove_container(&self, container_id: Container, ctd_namespace: &str, tid: &TransactionId) -> Result<()>;
+    async fn remove_container(
+        &self,
+        container_id: Container,
+        ctd_namespace: &str,
+        tid: &TransactionId,
+    ) -> Result<()>;
 
     async fn prepare_function_registration(
         &self,
@@ -64,11 +71,17 @@ pub trait ContainerIsolationService: ToAny + Send + Sync + std::fmt::Debug {
 
     /// Waits for the startup message for a container to come through
     /// Really the task inside, the web server should write (something) to stdout when it is ready
-    async fn wait_startup(&self, container: &Container, timout_ms: u64, tid: &TransactionId) -> Result<()>;
+    async fn wait_startup(
+        &self,
+        container: &Container,
+        timout_ms: u64,
+        tid: &TransactionId,
+    ) -> Result<()>;
 
     /// Update the current resident memory size of the container
     /// If an error occurs, the memory usage will not be change and the container will be marked unhealthy
-    async fn update_memory_usage_mb(&self, container: &Container, tid: &TransactionId) -> MemSizeMb;
+    async fn update_memory_usage_mb(&self, container: &Container, tid: &TransactionId)
+        -> MemSizeMb;
 
     /// get the contents of the container's stdout as a string
     /// or an error message string if something went wrong
@@ -83,7 +96,8 @@ pub trait ContainerIsolationService: ToAny + Send + Sync + std::fmt::Debug {
 }
 
 /// Different containerization
-pub type ContainerIsolationCollection = Arc<std::collections::HashMap<Isolation, Arc<dyn ContainerIsolationService>>>;
+pub type ContainerIsolationCollection =
+    Arc<std::collections::HashMap<Isolation, Arc<dyn ContainerIsolationService>>>;
 
 pub struct IsolationFactory {
     worker_config: WorkerConfig,
@@ -127,6 +141,7 @@ impl IsolationFactory {
                     self.worker_config.container_resources.clone(),
                     self.worker_config.limits.clone(),
                     self.worker_config.container_resources.docker_config.clone(),
+                    self.worker_config.minio_storage.clone(),
                     tid,
                 )?);
                 self.insert_cycle(&mut ret, d)?;

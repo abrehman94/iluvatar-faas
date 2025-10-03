@@ -52,6 +52,8 @@ pub struct Configuration {
     pub influx: Option<Arc<InfluxConfig>>,
     /// Optional feature to enable fine scheduling of tasks
     pub finesched: Option<Arc<FineSchedConfig>>,
+    /// Optional feature to configure minio storage
+    pub minio_storage: Option<MinioConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -165,6 +167,13 @@ pub struct FunctionLimits {
     pub cpu_max: u32,
     /// invocation length timeout
     pub timeout_sec: u64,
+}
+
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct MinioConfig {
+    pub minio_address: String,
+    pub minio_access_key: String,
+    pub minio_secret_key: String,
 }
 
 #[derive(Debug, Deserialize, Default)]

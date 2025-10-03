@@ -3,7 +3,7 @@ use super::{structs::Container, ContainerIsolationService};
 use crate::services::resources::gpu::GPU;
 use crate::{
     services::{containers::structs::ContainerState, registration::RegisteredFunction},
-    worker_api::worker_config::{ContainerResourceConfig, FunctionLimits},
+    worker_api::worker_config::{ContainerResourceConfig, FunctionLimits, MinioConfig},
 };
 use anyhow::Result;
 use bollard::Docker;
@@ -13,7 +13,8 @@ use bollard::{
 };
 use bollard::{
     container::{
-        Config, CreateContainerOptions, ListContainersOptions, LogsOptions, RemoveContainerOptions, StatsOptions,
+        Config, CreateContainerOptions, ListContainersOptions, LogsOptions, RemoveContainerOptions,
+        StatsOptions,
     },
     image::CreateImageOptions,
 };
@@ -58,6 +59,7 @@ pub struct DockerIsolation {
     pulled_images: DashSet<String>,
     docker_api: Docker,
     docker_config: Option<DockerConfig>,
+    minio_config: Option<MinioConfig>,
 }
 pub type BollardPortBindings = Option<HashMap<String, Option<Vec<PortBinding>>>>;
 impl DockerIsolation {
@@ -82,6 +84,7 @@ impl DockerIsolation {
         config: Arc<ContainerResourceConfig>,
         limits_config: Arc<FunctionLimits>,
         docker_config: Option<DockerConfig>,
+        minio_config: Option<MinioConfig>,
         tid: &TransactionId,
     ) -> Result<Self> {
         let docker = match Docker::connect_with_socket_defaults() {
@@ -99,6 +102,7 @@ impl DockerIsolation {
             creation_sem: sem,
             pulled_images: DashSet::new(),
             docker_api: docker,
+            minio_config,
         })
     }
 
@@ -118,14 +122,14 @@ impl DockerIsolation {
         let mut host_config = host_config.unwrap_or_default();
         host_config.cpu_shares = Some((1024) as i64); // it only decides priority at times
                                                       // of contention, there is no setting
-                                                      // for period and quota 
+                                                      // for period and quota
                                                       // Ref: Documentation/ABI/removed/sysfs-kernel-uids
                                                       //      Documentation/scheduler/sched-design-CFS.rst
-                                                             
-        host_config.cpu_period = Some((100 * 1024) as i64); // 100 ms  
+
+        host_config.cpu_period = Some((100 * 1024) as i64); // 100 ms
         host_config.cpu_quota = Some((cpus * 100 * 1024) as i64); // 100 ms of quota is worth one
-                                                                  // CPU   
-                                                             
+                                                                  // CPU
+
         host_config.memory = Some(mem_limit_mb * 1024 * 1024);
         let exposed_ports: Option<HashMap<String, HashMap<(), ()>>> = match ports.as_ref() {
             Some(p) => {
@@ -158,7 +162,12 @@ impl DockerIsolation {
                 }
             }
 
-            if self.config.gpu_resource.as_ref().map_or(false, |c| c.mps_enabled()) {
+            if self
+                .config
+                .gpu_resource
+                .as_ref()
+                .map_or(false, |c| c.mps_enabled())
+            {
                 info!(tid=%tid, container_id=%container_id, threads=device.thread_pct, memory=device.allotted_mb, "Container running inside MPS context");
                 host_config.ipc_mode = Some("host".to_owned());
                 mps_thread = format!("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE={}", device.thread_pct);
@@ -176,6 +185,7 @@ impl DockerIsolation {
                 env.push("LD_PRELOAD=/app/libgpushare.so");
             }
         }
+
         match host_config.binds.as_mut() {
             Some(binds) => binds.extend(volumes),
             None => host_config.binds = Some(volumes),
@@ -201,8 +211,24 @@ impl DockerIsolation {
             owned_env.push(e.to_owned());
         }
 
+        if self.minio_config.is_some() {
+            let minio_config = self.minio_config.as_ref().unwrap();
+            owned_env.push(format!("MINIO_ADDRESS={}", minio_config.minio_address));
+            owned_env.push(format!(
+                "MINIO_ACCESS_KEY={}",
+                minio_config.minio_access_key
+            ));
+            owned_env.push(format!(
+                "MINIO_SECRET_KEY={}",
+                minio_config.minio_secret_key
+            ));
+        }
+
         let config: Config<String> = Config {
-            labels: Some(HashMap::from([("owner".to_owned(), "iluvatar_worker".to_owned())])),
+            labels: Some(HashMap::from([(
+                "owner".to_owned(),
+                "iluvatar_worker".to_owned(),
+            )])),
             image: Some(image_name.to_owned()),
             host_config: Some(host_config),
             env: Some(owned_env),
@@ -211,16 +237,24 @@ impl DockerIsolation {
             ..Default::default()
         };
         debug!(tid=%tid, container_id=%container_id, config=?config, "Creating container");
-        match self.docker_api.create_container(Some(options), config).await {
+        match self
+            .docker_api
+            .create_container(Some(options), config)
+            .await
+        {
             Ok(_) => (),
             Err(e) => bail_error!(tid=%tid, error=%e, "Error creating container"),
         };
         debug!(tid=%tid, container_id=%container_id, "Container created");
 
-        match self.docker_api.start_container::<String>(container_id, None).await {
+        match self
+            .docker_api
+            .start_container::<String>(container_id, None)
+            .await
+        {
             Ok(_) => {
                 debug!(tid=%tid, container_id=%container_id, "Dockercontainer started");
-            },
+            }
             Err(e) => bail_error!(tid=%tid, error=%e, "Error starting container"),
         };
         debug!(tid=%tid, container_id=%container_id, "Container started");
@@ -228,7 +262,11 @@ impl DockerIsolation {
     }
 
     /// Get the stdout and stderr of a container
-    pub async fn get_logs(&self, container_id: &str, tid: &TransactionId) -> Result<(String, String)> {
+    pub async fn get_logs(
+        &self,
+        container_id: &str,
+        tid: &TransactionId,
+    ) -> Result<(String, String)> {
         let options = LogsOptions::<String> {
             stdout: true,
             stderr: true,
@@ -290,7 +328,11 @@ impl ContainerIsolationService for DockerIsolation {
         tid: &TransactionId,
     ) -> ResultErrorVal<Container, Option<GPU>> {
         if !iso.eq(&Isolation::DOCKER) {
-            error_value!("Only supports docker Isolation, now {:?}", iso, device_resource);
+            error_value!(
+                "Only supports docker Isolation, now {:?}",
+                iso,
+                device_resource
+            );
         }
         let mut env = vec![];
         let cid = format!("{}-{}", fqdn, GUID::rand());
@@ -368,7 +410,12 @@ impl ContainerIsolationService for DockerIsolation {
     }
 
     /// Removed the specified container in the containerd namespace
-    async fn remove_container(&self, container: Container, _ctd_namespace: &str, tid: &TransactionId) -> Result<()> {
+    async fn remove_container(
+        &self,
+        container: Container,
+        _ctd_namespace: &str,
+        tid: &TransactionId,
+    ) -> Result<()> {
         let options = RemoveContainerOptions {
             force: true,
             v: true,
@@ -390,18 +437,18 @@ impl ContainerIsolationService for DockerIsolation {
         _fqdn: &str,
         tid: &TransactionId,
     ) -> Result<()> {
-
         if self.pulled_images.contains(&rf.image_name) {
             return Ok(());
-        }else{
-
-            // TODO: properly check via cli if it's already pulled 
-            
-            // right now I know the images have been pulled on v-021 
-            // there we don't need to pull again and again for the exps. 
-            self.pulled_images.insert(rf.image_name.clone());
-            return Ok(());
         }
+        // else{
+
+        //     // TODO: properly check via cli if it's already pulled
+        //
+        //     // right now I know the images have been pulled on v-021
+        //     // there we don't need to pull again and again for the exps.
+        //     self.pulled_images.insert(rf.image_name.clone());
+        //     return Ok(());
+        // }
 
         let options = Some(CreateImageOptions {
             from_image: rf.image_name.as_str(),
@@ -409,11 +456,13 @@ impl ContainerIsolationService for DockerIsolation {
         });
         let auth = match &self.docker_config {
             Some(cfg) => match &cfg.auth {
-                Some(a) if rf.image_name.starts_with(a.repository.as_str()) => Some(DockerCredentials {
-                    username: Some(a.username.clone()),
-                    password: Some(a.password.clone()),
-                    ..Default::default()
-                }),
+                Some(a) if rf.image_name.starts_with(a.repository.as_str()) => {
+                    Some(DockerCredentials {
+                        username: Some(a.username.clone()),
+                        password: Some(a.password.clone()),
+                        ..Default::default()
+                    })
+                }
                 _ => None,
             },
             None => None,
@@ -464,7 +513,12 @@ impl ContainerIsolationService for DockerIsolation {
     }
 
     #[cfg_attr(feature = "full_spans", tracing::instrument(skip(self, container, timeout_ms), fields(tid=%tid)))]
-    async fn wait_startup(&self, container: &Container, timeout_ms: u64, tid: &TransactionId) -> Result<()> {
+    async fn wait_startup(
+        &self,
+        container: &Container,
+        timeout_ms: u64,
+        tid: &TransactionId,
+    ) -> Result<()> {
         let start = now();
         loop {
             match self.get_logs(container.container_id(), tid).await {
@@ -492,15 +546,20 @@ impl ContainerIsolationService for DockerIsolation {
     }
 
     #[cfg_attr(feature = "full_spans", tracing::instrument(skip(self, container), fields(tid=%tid)))]
-    async fn update_memory_usage_mb(&self, container: &Container, tid: &TransactionId) -> MemSizeMb {
+    async fn update_memory_usage_mb(
+        &self,
+        container: &Container,
+        tid: &TransactionId,
+    ) -> MemSizeMb {
         debug!(tid=%tid, container_id=%container.container_id(), "Updating memory usage for container");
-        let cast_container = match crate::services::containers::structs::cast::<DockerContainer>(container) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(tid=%tid, error=%e, "Error casting container to DockerContainer");
-                return container.get_curr_mem_usage();
-            }
-        };
+        let cast_container =
+            match crate::services::containers::structs::cast::<DockerContainer>(container) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(tid=%tid, error=%e, "Error casting container to DockerContainer");
+                    return container.get_curr_mem_usage();
+                }
+            };
         let options = StatsOptions {
             stream: false,
             one_shot: true,
@@ -529,10 +588,14 @@ impl ContainerIsolationService for DockerIsolation {
     }
 
     async fn read_stdout(&self, container: &Container, tid: &TransactionId) -> String {
-        self.get_stdout(container, tid).await.unwrap_or_else(|_| "".to_string())
+        self.get_stdout(container, tid)
+            .await
+            .unwrap_or_else(|_| "".to_string())
     }
     async fn read_stderr(&self, container: &Container, tid: &TransactionId) -> String {
-        self.get_stderr(container, tid).await.unwrap_or_else(|_| "".to_string())
+        self.get_stderr(container, tid)
+            .await
+            .unwrap_or_else(|_| "".to_string())
     }
 }
 impl crate::services::containers::structs::ToAny for DockerIsolation {
