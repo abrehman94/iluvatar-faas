@@ -1,0 +1,17 @@
+FROM python:3.10-slim-bullseye
+
+# TODO: these images are really big...
+# Do something to slim them down
+
+WORKDIR /app
+COPY reqs.txt .
+RUN python3 -m pip install --upgrade pip && python3 -m pip install flask gunicorn && python3 -m pip install -r reqs.txt && python3 -m pip cache purge
+RUN apt update && apt install -y wget xz-utils
+
+COPY *.py ./
+
+ARG init_script=/app-local/init.sh
+RUN --mount=source=./,target=/app-local if [ -f $init_script ]; then $init_script ./; fi
+RUN --mount=from=l1dir,source=./,target=/app-local if [ -f $init_script ]; then $init_script ./; fi
+
+ENTRYPOINT [ "gunicorn", "-w", "1", "server:app" ]

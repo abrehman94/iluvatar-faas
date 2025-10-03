@@ -1,0 +1,3 @@
+igraph==0.11.4
+minio
+IPython

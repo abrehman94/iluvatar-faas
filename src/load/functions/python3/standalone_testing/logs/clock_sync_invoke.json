@@ -1,0 +1,1 @@
+{"duration_sec":0.053464,"end":"2025-09-25 15:39:09:629688+","start":"2025-09-25 15:39:09:576224+","user_result":"{\"body\": {\"latency\": 0.05346512794494629, \"data\": {\"result\": {\"bucket-key\": \"test_id_/results-test_id.b3c187d6.csv\", \"timestamp\": 0}}, \"cold\": true, \"start\": 1758814749.576229, \"end\": 1758814749.6296942}}","was_cold":true}

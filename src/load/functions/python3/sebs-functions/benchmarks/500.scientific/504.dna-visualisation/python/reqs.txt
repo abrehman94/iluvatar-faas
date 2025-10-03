@@ -1,0 +1,3 @@
+minio
+IPython
+squiggle==0.3.1
