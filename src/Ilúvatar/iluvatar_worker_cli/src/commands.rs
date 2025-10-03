@@ -19,7 +19,10 @@ pub async fn invoke(host: String, port: Port, args: InvokeArgs) -> Result<()> {
 
     let arguments = match args.arguments.as_ref() {
         Some(a) => args_to_json(a)?,
-        None => "{}".to_string(),
+        None => match args.json_arguments.as_ref() {
+            Some(a) => a.to_string(),
+            None => "{}".to_string(),
+        },
     };
 
     let ret = api.invoke(args.name, args.version, arguments, tid).await?;
@@ -35,7 +38,9 @@ pub async fn invoke_async(host: String, port: Port, args: InvokeArgs) -> Result<
         Some(a) => args_to_json(a)?,
         None => "{}".to_string(),
     };
-    let ret = api.invoke_async(args.name, args.version, arguments, tid).await?;
+    let ret = api
+        .invoke_async(args.name, args.version, arguments, tid)
+        .await?;
     info!("{}", ret);
     Ok(())
 }

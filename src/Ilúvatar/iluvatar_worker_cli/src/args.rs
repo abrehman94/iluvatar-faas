@@ -10,6 +10,11 @@ pub struct InvokeArgs {
     #[arg(short, long)]
     /// Function arguments
     pub arguments: Option<Vec<String>>,
+
+    #[arg(short, long)]
+    /// Function arguments as json string.
+    pub json_arguments: Option<String>,
+
     #[arg(short, long)]
     /// Name of function to invoke
     pub name: String,
