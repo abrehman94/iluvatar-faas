@@ -134,6 +134,7 @@ impl IsolationFactory {
                     self.worker_config.container_resources.clone(),
                     self.worker_config.limits.clone(),
                     self.worker_config.container_resources.docker_config.clone(),
+                    self.worker_config.minio_storage.clone(),
                     tid,
                 )?);
                 self.insert_cycle(&mut ret, d)?;

@@ -46,6 +46,8 @@ pub struct Configuration {
     pub status: Arc<StatusConfig>,
     pub influx: Option<Arc<InfluxConfig>>,
     pub http_server: Option<Arc<HttpServerConfig>>,
+    /// Optional feature to configure minio storage
+    pub minio_storage: Option<MinioConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -166,6 +168,13 @@ pub struct FunctionLimits {
     pub cpu_max: u32,
     /// invocation length timeout
     pub timeout_sec: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MinioConfig {
+    pub minio_address: String,
+    pub minio_access_key: String,
+    pub minio_secret_key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

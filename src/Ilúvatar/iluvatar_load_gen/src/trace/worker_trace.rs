@@ -16,8 +16,12 @@ use iluvatar_library::{
     utils::config::args_to_json,
 };
 use iluvatar_worker_library::worker_api::worker_comm::WorkerAPIFactory;
+use std::fs::File;
+use std::io::prelude::*;
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
+
 use tracing::{debug, info};
 
 async fn run_invokes(tid: &TransactionId, args: TraceArgs, factory: Arc<WorkerAPIFactory>, host: String) -> Result<()> {
@@ -51,7 +55,22 @@ async fn run_invokes(tid: &TransactionId, args: TraceArgs, factory: Arc<WorkerAP
             })?;
 
             let func_args = match is_simulation() {
-                false => args_to_json(&prepare_function_args(func, args.load_type)?)?,
+                false => {
+                    let mut args_string = "".to_string();
+
+                    if let Some(ref _args) = func.args {
+                        args_string = args_to_json(&prepare_function_args(func, args.load_type)?)?;
+                    } else if let Some(ref args_jsonfile) = func.args_jsonfile {
+                        let args_path = Path::new(args_jsonfile.as_str());
+                        if args_path.is_file() {
+                            let file = File::open(args_path)?;
+                            let mut buf_reader = BufReader::new(file);
+                            buf_reader.read_to_string(&mut args_string)?;
+                        }
+                    }
+
+                    args_string
+                },
                 true => serde_json::to_string(func.sim_invoke_data.as_ref().unwrap())?,
             };
             let f_c = func.func_name.clone();

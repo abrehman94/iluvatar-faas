@@ -3,7 +3,7 @@ use super::{structs::Container, ContainerIsolationService};
 use crate::services::resources::gpu::GPU;
 use crate::{
     services::{containers::structs::ContainerState, registration::RegisteredFunction},
-    worker_api::worker_config::{ContainerResourceConfig, FunctionLimits},
+    worker_api::worker_config::{ContainerResourceConfig, FunctionLimits, MinioConfig},
 };
 use anyhow::Result;
 use bollard::Docker;
@@ -64,6 +64,7 @@ pub struct DockerIsolation {
     pulled_images: DashSet<String>,
     docker_api: Docker,
     docker_config: Option<DockerConfig>,
+    minio_config: Option<MinioConfig>,
 }
 pub type BollardPortBindings = Option<HashMap<String, Option<Vec<PortBinding>>>>;
 impl DockerIsolation {
@@ -88,6 +89,7 @@ impl DockerIsolation {
         config: Arc<ContainerResourceConfig>,
         limits_config: Arc<FunctionLimits>,
         docker_config: Option<DockerConfig>,
+        minio_config: Option<MinioConfig>,
         tid: &TransactionId,
     ) -> Result<Self> {
         let docker = match Docker::connect_with_socket_defaults() {
@@ -105,6 +107,7 @@ impl DockerIsolation {
             creation_sem: sem,
             pulled_images: DashSet::new(),
             docker_api: docker,
+            minio_config,
         })
     }
 
@@ -123,6 +126,7 @@ impl DockerIsolation {
     ) -> Result<()> {
         let mut host_config = host_config.unwrap_or_default();
         host_config.cpu_shares = Some((cpus * 1024) as i64);
+
         host_config.memory = Some(mem_limit_mb * 1024 * 1024);
         let exposed_ports: Option<HashMap<String, HashMap<(), ()>>> = match ports.as_ref() {
             Some(p) => {
@@ -193,6 +197,13 @@ impl DockerIsolation {
             name: container_id,
             platform: None,
         };
+
+        if self.minio_config.is_some() {
+            let minio_config = self.minio_config.as_ref().unwrap();
+            env.push(format!("MINIO_ADDRESS={}", minio_config.minio_address));
+            env.push(format!("MINIO_ACCESS_KEY={}", minio_config.minio_access_key));
+            env.push(format!("MINIO_SECRET_KEY={}", minio_config.minio_secret_key));
+        }
 
         let config: Config<String> = Config {
             labels: Some(HashMap::from([("owner".to_owned(), "iluvatar_worker".to_owned())])),
@@ -289,6 +300,7 @@ impl ContainerIsolationService for DockerIsolation {
             Ok(p) => p,
             Err(e) => return err_val(e, device_resource),
         };
+
         let gunicorn_args = format!(
             "GUNICORN_CMD_ARGS=--workers=1 --timeout={} --bind=0.0.0.0:{}",
             &self.limits_config.timeout_sec, port
@@ -304,6 +316,22 @@ impl ContainerIsolationService for DockerIsolation {
         );
         env.push(format!("__IL_PORT={}", port));
         env.push(format!("__IL_SOCKET={}", "/iluvatar/sockets/sock"));
+
+        let udp_port = match free_local_port() {
+            Ok(p) => p,
+            Err(e) => return err_val(e, device_resource),
+        };
+
+        ports.insert(
+            format!("{}/udp", udp_port),
+            Some(vec![PortBinding {
+                host_ip: Some("".to_string()),
+                host_port: Some(udp_port.to_string()),
+            }]),
+        );
+
+        let il_udp_port = format!("__IL_UDP_PORT={}", udp_port);
+        env.push(il_udp_port);
 
         let permit = match &self.creation_sem {
             Some(sem) => match sem.acquire().await {

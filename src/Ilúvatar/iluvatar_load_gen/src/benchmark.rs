@@ -9,6 +9,9 @@ use iluvatar_library::types::{Compute, ContainerServer, Isolation, MemSizeMb, Re
 use iluvatar_library::utils::config::args_to_json;
 use iluvatar_library::{sync_live_scope, transaction::gen_tid, utils::port_utils::Port};
 use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::prelude::*;
+use std::io::BufReader;
 use std::time::Duration;
 use std::{collections::HashMap, path::Path};
 use tracing::{error, info};
@@ -31,6 +34,8 @@ pub struct ToBenchmarkFunction {
     pub server: ContainerServer,
     /// Arguments to pass to each invocation of the function
     pub args: Option<String>,
+    /// Arguments to pass to each invocation of the function in json file.
+    pub args_jsonfile: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -262,7 +267,25 @@ pub fn benchmark_worker(
                 dummy.args = Some(arg.clone());
                 args_to_json(&prepare_function_args(&dummy, LoadType::Functions)?)?
             },
-            None => "{\"name\":\"TESTING\"}".to_string(),
+            None => {
+                let default_args = "{\"name\":\"TESTING\"}".to_string();
+
+                match &function.args_jsonfile {
+                    Some(ref args_jsonfile) => {
+                        let args_path = Path::new(args_jsonfile.as_str());
+                        if args_path.is_file() {
+                            let file = File::open(args_path)?;
+                            let mut buf_reader = BufReader::new(file);
+                            let mut contents = String::new();
+                            buf_reader.read_to_string(&mut contents)?;
+                            contents
+                        } else {
+                            default_args
+                        }
+                    },
+                    None => default_args,
+                }
+            },
         };
         for supported_compute in function.compute {
             info!("Running {} {}", &function.name, supported_compute);

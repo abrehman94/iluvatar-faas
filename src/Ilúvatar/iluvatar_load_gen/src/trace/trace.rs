@@ -143,6 +143,8 @@ pub struct Function {
     pub sim_invoke_data: Option<SimulationInvocation>,
     /// Arguments to pass to each invocation of the function
     pub args: Option<String>,
+    /// Arguments to pass to each invocation of the function in json file.
+    pub args_jsonfile: Option<String>,
 }
 #[derive(Debug, serde::Deserialize)]
 pub struct CsvInvocation {
