@@ -1,7 +1,7 @@
 NPROCS:=$(shell grep -c ^processor /proc/cpuinfo)
 CROSS_FLAGS=CROSS_CONTAINER_UID=0 CROSS_CONTAINER_GID=0 CROSS_ROOTLESS_CONTAINER_ENGINE=false CROSS_CONTAINER_USER_NAMESPACE=none CROSS_CONTAINER_OPTS=--privileged
 TARGET_CPU?=generic
-RUST_FLAGS=-Dwarnings -Ctarget-cpu=$(TARGET_CPU)
+#RUST_FLAGS=-Dwarnings -Ctarget-cpu=$(TARGET_CPU)
 # Jetson platform
 # TARGET_PLAT=aarch64-unknown-linux-gnu
 TARGET_PLAT?=x86_64-unknown-linux-gnu
@@ -10,10 +10,11 @@ TARGET :=
 else
 TARGET :=--target $(TARGET_PLAT)
 endif
-RUST_C?=cross
+#RUST_C?=cross
+RUST_C?=cargo
 SHARED_FLAGS=$(TARGET) --jobs $(NPROCS)
 BIN_FLAGS=--lib --bins $(SHARED_FLAGS)
-CARGO_ARGS?=""
+CARGO_ARGS?=
 
 default: debug
 
