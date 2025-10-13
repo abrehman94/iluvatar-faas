@@ -7,6 +7,8 @@ use iluvatar_library::{
     energy::EnergyConfig, influx::InfluxConfig, logging::LoggingConfig, types::MemSizeMb, utils::port_utils::Port,
 };
 
+use iluvatar_finesched::PreallocGroupsConfig;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,6 +48,8 @@ pub struct Configuration {
     pub status: Arc<StatusConfig>,
     pub influx: Option<Arc<InfluxConfig>>,
     pub http_server: Option<Arc<HttpServerConfig>>,
+    /// Optional feature to enable fine scheduling of serverless tasks.
+    pub fineloadbalancing: Option<Arc<FineLoadBalancingConfig>>,
     /// Optional feature to configure minio storage
     pub minio_storage: Option<MinioConfig>,
 }
@@ -175,6 +179,57 @@ pub struct MinioConfig {
     pub minio_address: String,
     pub minio_access_key: String,
     pub minio_secret_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+/// Fine load balancing configuration
+pub struct FineLoadBalancingConfig {
+    /// PreallocGroupsConfig
+    ///     schedgroup
+    ///         sched domain - single queue
+    ///             fifo
+    ///             prio queue
+    ///                 arrival
+    ///                 srpt
+    ///                 invoc
+    pub preallocated_groups: PreallocGroupsConfig,
+
+    /// Dispatch policy fqdn -> schedgroup
+    ///   roundrobin, staticselect, sizebucketassign, leastworkleft,
+    pub dispatchpolicy: String,
+
+    /// "e2e_buckets":  [  ],
+    pub e2e_buckets: Vec<i32>,
+
+    /// "static_sel_conc_limit"         : {
+    ///      "torch_rnn"       : 0,
+    ///      "float_operation" : 1
+    ///  },
+    pub static_sel_conc_limit: HashMap<String, i32>,
+
+    ///   "static_sel_buckets"         : {
+    ///      "torch_rnn"       : [0, 1, 2, 3],
+    ///      "float_operation" : [4, 5]
+    ///  },
+    pub static_sel_buckets: HashMap<String, i32>,
+
+    /// at least two to circumvent the latency of group switch and keep cores warm    
+    pub concur_limit: u32,
+
+    /// Global frequency target [0,1024].
+    /// 0 -> Use default schedutil.
+    /// [1,1024] -> Provide perf target to schedutil using scx_bpf_cpuperf_set.
+    #[serde(default)]
+    pub freq_target: u32,
+
+    /// Guardrails tightness [1..].
+    pub guardrails_tightness: u32,
+
+    /// Guardrails log_base_c [2..].
+    pub guardrails_log_base_c: u32,
+
+    /// verbose logs from bpf skeleton load
+    pub bpf_verbose: u8,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

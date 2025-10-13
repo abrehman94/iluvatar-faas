@@ -32,8 +32,14 @@ pub async fn create_worker(worker_config: WorkerConfig, tid: &TransactionId) -> 
 
     let factory = IsolationFactory::new(worker_config.clone(), cmap.clone());
     let load_avg = build_load_avg_signal();
-    let cpu = CpuResourceTracker::new(&worker_config.container_resources.cpu_resource, load_avg.clone(), tid)
-        .or_else(|e| bail_error!(tid=tid, error=%e, "Failed to make cpu resource tracker"))?;
+    let cpu = CpuResourceTracker::new(
+        &worker_config.container_resources.cpu_resource,
+        load_avg.clone(),
+        tid,
+        cmap.clone(),
+        worker_config.fineloadbalancing.clone(),
+    )
+    .or_else(|e| bail_error!(tid=tid, error=%e, "Failed to make cpu resource tracker"))?;
 
     let isos = factory
         .get_isolation_services(tid, true)

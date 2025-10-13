@@ -355,6 +355,8 @@ impl CpuQueueingInvoker {
             EventualItem::Now(n) => n?,
         };
         self.running.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.cpu
+            .cgroup_assigned_to_function(ctr_lock.container.cgroup_id(), &item.tid, item.registration.clone());
         let result = invoke_on_container(
             &item.registration,
             &item.json_args,
@@ -372,6 +374,8 @@ impl CpuQueueingInvoker {
         .await;
         // don't resolve Result of invoke, handle clean up and return as-is
         self.running.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.cpu
+            .cgroup_released_for_function(ctr_lock.container.cgroup_id(), &item.tid, item.registration.clone());
         drop(permit);
         self.signal.notify_waiters();
         result

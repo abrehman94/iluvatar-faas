@@ -1,0 +1,222 @@
+use std::collections::HashMap;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+pub struct ClonableMutex<T>
+where
+    T: Clone + Default,
+{
+    pub value: Mutex<T>,
+}
+
+impl<T> Default for ClonableMutex<T>
+where
+    T: Clone + Default,
+{
+    fn default() -> Self {
+        ClonableMutex {
+            value: Mutex::new(T::default()),
+        }
+    }
+}
+
+impl<T> ClonableMutex<T>
+where
+    T: Clone + Default,
+{
+    pub fn new(value: T) -> Self {
+        ClonableMutex {
+            value: Mutex::new(value),
+        }
+    }
+}
+
+impl<T> Clone for ClonableMutex<T>
+where
+    T: Clone + Default,
+{
+    fn clone(&self) -> Self {
+        ClonableMutex {
+            value: Mutex::new(self.value.lock().unwrap().clone()),
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////
+/// Ugly Code - Can use procedural macros to generate clonable atomics for
+/// each atomic type - needs it's own crate - maybe some other time
+
+pub struct ClonableAtomicU32 {
+    pub value: AtomicU32,
+}
+
+impl ClonableAtomicU32 {
+    pub fn new(value: u32) -> Self {
+        ClonableAtomicU32 {
+            value: AtomicU32::new(value),
+        }
+    }
+}
+
+impl Default for ClonableAtomicU32 {
+    fn default() -> Self {
+        ClonableAtomicU32 {
+            value: AtomicU32::new(0),
+        }
+    }
+}
+
+impl Clone for ClonableAtomicU32 {
+    fn clone(&self) -> Self {
+        ClonableAtomicU32 {
+            value: AtomicU32::new(self.value.load(std::sync::atomic::Ordering::Relaxed)),
+        }
+    }
+}
+
+pub struct ClonableAtomicI32 {
+    pub value: AtomicI32,
+}
+
+impl ClonableAtomicI32 {
+    pub fn new(value: i32) -> Self {
+        ClonableAtomicI32 {
+            value: AtomicI32::new(value),
+        }
+    }
+
+    pub fn sub_clamp_limited(&self, val: i32, lower_clamp: i32) -> i32 {
+        loop {
+            let current = self.value.load(Ordering::Relaxed);
+            if lower_clamp == current {
+                break current;
+            }
+
+            let sub = if val > current { current } else { val };
+            let new = current - sub;
+
+            if self
+                .value
+                .compare_exchange(current, new, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break current;
+            }
+        }
+    }
+}
+
+impl Default for ClonableAtomicI32 {
+    fn default() -> Self {
+        ClonableAtomicI32 {
+            value: AtomicI32::new(0),
+        }
+    }
+}
+
+impl Clone for ClonableAtomicI32 {
+    fn clone(&self) -> Self {
+        ClonableAtomicI32 {
+            value: AtomicI32::new(self.value.load(std::sync::atomic::Ordering::Relaxed)),
+        }
+    }
+}
+
+/// Ugly Code ends
+///////////////////////////////////////
+
+#[derive(Debug)]
+pub struct ArcMap<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: Default,
+{
+    map: Mutex<HashMap<K, Arc<V>>>,
+}
+
+impl<K, V> Clone for ArcMap<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: Default,
+{
+    fn clone(&self) -> Self {
+        ArcMap {
+            map: Mutex::new(self.map.lock().unwrap().clone()),
+        }
+    }
+}
+
+impl<K, V> ArcMap<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: Default,
+{
+    pub fn new() -> Self {
+        ArcMap {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn get(&self, key: &K) -> Option<Arc<V>> {
+        self.map.lock().unwrap().get(key).map(|v| v.clone())
+    }
+
+    pub fn get_or_create(&self, key: &K) -> Arc<V> {
+        let mut map = self.map.lock().unwrap();
+        match map.get(key) {
+            Some(v) => v.clone(),
+            None => {
+                let val: Arc<V> = Arc::new(Default::default());
+                map.insert((*key).clone(), val.clone());
+                val
+            },
+        }
+    }
+
+    pub fn get_or_insert(&self, key: &K, value: V) -> Arc<V> {
+        let mut map = self.map.lock().unwrap();
+        match map.get(key) {
+            Some(v) => v.clone(),
+            None => {
+                let val: Arc<V> = Arc::new(value);
+                map.insert((*key).clone(), val.clone());
+                val
+            },
+        }
+    }
+
+    pub fn remove(&self, key: &K) -> Option<Arc<V>> {
+        let mut map = self.map.lock().unwrap();
+
+        map.remove(key)
+    }
+
+    pub fn insert(&self, key: K, value: V) -> Option<Arc<V>> {
+        let mut map = self.map.lock().unwrap();
+
+        map.insert(key, Arc::new(value))
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+
+    pub fn immutable_clone(&self) -> HashMap<K, Arc<V>> {
+        self.map.lock().unwrap().clone()
+    }
+}
+
+impl<K, V> Default for ArcMap<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: Default,
+{
+    fn default() -> Self {
+        ArcMap {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+}

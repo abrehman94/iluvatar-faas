@@ -71,7 +71,14 @@ async fn build_mqfq(
     let buff = Arc::new(iluvatar_library::ring_buff::RingBuffer::new(
         std::time::Duration::from_secs(2),
     ));
-    let cpu = CpuResourceTracker::new(&cfg.container_resources.cpu_resource, load_avg, &TEST_TID).unwrap();
+    let cpu = CpuResourceTracker::new(
+        &cfg.container_resources.cpu_resource,
+        load_avg,
+        &TEST_TID,
+        cmap.clone(),
+        None,
+    )
+    .unwrap();
     let gpu = GpuResourceTracker::boxed(
         &cfg.container_resources.gpu_resource,
         &cfg.container_resources,

@@ -9,6 +9,7 @@ members = [
   "iluvatar_worker_library",
   "iluvatar_energy_mon",
   "iluvatar_rpc",
+  "iluvatar_finesched",
   "iluvatar_library/iluvatar_derive",
 ]
 resolver = "2"

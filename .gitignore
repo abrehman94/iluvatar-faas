@@ -6,4 +6,6 @@ __pycache__/*.lock
 .idea/
 .vscode/
 dist/
+**.swn
+**.swo
 **.swp

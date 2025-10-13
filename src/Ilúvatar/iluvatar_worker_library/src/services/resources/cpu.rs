@@ -1,8 +1,14 @@
+use super::fineloadbalancing::BuildFineLoadBalancing;
+use super::fineloadbalancing::FineLoadBalancing;
 use crate::services::invocation::Invoker;
 use crate::services::registration::RegisteredFunction;
 use crate::worker_api::config::StatusConfig;
 use crate::worker_api::worker_config::CPUResourceConfig;
+use crate::worker_api::worker_config::FineLoadBalancingConfig;
 use anyhow::Result;
+use iluvatar_library::char_map::Chars;
+use iluvatar_library::char_map::Value;
+use iluvatar_library::char_map::WorkerCharMap;
 use iluvatar_library::clock::now;
 use iluvatar_library::ring_buff::{RingBuffer, Wireable};
 use iluvatar_library::threading::{is_simulation, tokio_thread};
@@ -11,6 +17,7 @@ use iluvatar_library::{bail_error, threading};
 use parking_lot::{Mutex, RwLock};
 use std::fs::read_to_string;
 use std::io::{BufRead, BufReader};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -34,10 +41,18 @@ pub struct CpuResourceTracker {
     max_load: Option<f64>,
     pub cores: f64,
     load_avg: LoadAvg,
+    cmap: WorkerCharMap,
+    fineloadbalancing: Option<FineLoadBalancing>,
 }
 
 impl CpuResourceTracker {
-    pub fn new(config: &Arc<CPUResourceConfig>, load_avg: LoadAvg, tid: &TransactionId) -> Result<Arc<Self>> {
+    pub fn new(
+        config: &Arc<CPUResourceConfig>,
+        load_avg: LoadAvg,
+        tid: &TransactionId,
+        cmap: WorkerCharMap,
+        fineloadbalancing_config: Option<Arc<FineLoadBalancingConfig>>,
+    ) -> Result<Arc<Self>> {
         let mut max_concur = 0;
         let available_cores = match config.count {
             0 => num_cpus::get(),
@@ -69,6 +84,12 @@ impl CpuResourceTracker {
             },
             None => (None, None),
         };
+
+        let mut fineloadbalancing = None;
+        if let Some(ref fineloadbalancing_config) = fineloadbalancing_config {
+            fineloadbalancing = Some(FineLoadBalancing::build_arc(fineloadbalancing_config.clone()));
+        }
+
         let svc = Arc::new(CpuResourceTracker {
             concurrency_semaphore: sem,
             min_concur: config.count,
@@ -78,6 +99,8 @@ impl CpuResourceTracker {
             _load_thread: load_handle,
             cores: available_cores as f64,
             load_avg,
+            cmap,
+            fineloadbalancing,
         });
         if let Some(load_tx) = load_tx {
             load_tx.send(svc.clone())?;
@@ -157,6 +180,56 @@ impl CpuResourceTracker {
             load = norm_load,
             "Current concurrency"
         );
+    }
+
+    pub fn cgroup_assigned_to_function(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        let fqdn = reg.fqdn.as_str();
+        if let Some(fineloadbalancing) = self.fineloadbalancing.as_ref() {
+            let lbpolicy = &fineloadbalancing.lbpolicy;
+            let domain_id = lbpolicy.assign_domain_to_function_cgroup(cgroup_id, tid, reg.clone());
+            if let Some(domain_id) = domain_id {
+                // Capture stats for the domain assignment.
+                let stats = fineloadbalancing.stats.clone();
+                stats.tid_map.insert(tid.clone(), domain_id);
+
+                let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
+                scheduled_invocations.fetch_add(1, Ordering::Relaxed);
+
+                // Update cgroup characteristics map shared with the scheduler.
+                let timestamp_epoch = 0;
+                let dur = self.cmap.get(fqdn, Chars::CpuExecTime, Value::Avg);
+                let dur_ms = (dur * 1000.0) as u64;
+
+                // TODO: lookup arrival time and push
+                let sched_domains = &fineloadbalancing.preallocated_domains;
+                sched_domains.update_cgroup_chrs(domain_id, timestamp_epoch, dur_ms, 0, cgroup_id);
+
+                debug!( tid=%tid, fqdn=%fqdn, cgroup_id=%cgroup_id, timestamp_epoch=%timestamp_epoch, domain_id=%domain_id, "[finesched] domain assigned to function cgroup");
+            }
+        }
+    }
+
+    pub fn cgroup_released_for_function(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        let fqdn = reg.fqdn.as_str();
+        if let Some(fineloadbalancing) = &self.fineloadbalancing {
+            let lbpolicy = &fineloadbalancing.lbpolicy;
+            lbpolicy.invoke_is_complete(cgroup_id, tid, reg.clone());
+
+            let stats = fineloadbalancing.stats.clone();
+            let domain_id = match stats.tid_map.get(tid) {
+                Some(entry) => *entry,
+                None => {
+                    error!(tid=%tid, "[finesched] no domain found for tid in tid_stats map");
+                    return;
+                },
+            };
+            stats.tid_map.remove(tid);
+
+            let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
+            scheduled_invocations.fetch_sub(1, Ordering::Relaxed);
+
+            debug!( tid=%tid, fqdn=%fqdn, cgroup_id=%cgroup_id, domain_id=%domain_id, "[finesched] domain released for function cgroup");
+        }
     }
 }
 

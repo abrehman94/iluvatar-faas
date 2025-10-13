@@ -119,6 +119,10 @@ impl ContainerT for ContainerdContainer {
         *lock = now();
     }
 
+    fn cgroup_id(&self) -> &String {
+        &self.container_id
+    }
+
     fn container_id(&self) -> &String {
         &self.container_id
     }

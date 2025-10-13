@@ -22,6 +22,8 @@ pub trait ContainerT: ToAny + Send + Sync {
     fn touch(&self);
     /// the unique ID for this container
     fn container_id(&self) -> &String;
+    /// the kernfs cgroup name for this container
+    fn cgroup_id(&self) -> &String;
     /// The time at which the container last served an invocation
     fn last_used(&self) -> Instant;
     /// Number of invocations this container has served
