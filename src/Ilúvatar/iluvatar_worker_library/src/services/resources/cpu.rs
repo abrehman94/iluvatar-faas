@@ -41,7 +41,6 @@ pub struct CpuResourceTracker {
     max_load: Option<f64>,
     pub cores: f64,
     load_avg: LoadAvg,
-    cmap: WorkerCharMap,
     fineloadbalancing: Option<FineLoadBalancing>,
 }
 
@@ -87,7 +86,7 @@ impl CpuResourceTracker {
 
         let mut fineloadbalancing = None;
         if let Some(ref fineloadbalancing_config) = fineloadbalancing_config {
-            fineloadbalancing = Some(FineLoadBalancing::build_arc(fineloadbalancing_config.clone()));
+            fineloadbalancing = Some(FineLoadBalancing::build_arc(fineloadbalancing_config.clone(), cmap));
         }
 
         let svc = Arc::new(CpuResourceTracker {
@@ -99,7 +98,6 @@ impl CpuResourceTracker {
             _load_thread: load_handle,
             cores: available_cores as f64,
             load_avg,
-            cmap,
             fineloadbalancing,
         });
         if let Some(load_tx) = load_tx {
@@ -197,7 +195,7 @@ impl CpuResourceTracker {
 
                 // Update cgroup characteristics map shared with the scheduler.
                 let timestamp_epoch = 0;
-                let dur = self.cmap.get(fqdn, Chars::CpuExecTime, Value::Avg);
+                let dur = fineloadbalancing.cmap.get(fqdn, Chars::CpuExecTime, Value::Avg);
                 let dur_ms = (dur * 1000.0) as u64;
 
                 // TODO: lookup arrival time and push
