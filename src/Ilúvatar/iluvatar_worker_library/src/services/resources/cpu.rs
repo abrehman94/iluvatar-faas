@@ -5,6 +5,7 @@ use crate::services::registration::RegisteredFunction;
 use crate::worker_api::config::StatusConfig;
 use crate::worker_api::worker_config::CPUResourceConfig;
 use crate::worker_api::worker_config::FineLoadBalancingConfig;
+use anyhow::bail;
 use anyhow::Result;
 use iluvatar_library::char_map::Chars;
 use iluvatar_library::char_map::Value;
@@ -112,11 +113,18 @@ impl CpuResourceTracker {
     pub fn try_acquire_cores(
         &self,
         reg: &Arc<RegisteredFunction>,
-        _tid: &TransactionId,
+        tid: &TransactionId,
     ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::TryAcquireError> {
+        debug!(cpu_sem =? self.concurrency_semaphore, "CPUResourceMananger");
         if let Some(sem) = &self.concurrency_semaphore {
             return match sem.clone().try_acquire_many_owned(reg.cpus) {
-                Ok(p) => Ok(Some(p)),
+                Ok(p) => {
+                    if self.assign_domain_to_function_request(tid, reg.clone()).is_ok() {
+                        Ok(Some(p))
+                    } else {
+                        Ok(None)
+                    }
+                },
                 Err(e) => Err(e),
             };
         }
@@ -128,11 +136,17 @@ impl CpuResourceTracker {
     pub async fn acquire_cores(
         &self,
         reg: &Arc<RegisteredFunction>,
-        _tid: &TransactionId,
+        tid: &TransactionId,
     ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::AcquireError> {
         if let Some(sem) = &self.concurrency_semaphore {
             return match sem.clone().acquire_many_owned(reg.cpus).await {
-                Ok(p) => Ok(Some(p)),
+                Ok(p) => {
+                    if self.assign_domain_to_function_request(tid, reg.clone()).is_ok() {
+                        Ok(Some(p))
+                    } else {
+                        Ok(None)
+                    }
+                },
                 Err(e) => Err(e),
             };
         }
@@ -180,11 +194,11 @@ impl CpuResourceTracker {
         );
     }
 
-    pub fn cgroup_assigned_to_function(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+    pub fn assign_domain_to_function_request(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Result<()> {
         let fqdn = reg.fqdn.as_str();
         if let Some(fineloadbalancing) = self.fineloadbalancing.as_ref() {
             let lbpolicy = &fineloadbalancing.lbpolicy;
-            let domain_id = lbpolicy.assign_domain_to_function_cgroup(cgroup_id, tid, reg.clone());
+            let domain_id = lbpolicy.assign_domain_to_function_request(tid, reg.clone());
             if let Some(domain_id) = domain_id {
                 // Capture stats for the domain assignment.
                 let stats = fineloadbalancing.stats.clone();
@@ -193,17 +207,38 @@ impl CpuResourceTracker {
                 let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
                 scheduled_invocations.fetch_add(1, Ordering::Relaxed);
 
-                // Update cgroup characteristics map shared with the scheduler.
-                let timestamp_epoch = 0;
-                let dur = fineloadbalancing.cmap.get(fqdn, Chars::CpuExecTime, Value::Avg);
-                let dur_ms = (dur * 1000.0) as u64;
-
-                // TODO: lookup arrival time and push
-                let sched_domains = &fineloadbalancing.preallocated_domains;
-                sched_domains.update_cgroup_chrs(domain_id, timestamp_epoch, dur_ms, 0, cgroup_id);
-
-                debug!( tid=%tid, fqdn=%fqdn, cgroup_id=%cgroup_id, timestamp_epoch=%timestamp_epoch, domain_id=%domain_id, "[finesched] domain assigned to function cgroup");
+                debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, "[finesched] domain assigned to function request");
+                return Ok(());
             }
+        } else {
+            return Ok(());
+        }
+
+        bail!("no domain assigned")
+    }
+
+    pub fn cgroup_assigned_to_function(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        let fqdn = reg.fqdn.as_str();
+        if let Some(fineloadbalancing) = self.fineloadbalancing.as_ref() {
+            let stats = fineloadbalancing.stats.clone();
+            let domain_id = match stats.tid_map.get(tid) {
+                Some(entry) => *entry,
+                None => {
+                    error!(tid=%tid, "[finesched] no domain found for tid in tid_stats map");
+                    return;
+                },
+            };
+
+            // Update cgroup characteristics map shared with the scheduler.
+            let timestamp_epoch = 0;
+            let dur = fineloadbalancing.cmap.get(fqdn, Chars::CpuExecTime, Value::Avg);
+            let dur_ms = (dur * 1000.0) as u64;
+
+            // TODO: lookup arrival time and push
+            let sched_domains = &fineloadbalancing.preallocated_domains;
+            sched_domains.update_cgroup_chrs(domain_id, timestamp_epoch, dur_ms, 0, cgroup_id);
+
+            debug!( tid=%tid, fqdn=%fqdn, cgroup_id=%cgroup_id, timestamp_epoch=%timestamp_epoch, domain_id=%domain_id, "[finesched] domain assigned to function cgroup");
         }
     }
 
