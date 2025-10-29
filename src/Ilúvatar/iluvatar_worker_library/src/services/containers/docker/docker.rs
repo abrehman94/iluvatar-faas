@@ -243,7 +243,8 @@ impl DockerIsolation {
             match res {
                 Ok(r) => match r {
                     bollard::container::LogOutput::StdErr { message } => {
-                        stderr = String::from_utf8_lossy(&message).to_string()
+                        stderr = String::from_utf8_lossy(&message).to_string();
+                        println!("{}", stderr);
                     },
                     bollard::container::LogOutput::StdOut { message } => {
                         stdout = String::from_utf8_lossy(&message).to_string()
