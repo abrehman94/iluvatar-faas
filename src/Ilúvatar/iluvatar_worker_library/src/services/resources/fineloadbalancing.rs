@@ -234,7 +234,7 @@ impl Guardrails {
             .collect()
     }
 
-    fn guardrails_pick(&self, dur_ms: u32, domain_set: &Vec<SchedGroupID>) -> SchedGroupID {
+    pub fn guardrails_pick(&self, dur_ms: u32, domain_set: &Vec<SchedGroupID>) -> SchedGroupID {
         let safe_domains = self.set_of_safe_domains(dur_ms, domain_set);
         assert!(safe_domains.len() != 0);
 
@@ -261,6 +261,26 @@ impl Guardrails {
             sched_domain_counters[domain_id as usize] = *sched_domain_counters.iter().min().unwrap();
         }
     }
+
+    pub fn return_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        let fqdn = reg.fqdn.as_str();
+        let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
+        let stats = fineloadbalancing.stats.clone();
+
+        let domain_id = match stats.tid_map.get(tid) {
+            Some(entry) => *entry,
+            None => {
+                error!(tid=%tid, "[finesched] no domain found for tid in tid_stats map");
+                return;
+            },
+        };
+
+        let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
+        if scheduled_invocations.load(Ordering::Relaxed) == 1 {
+            debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, "[finesched][guardrails] domain reset");
+            self.reset_domain(domain_id);
+        }
+    }
 }
 
 impl LoadBalancingPolicyTrait for Guardrails {
@@ -281,23 +301,7 @@ impl LoadBalancingPolicyTrait for Guardrails {
     }
 
     fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
-        let fqdn = reg.fqdn.as_str();
-        let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
-        let stats = fineloadbalancing.stats.clone();
-
-        let domain_id = match stats.tid_map.get(tid) {
-            Some(entry) => *entry,
-            None => {
-                error!(tid=%tid, "[finesched] no domain found for tid in tid_stats map");
-                return;
-            },
-        };
-
-        let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
-        if scheduled_invocations.load(Ordering::Relaxed) == 1 {
-            debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, "[finesched][guardrails] domain reset");
-            self.reset_domain(domain_id);
-        }
+        self.return_domain(tid, reg.clone());
     }
 }
 
@@ -493,6 +497,30 @@ pub struct ConsistentHashing {
     func_preferred_domains: ArcMap<String, ArcVec<Domain>>,
 }
 
+pub trait SelectDomain {
+    fn pick_domain_from_set(&self, reg: Arc<RegisteredFunction>, domains: &Vec<Arc<Domain>>) -> Option<Arc<Domain>>;
+}
+
+impl SelectDomain for ConsistentHashing {
+    /// Pick first acquirable domain from the set.
+    fn pick_domain_from_set(&self, reg: Arc<RegisteredFunction>, domains: &Vec<Arc<Domain>>) -> Option<Arc<Domain>> {
+        let func_name = &reg.fqdn;
+        let requested_cores = reg.cpus;
+
+        for domain in domains.iter() {
+            if domain
+                .can_serve_and_acquire_empty_or_assigned(func_name, requested_cores)
+                .is_ok()
+            {
+                debug!( lbpolicy=%"consistent_hashing", domain_assigned=%dump_domain(&domain), "[finesched] assign_domain_to_function_request");
+                return Some(domain.clone());
+            }
+        }
+
+        None
+    }
+}
+
 impl ConsistentHashing {
     pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
         let domains = ArcVec::<Domain>::new();
@@ -525,7 +553,7 @@ impl ConsistentHashing {
         domains[domain_id].clone()
     }
 
-    pub fn pick_next_domain(&self, starting_id: DomainId, func_name: &String, cpus: u32) -> Option<Arc<Domain>> {
+    fn pick_next_domain(&self, starting_id: DomainId, func_name: &String, cpus: u32) -> Option<Arc<Domain>> {
         let domains = self.domains.immutable_clone();
         let total_domains = domains.len();
         let mut domain_id = starting_id + 1;
@@ -545,13 +573,15 @@ impl ConsistentHashing {
 
         None
     }
-}
 
-impl LoadBalancingPolicyTrait for ConsistentHashing {
-    fn assign_domain_to_function_request(
+    pub fn sys_domains(&self) -> Vec<Arc<Domain>> {
+        self.domains.immutable_clone()
+    }
+
+    pub fn pick_domain(
         &self,
-        _tid: &TransactionId,
         reg: Arc<RegisteredFunction>,
+        domains_selection: &dyn SelectDomain,
     ) -> Option<SchedGroupID> {
         let func_name = &reg.fqdn;
         let requested_cores = reg.cpus;
@@ -559,17 +589,13 @@ impl LoadBalancingPolicyTrait for ConsistentHashing {
         let preferred_domains = self.func_preferred_domains.get_or_create(func_name).immutable_clone();
         debug!( lbpolicy=%"consistent_hashing", fqdn=%func_name, preferred_domains=%dump_domains(&preferred_domains), "[finesched] assign_domain_to_function_request");
 
-        for domain in preferred_domains.iter() {
-            if domain
-                .can_serve_and_acquire_empty_or_assigned(func_name, requested_cores)
-                .is_ok()
-            {
-                debug!( lbpolicy=%"consistent_hashing", fqdn=%func_name, domain_assigned=%dump_domain(&domain), "[finesched] assign_domain_to_function_request");
-                return Some(domain.id());
-            }
+        let mut domain;
+
+        domain = domains_selection.pick_domain_from_set(reg.clone(), &preferred_domains);
+        if domain.is_some() {
+            return Some(domain.unwrap().id());
         }
 
-        let domain;
         if preferred_domains.len() == 0 {
             domain = self.pick_next_domain(0, func_name, requested_cores);
         } else {
@@ -592,10 +618,82 @@ impl LoadBalancingPolicyTrait for ConsistentHashing {
         Some(domain.id())
     }
 
-    fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+    pub fn return_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         let stats = self.fineloadbalancing.upgrade().unwrap().stats.clone();
         let domain_id = *stats.tid_map.get(tid).unwrap() as DomainId;
         let domain = &self.domains.immutable_clone()[domain_id];
         domain.return_cpus_and_release(reg.cpus);
+    }
+}
+
+impl LoadBalancingPolicyTrait for ConsistentHashing {
+    fn assign_domain_to_function_request(
+        &self,
+        _tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
+        self.pick_domain(reg.clone(), self)
+    }
+
+    fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.return_domain(tid, reg.clone());
+    }
+}
+
+// Consistent hashing with Guardrails pick
+pub struct ConsistentHashingGuardrailsPick {
+    fineloadbalancing: FineLoadBalancingWeak,
+
+    consistent_hashing: ConsistentHashing,
+    guardrails: Guardrails,
+}
+
+impl ConsistentHashingGuardrailsPick {
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+        Self {
+            fineloadbalancing: fineloadbalancing.clone(),
+
+            consistent_hashing: ConsistentHashing::new(fineloadbalancing.clone(), config.clone()),
+            guardrails: Guardrails::new(fineloadbalancing.clone(), config.clone()),
+        }
+    }
+}
+
+impl SelectDomain for ConsistentHashingGuardrailsPick {
+    /// Pick a fair acquirable domain from the set using Guardrails.
+    fn pick_domain_from_set(&self, reg: Arc<RegisteredFunction>, domains: &Vec<Arc<Domain>>) -> Option<Arc<Domain>> {
+        let func_name = &reg.fqdn;
+        let requested_cores = reg.cpus;
+        let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
+
+        let domain_set: Vec<SchedGroupID> = domains.iter().map(|domain| domain.id()).collect();
+        let sys_domains = self.consistent_hashing.sys_domains();
+
+        let dur_ms = (fineloadbalancing.cmap.get(func_name, Chars::CpuExecTime, Value::Avg) * 1000.0) as u32;
+        let domain_id = self.guardrails.guardrails_pick(dur_ms, &domain_set);
+        let domain = &sys_domains[domain_id as usize];
+        if domain
+            .can_serve_and_acquire_empty_or_assigned(func_name, requested_cores)
+            .is_ok()
+        {
+            return Some(domain.clone());
+        }
+
+        None
+    }
+}
+
+impl LoadBalancingPolicyTrait for ConsistentHashingGuardrailsPick {
+    fn assign_domain_to_function_request(
+        &self,
+        _tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
+        self.consistent_hashing.pick_domain(reg.clone(), self)
+    }
+
+    fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.consistent_hashing.return_domain(tid, reg.clone());
+        self.guardrails.return_domain(tid, reg.clone());
     }
 }
