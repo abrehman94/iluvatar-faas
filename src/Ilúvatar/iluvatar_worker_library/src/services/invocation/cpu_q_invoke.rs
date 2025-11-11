@@ -203,7 +203,13 @@ impl CpuQueueingInvoker {
         }
         let mut ret = vec![];
         match self.cpu.try_acquire_cores(&item.registration, &item.tid) {
-            Ok(c) => ret.push(c),
+            Ok(c) => {
+                if c.is_some() {
+                    ret.push(c);
+                } else {
+                    return None;
+                }
+            },
             Err(e) => {
                 match e {
                     tokio::sync::TryAcquireError::Closed => {

@@ -35,6 +35,11 @@ fn inspect_container(container_id: &str, field: &str) -> String {
     "".to_string()
 }
 
+fn docker_container_cgroup_id(container_id: &str) -> String {
+    let container_full_id = inspect_container(&container_id, "'{{.Id}}'");
+    "docker-".to_string() + &container_full_id + ".scope"
+}
+
 #[allow(unused, dyn_drop)]
 #[derive(iluvatar_library::ToAny)]
 pub struct DockerContainer {
@@ -77,7 +82,7 @@ impl DockerContainer {
         let r = DockerContainer {
             mem_usage: RwLock::new(function.memory),
             dev_mem_usage: RwLock::new((0, true)),
-            cgroup_id: inspect_container(&container_id, "'{{.Id}}'"),
+            cgroup_id: docker_container_cgroup_id(&container_id),
             container_id,
             fqdn: fqdn.to_owned(),
             function: function.clone(),

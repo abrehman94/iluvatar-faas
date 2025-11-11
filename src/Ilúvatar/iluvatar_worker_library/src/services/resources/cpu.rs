@@ -246,8 +246,6 @@ impl CpuResourceTracker {
         let fqdn = reg.fqdn.as_str();
         if let Some(fineloadbalancing) = &self.fineloadbalancing {
             let lbpolicy = &fineloadbalancing.lbpolicy;
-            lbpolicy.invoke_is_complete(cgroup_id, tid, reg.clone());
-
             let stats = fineloadbalancing.stats.clone();
             let domain_id = match stats.tid_map.get(tid) {
                 Some(entry) => *entry,
@@ -256,6 +254,8 @@ impl CpuResourceTracker {
                     return;
                 },
             };
+
+            lbpolicy.invoke_is_complete(cgroup_id, tid, reg.clone());
             stats.tid_map.remove(tid);
 
             let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;

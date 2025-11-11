@@ -80,6 +80,10 @@ impl BuildFineLoadBalancing for FineLoadBalancing {
                     fineloadbalancing_weak.clone(),
                     config.clone(),
                 ))),
+                "consistent_hashing_guardrailspick" => Some(Box::new(ConsistentHashingGuardrailsPick::new(
+                    fineloadbalancing_weak.clone(),
+                    config.clone(),
+                ))),
                 "domain_zero" => Some(Box::new(DomainZero::new(fineloadbalancing_weak.clone()))),
                 _ => None,
             };
@@ -214,7 +218,7 @@ impl Guardrails {
             .map(|domain_id: &SchedGroupID| sched_domain_counters[*domain_id as usize])
             .collect();
 
-        let rank_min_counter = *sched_domain_counters.iter().min().unwrap();
+        let rank_min_counter = *select_counters.iter().min().unwrap();
 
         let is_safe_domain = move |arg: &(usize, &u32)| {
             let (_index, domain_counter) = arg;
@@ -563,7 +567,7 @@ impl ConsistentHashing {
                 return Some(domain);
             }
 
-            domain_id += 1;
+            domain_id = (domain_id + 1) % total_domains;
         }
 
         let domain = self.least_loaded_domain();
@@ -591,14 +595,14 @@ impl ConsistentHashing {
 
         let mut domain;
 
-        domain = domains_selection.pick_domain_from_set(reg.clone(), &preferred_domains);
-        if domain.is_some() {
-            return Some(domain.unwrap().id());
-        }
-
         if preferred_domains.len() == 0 {
             domain = self.pick_next_domain(0, func_name, requested_cores);
         } else {
+            domain = domains_selection.pick_domain_from_set(reg.clone(), &preferred_domains);
+            if domain.is_some() {
+                return Some(domain.unwrap().id());
+            }
+
             domain = self.pick_next_domain(preferred_domains[0].id() as DomainId, func_name, requested_cores);
         }
 

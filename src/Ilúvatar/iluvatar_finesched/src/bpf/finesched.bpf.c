@@ -169,27 +169,31 @@ struct {
     __uint(value_size, sizeof(cgroup_ctx_t));  // value: context
 } cgroup_ctx_stor SEC(".maps");
 
-static cgroup_ctx_t *__noinline try_lookup_cgroup_ctx(const char *name, u32 max_len) {
+static cgroup_ctx_t *__noinline lookup_or_build_cgroup_ctx(const char *name, u32 max_len) {
     long err;
 
-    if (!name || max_len > MAX_PATH) {
-        dbg("[cmap][get_cgroup_ctx] invalid args: %s %u", name, max_len);
+    if (name == NULL || max_len > MAX_PATH) {
+        dbg("[cmap][get_cgroup_ctx][cpu_cgroup_attach] invalid args: %s %u", name, max_len);
         return NULL;
     }
 
-    cgroup_ctx_t *cgrp_ctx = bpf_map_lookup_elem(&cgroup_ctx_stor, name);
-    if (!cgrp_ctx) {
-        cgroup_ctx_t cgrp_ctx;
-        memset(&cgrp_ctx, 0, sizeof(cgroup_ctx_t));
+    cgroup_ctx_t *cgroup_ctx = bpf_map_lookup_elem(&cgroup_ctx_stor, name);
+    if (cgroup_ctx == NULL) {
+        cgroup_ctx_t local_cgroup_ctx;
+        memset(&local_cgroup_ctx, 0, sizeof(local_cgroup_ctx));
 
-        err = bpf_map_update_elem(&cgroup_ctx_stor, (const void *)name, (const void *)&cgrp_ctx,
-                                  BPF_ANY);
+        err = bpf_map_update_elem(&cgroup_ctx_stor, (const void *)name,
+                                  (const void *)&local_cgroup_ctx, BPF_ANY);
         if (err < 0) {
+            dbg("[cmap][get_cgroup_ctx][cpu_cgroup_attach] error(%d) failed to update elem in map",
+                err);
             return NULL;
         }
+
+        cgroup_ctx = bpf_map_lookup_elem(&cgroup_ctx_stor, name);
     }
 
-    return cgrp_ctx;
+    return cgroup_ctx;
 }
 
 struct {
@@ -458,6 +462,32 @@ void BPF_STRUCT_OPS(finesched_quiescent, struct task_struct *p, u64 deq_flags) {
     stats_task_stop(tctx);
 }
 
+// Remember all newly created cgroups.
+SEC("fentry/cpu_cgroup_attach")
+int BPF_PROG(cpu_cgroup_attach, struct cgroup_taskset *tset) {
+    char cgroup_name[MAX_PATH];
+    int err;
+
+    memset(cgroup_name, 0, MAX_PATH);
+    err = bpf_probe_read_kernel_str(cgroup_name, MAX_PATH,
+                                    tset->cur_cset->dom_cset->dfl_cgrp->kn->name);
+    if (err <= 0) {
+        bpf_printk("cpu_cgroup_attach: error(%d) reading cgroup_name \n", err);
+        return 0;
+    }
+
+    cgroup_ctx_t *cgroup_ctx = lookup_or_build_cgroup_ctx(cgroup_name, MAX_PATH);
+    if (cgroup_ctx == NULL) {
+        bpf_printk("cpu_cgroup_attach: error building cgroup_ctx \n");
+        return 0;
+    }
+    cgroup_ctx->init = true;
+    cgroup_ctx->task_count = 0;
+
+    bpf_printk("cpu_cgroup_attach: cgroup = %s\n", cgroup_name);
+    return 0;
+}
+
 // Task @p is being created.
 //    called when task is being forked
 //    args has
@@ -469,7 +499,10 @@ s32 BPF_STRUCT_OPS(finesched_init_task, struct task_struct *p, struct scx_init_t
 
     info("[init_task] initializing task %d - %s", p->pid, p->comm);
 
-    switch_to_scx_is_docker(p);
+    switch_to_scx_if_cgroup_exists(p);
+
+    // TODO: Does not work in some cases.
+    // switch_to_scx_is_docker(p);
 
     // TODO: CMAP may not yet have been populated - I don't know of a way to
     // make sure of that yet

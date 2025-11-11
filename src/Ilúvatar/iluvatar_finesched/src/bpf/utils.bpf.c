@@ -368,7 +368,7 @@ static cgroup_ctx_t *__noinline get_cgroup_ctx_for_p(struct task_struct *p) {
     if (cg_name == NULL) {
         goto out_no_ctx;
     }
-    cgroup_ctx_t *cgrp_ctx = try_lookup_cgroup_ctx(cg_name, MAX_PATH);
+    cgroup_ctx_t *cgrp_ctx = lookup_or_build_cgroup_ctx(cg_name, MAX_PATH);
     if (cgrp_ctx == NULL) {
         goto out_no_ctx;
     }
@@ -503,6 +503,19 @@ static void __noinline poll_update_pid_gid_cache() {
 
 //////
 // Task -> SCX switch
+
+static void __noinline switch_to_scx_if_cgroup_exists(struct task_struct *p) {
+
+    char *name = get_schedcgroup_name(p);
+    if (name == NULL) {
+        return;
+    }
+
+    cgroup_ctx_t *cgroup_ctx = bpf_map_lookup_elem(&cgroup_ctx_stor, name);
+    if (cgroup_ctx != NULL) {
+        scx_bpf_switch_to_scx(p);
+    }
+}
 
 static void __noinline switch_to_scx_is_docker(struct task_struct *p) {
     // TODO: also switches runc - container runtime shim - shouldn't impact the
