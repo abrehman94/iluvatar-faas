@@ -13,6 +13,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 
 // we don't want licence of hashmap to be included for the scheduler
@@ -25,6 +26,7 @@ char _license[] SEC("license") = "GPL";
 // Global Data for bpf scheduler
 
 bool cpu_boost_config = false;
+bool enable_timer_callback = false;
 u32 enqueue_config = SCHED_CONFIG_PRIO_DSQ;
 u64 prio_dsq_count = 0;
 
@@ -240,27 +242,19 @@ struct {
 /*
  * Heartbeat scheduler timer callback.
  */
+
 static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer) {
     s32 cpu = bpf_get_smp_processor_id();
     int err = 0;
 
     info("[callback][timer] heartbeat timer fired on cpu %d", cpu);
 
-    if (enqueue_config == SCHED_CONFIG_PRIO_DSQ) {
+    // stats_update_global();
+    // capture_stats_for_gmap();
 
-        kick_prio_dsq_cpus();
-
-    } else {
-
-        poll_update_pid_gid_cache();
-    }
-
-    stats_update_global();
-    capture_stats_for_gmap();
-
-    if (cpu_boost_config) {
-        boost_cpus();
-    }
+    // if (cpu_boost_config) {
+    //     boost_cpus();
+    // }
 
     /* Re-arm the timer */
     err = bpf_timer_start(timer, HEARTBEAT_INTERVAL, 0);
@@ -328,111 +322,45 @@ int perf_sample_handler(struct bpf_perf_event_data *ctx) {
 //////////////////////////////
 // Scx Callbacks
 
-// task ran out of timeslice, @p is in need of dispatch
-// select the cpu for it and scx_bpf_dsq_insert( SCX_DSQ_LOCAL )
-// cpu would be selected by the cpu returned
+// dispatch the task @p to least loaded local dsq of a core that belongs
+// to the domain assigned by CP
 s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags) {
-    info("[callback][select_cpu] prev_cpu %d task %d - %s", prev_cpu, p->pid, p->comm);
+    u64 timeslice = DEFAULT_TS;
+    s32 cpu;
 
-    s32 cpu = 0;
-    u64 ts = 0;
-    s32 err;
+    cpu = least_loaded_local_dsq_cpu(NULL);
 
-    if (enqueue_config == SCHED_CONFIG_PRIO_DSQ) {
-        err = enqueue_prio_dsq(p);
-        if (err < 0) {
-            goto out_no_dispatch;
+    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
+    if (cgrp_chrs != NULL) {
+        SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(cgrp_chrs->gid);
+        if (sched_chrs != NULL) {
+            cpu = least_loaded_local_dsq_cpu(&sched_chrs->corebitmask);
+            timeslice = sched_chrs->timeslice;
         }
-    } else {
-        err = get_sched_cpu_ts(p, &cpu, &ts);
-        if (err < 0) {
-            goto out_no_dispatch;
-        }
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, ts * NSEC_PER_MSEC, 0);
-        return cpu;
     }
 
-    return prev_cpu;
+    info("[info][finesched_select_cpu] [%s:%d] cpu: %d ts: %d ", p->comm, p->pid, cpu, timeslice);
 
-out_no_dispatch:
-    info("[warn][select_cpu] no schedcgroup found for task %d - %s", p->pid, p->comm);
-    return prev_cpu;
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, timeslice, 0);
+    return cpu;
 }
 
-// enqueue the task @p, it was not dispatched in the select_cpu() call
-// enq_flags can be
-// see enum scx_enq_flags in ext.c for details
-//
-//  Can dispatch using scx_bpf_dsq_insert() to a Q
-//    custom DSQ_id
-//    global SCX_DSQ_GLOBAL
-//    can target specific CPU using SCX_DSQ_LOCAL_ON
-//    can preempt existing task on a cpu using SCX_ENQ_PREEMPT while
-//    dispatching to the local dsq
+// replinish the task @p timeslice
 void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
-    s32 err;
     s32 cpu = bpf_get_smp_processor_id();
-    u64 ts = 0;
-    info("[callback][enqueue] cpu %d task %d - %s", cpu, p->pid, p->comm);
+    u64 timeslice = DEFAULT_TS;
 
-    if (enqueue_config == SCHED_CONFIG_PRIO_DSQ) {
-        err = enqueue_prio_dsq(p);
-        if (err < 0) {
-            goto out_no_dispatch;
-        }
-    } else {
-        cpu = 0;
-        ts = 0;
-        err = get_sched_cpu_ts(p, &cpu, &ts);
-        if (err < 0) {
-            goto out_no_dispatch;
-        }
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, ts * NSEC_PER_MSEC, 0);
-    }
-
-    // task must have been dispatched by this point
-    return;
-
-out_no_dispatch:
-    info("[warn][enqueue] no schedcgroup found for task %d - %s", p->pid, p->comm);
-    q_inactive_task(p);
-}
-
-// local DSQ of cpu is empty, give it something or it will go idle
-//    can consume multiple tasks from custom DSQs into local DSQ
-void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
-    // info("[dispatch] on %d", cpu);
-
-    // scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
-    struct cpu_ctx *cctx = try_lookup_cpu_ctx(cpu);
-    if (!cctx) {
-        error("[dispatch] cctx not found for cpu %d ", cpu);
-        return;
-    }
-
-    if (cctx->prio_dsqid != -1 && cctx->prio_dsqid != 0) {
-        if (scx_bpf_dsq_move_to_local(cctx->prio_dsqid)) {
-            scx_bpf_dsq_move_to_local(cctx->prio_dsqid); // two consumes
-            info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
-        } else if ((s32)(cctx->prio_dsqid - 1) >= DSQ_PRIO_GRPS_START &&
-                   scx_bpf_dsq_move_to_local(cctx->prio_dsqid - 1)) {
-            info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
-        } else if ((s32)(cctx->prio_dsqid - 2) >= DSQ_PRIO_GRPS_START &&
-                   scx_bpf_dsq_move_to_local(cctx->prio_dsqid - 2)) {
-            info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
-        } else if ((s32)(cctx->prio_dsqid - 3) >= DSQ_PRIO_GRPS_START &&
-                   scx_bpf_dsq_move_to_local(cctx->prio_dsqid - 3)) {
-            info("[info][dispatch] consumed a task from prio DSQ on cpu %d", cpu);
+    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
+    if (cgrp_chrs != NULL) {
+        SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(cgrp_chrs->gid);
+        if (sched_chrs != NULL) {
+            timeslice = sched_chrs->timeslice;
         }
     }
 
-    scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL);
-    scx_bpf_dsq_move_to_local(DSQ_INACTIVE_GRPS_N1);
-    if (cores_inact_grp_mask && bpf_cpumask_test_cpu(cpu, cores_inact_grp_mask)) {
-        if (scx_bpf_dsq_move_to_local(DSQ_INACTIVE_GRPS_N0)) {
-            info("[info][dispatch] consumed a task from inactive groups DSQ on cpu %d", cpu);
-        }
-    }
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, timeslice, 0);
+
+    info("[info][finesched_enqueue] [%s:%d] cpu: %d ts: %d ", p->comm, p->pid, cpu, timeslice);
 }
 
 void BPF_STRUCT_OPS(finesched_set_cpumask, struct task_struct *p, const struct cpumask *cpumask) {
@@ -552,9 +480,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(finesched_init) {
 
     info("[init] initializing the tsksz scheduler");
 
-    err = usersched_timer_init();
-    if (err)
-        return err;
+    if (enable_timer_callback) {
+        err = usersched_timer_init();
+        if (err)
+            return err;
+    }
 
     err = populate_cpumasks();
     if (err < 0)
@@ -589,9 +519,9 @@ void BPF_STRUCT_OPS(finesched_exit, struct scx_exit_info *ei) {
 }
 
 SCX_OPS_DEFINE(finesched_ops, .select_cpu = (void *)finesched_select_cpu,
-               .enqueue = (void *)finesched_enqueue, .dispatch = (void *)finesched_dispatch,
-               .set_cpumask = (void *)finesched_set_cpumask, .running = (void *)finesched_running,
-               .stopping = (void *)finesched_stopping, .quiescent = (void *)finesched_quiescent,
+               .enqueue = (void *)finesched_enqueue, .set_cpumask = (void *)finesched_set_cpumask,
+               .running = (void *)finesched_running, .stopping = (void *)finesched_stopping,
+               .quiescent = (void *)finesched_quiescent,
                .update_idle = (void *)finesched_update_idle,
                .init_task = (void *)finesched_init_task, .exit_task = (void *)finesched_exit_task,
                .init = (void *)finesched_init, .exit = (void *)finesched_exit,

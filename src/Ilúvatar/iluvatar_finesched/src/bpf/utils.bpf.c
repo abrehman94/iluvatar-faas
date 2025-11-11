@@ -324,6 +324,33 @@ static s32 __noinline create_priority_dsqs() {
     return 0;
 }
 
+static s32 __inline min_dsq_len_among(s32 current_cpu, s32 old_cpu, s32 old_len) {
+    s32 current_len = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | current_cpu);
+    if (current_len < old_len) {
+        return current_cpu;
+    }
+
+    return old_cpu;
+}
+
+static s32 __noinline least_loaded_local_dsq_cpu(struct cpumask *bitmask) {
+    s32 cpu;
+    s32 min_dsq_cpu = 0;
+    s32 min_dsq_len = INT_MAX;
+
+    bpf_for(cpu, 0, MAX_CPUS) {
+        if (bitmask) {
+            if (bpf_cpumask_test_cpu(cpu, bitmask)) {
+                min_dsq_cpu = min_dsq_len_among(cpu, min_dsq_cpu, min_dsq_len);
+            }
+        } else {
+            min_dsq_cpu = min_dsq_len_among(cpu, min_dsq_cpu, min_dsq_len);
+        }
+    }
+
+    return min_dsq_cpu;
+}
+
 ////////////////////////////
 // Scheduling Logic Helpers
 
