@@ -147,6 +147,16 @@ static s32 __noinline populate_cpu_to_dsq() {
     return 0;
 }
 
+static struct bpf_cpumask *__noinline cpu_mask_intersection(struct cpumask *mask0,
+                                                            struct cpumask *mask1) {
+    struct bpf_cpumask *cpumask = bpf_cpumask_create();
+    if (!cpumask)
+        return NULL;
+
+    bpf_cpumask_and(cpumask, mask0, mask1);
+    return cpumask;
+}
+
 ////////////////////////////
 // Map Lookup
 
@@ -574,6 +584,30 @@ static void __noinline switch_to_scx_cmap_checked(struct task_struct *p) {
 
 //////
 // Task -> Sched CPU, TS
+
+static void __noinline update_from_assigned_domain(s32 *cpu, u64 *timeslice,
+                                                   struct task_struct *p) {
+    if (!cpu || !timeslice || !p) {
+        return;
+    }
+
+    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
+    if (cgrp_chrs != NULL) {
+        SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(cgrp_chrs->gid);
+        if (sched_chrs != NULL) {
+            struct bpf_cpumask *allowed_cpus_mask =
+                cpu_mask_intersection(p->cpus_ptr, &sched_chrs->corebitmask);
+            if (allowed_cpus_mask) {
+                if (!bpf_cpumask_empty((struct cpumask *)allowed_cpus_mask)) {
+                    *cpu = least_loaded_local_dsq_cpu((struct cpumask *)allowed_cpus_mask);
+                }
+                bpf_cpumask_release(allowed_cpus_mask);
+            }
+
+            *timeslice = sched_chrs->timeslice;
+        }
+    }
+}
 
 static s32 __noinline get_sched_cpu_ts(struct task_struct *p, s32 *cpu, u64 *ts) {
 

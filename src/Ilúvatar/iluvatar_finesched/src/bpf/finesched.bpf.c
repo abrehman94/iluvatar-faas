@@ -325,19 +325,11 @@ int perf_sample_handler(struct bpf_perf_event_data *ctx) {
 // dispatch the task @p to least loaded local dsq of a core that belongs
 // to the domain assigned by CP
 s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags) {
-    u64 timeslice = DEFAULT_TS;
     s32 cpu;
+    u64 timeslice = DEFAULT_TS;
 
-    cpu = least_loaded_local_dsq_cpu(NULL);
-
-    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
-    if (cgrp_chrs != NULL) {
-        SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(cgrp_chrs->gid);
-        if (sched_chrs != NULL) {
-            cpu = least_loaded_local_dsq_cpu(&sched_chrs->corebitmask);
-            timeslice = sched_chrs->timeslice;
-        }
-    }
+    cpu = least_loaded_local_dsq_cpu(p->cpus_ptr);
+    update_from_assigned_domain(&cpu, &timeslice, p);
 
     info("[info][finesched_select_cpu] [%s:%d] cpu: %d ts: %d ", p->comm, p->pid, cpu, timeslice);
 
@@ -350,15 +342,10 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
     s32 cpu = bpf_get_smp_processor_id();
     u64 timeslice = DEFAULT_TS;
 
-    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
-    if (cgrp_chrs != NULL) {
-        SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(cgrp_chrs->gid);
-        if (sched_chrs != NULL) {
-            timeslice = sched_chrs->timeslice;
-        }
-    }
+    cpu = least_loaded_local_dsq_cpu(p->cpus_ptr);
+    update_from_assigned_domain(&cpu, &timeslice, p);
 
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, timeslice, 0);
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, timeslice, 0);
 
     info("[info][finesched_enqueue] [%s:%d] cpu: %d ts: %d ", p->comm, p->pid, cpu, timeslice);
 }
