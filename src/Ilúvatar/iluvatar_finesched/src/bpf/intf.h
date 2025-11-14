@@ -40,14 +40,15 @@ enum consts {
     HEARTBEAT_INTERVAL = 200 * NSEC_PER_MSEC,
     // HEARTBEAT_INTERVAL = 100 * NSEC_PER_MSEC,
 
-    DSQ_INACTIVE_GRPS_N0 = 0x10, // custom DSQ on numa node 0 - custom DSQs can
-                                 // be allocated on any node, if no node is
-                                 // specified - it's allocated on the node on
-                                 // which the scx_bpf_create_dsq executes.
-                                 // for specific cores
-    DSQ_INACTIVE_GRPS_N1 = 0x11, // for all cores
-    DSQ_PRIO_GRPS_START = 0x200, // starting id for prio dsqs for the sched
-                                 // grps
+    DSQ_INACTIVE_GRPS_N0 = 0x10,    // custom DSQ on numa node 0 - custom DSQs can
+                                    // be allocated on any node, if no node is
+                                    // specified - it's allocated on the node on
+                                    // which the scx_bpf_create_dsq executes.
+                                    // for specific cores
+    DSQ_INACTIVE_GRPS_N1 = 0x11,    // for all cores
+    DSQ_PRIO_GRPS_START = 0x200,    // starting id for prio dsqs for the sched
+                                    // grps
+    DSQ_PRIO_PER_CPU_START = 0x300, // starting id for prio dsqs for the sched
     DSQ_MAX_COUNT = 0x20,
 
     INACTIVE_GRPS_TS = (10 * NSEC_PER_MSEC),

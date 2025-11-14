@@ -88,6 +88,8 @@ static int __noinline populate_cpumasks() {
     return 0;
 }
 
+static s32 __noinline cpu_to_numanode(s32 cpu) { return cpu < (MAX_CPUS / 2) ? 0 : 1; }
+
 static int __noinline cpumask_to_numanode(struct bpf_cpumask *cpumask) {
 
     int r = -1;
@@ -324,7 +326,7 @@ static long __noinline callback_gmap_create_dsqs_iter(struct bpf_map *map, const
     return 0;
 }
 
-static s32 __noinline create_priority_dsqs() {
+static s32 __noinline create_priority_dsqs_per_domain() {
 
     int count;
     count = bpf_for_each_map_elem(&gMap, &callback_gmap_create_dsqs_iter, &count, 0);
@@ -334,13 +336,37 @@ static s32 __noinline create_priority_dsqs() {
     return 0;
 }
 
-static s32 __inline min_dsq_len_among(s32 current_cpu, s32 old_cpu, s32 old_len) {
-    s32 current_len = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | current_cpu);
-    if (current_len < old_len) {
-        return current_cpu;
+static s32 __noinline create_priority_dsqs_per_cpu() {
+    s32 cpu;
+    s32 numa_node;
+    u64 dsqid;
+    s32 err = 0;
+
+    bpf_for(cpu, 0, MAX_CPUS) {
+        numa_node = cpu_to_numanode(cpu);
+        dsqid = DSQ_PRIO_PER_CPU_START + cpu;
+        err = scx_bpf_create_dsq(dsqid, numa_node);
+        if (err < 0) {
+            return err;
+        }
     }
 
-    return old_cpu;
+    return err;
+}
+
+static bool __inline lookup_and_update_min_dsq_len(s32 current_cpu, s32 *old_cpu, s32 *old_len) {
+    if (!old_cpu || !old_len) {
+        return false;
+    }
+
+    s32 current_len = scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + current_cpu);
+    if (current_len < *old_len) {
+        *old_cpu = current_cpu;
+        *old_len = current_len;
+        return true;
+    }
+
+    return false;
 }
 
 static s32 __noinline least_loaded_local_dsq_cpu(struct cpumask *bitmask) {
@@ -351,10 +377,10 @@ static s32 __noinline least_loaded_local_dsq_cpu(struct cpumask *bitmask) {
     bpf_for(cpu, 0, MAX_CPUS) {
         if (bitmask) {
             if (bpf_cpumask_test_cpu(cpu, bitmask)) {
-                min_dsq_cpu = min_dsq_len_among(cpu, min_dsq_cpu, min_dsq_len);
+                lookup_and_update_min_dsq_len(cpu, &min_dsq_cpu, &min_dsq_len);
             }
         } else {
-            min_dsq_cpu = min_dsq_len_among(cpu, min_dsq_cpu, min_dsq_len);
+            lookup_and_update_min_dsq_len(cpu, &min_dsq_cpu, &min_dsq_len);
         }
     }
 
@@ -584,6 +610,26 @@ static void __noinline switch_to_scx_cmap_checked(struct task_struct *p) {
 
 //////
 // Task -> Sched CPU, TS
+
+static u64 __always_inline fifo_vtime() { return bpf_ktime_get_ns(); }
+
+static u64 __noinline wakeup_boost_to_front_of_queue(u64 vtime, s32 cpu, u64 timeslice) {
+    s32 current_len = scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + cpu);
+    return vtime - (timeslice * current_len);
+}
+
+static u64 __noinline shorten_timeslice_by_dsqlen(u64 timeslice, s32 cpu) {
+    s32 current_len = scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + cpu);
+    current_len = current_len > 0 ? current_len : 1;
+
+    timeslice = timeslice / current_len;
+    u64 min_timeslice = 2; // ms
+    if (timeslice < min_timeslice) {
+        timeslice = min_timeslice;
+    }
+
+    return timeslice;
+}
 
 static void __noinline update_from_assigned_domain(s32 *cpu, u64 *timeslice,
                                                    struct task_struct *p) {

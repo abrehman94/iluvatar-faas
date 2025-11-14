@@ -333,7 +333,12 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 
     info("[info][finesched_select_cpu] [%s:%d] cpu: %d ts: %d ", p->comm, p->pid, cpu, timeslice);
 
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, timeslice, 0);
+    u64 vtime = fifo_vtime();
+    vtime = wakeup_boost_to_front_of_queue(vtime, cpu, timeslice);
+
+    timeslice = shorten_timeslice_by_dsqlen(timeslice, cpu);
+
+    scx_bpf_dsq_insert_vtime(p, DSQ_PRIO_PER_CPU_START + cpu, timeslice, vtime, 0);
     return cpu;
 }
 
@@ -345,9 +350,17 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
     cpu = least_loaded_local_dsq_cpu(p->cpus_ptr);
     update_from_assigned_domain(&cpu, &timeslice, p);
 
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, timeslice, 0);
+    timeslice = shorten_timeslice_by_dsqlen(timeslice, cpu);
+
+    scx_bpf_dsq_insert_vtime(p, DSQ_PRIO_PER_CPU_START + cpu, timeslice, fifo_vtime(), 0);
 
     info("[info][finesched_enqueue] [%s:%d] cpu: %d ts: %d ", p->comm, p->pid, cpu, timeslice);
+}
+
+void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
+    s32 task_count = 2;
+    s32 i;
+    bpf_for(i, 0, task_count) { scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu); }
 }
 
 void BPF_STRUCT_OPS(finesched_set_cpumask, struct task_struct *p, const struct cpumask *cpumask) {
@@ -485,7 +498,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(finesched_init) {
     if (err < 0)
         return err;
 
-    err = create_priority_dsqs();
+    err = create_priority_dsqs_per_domain();
+    if (err < 0)
+        return err;
+
+    err = create_priority_dsqs_per_cpu();
     if (err < 0)
         return err;
 
@@ -506,9 +523,9 @@ void BPF_STRUCT_OPS(finesched_exit, struct scx_exit_info *ei) {
 }
 
 SCX_OPS_DEFINE(finesched_ops, .select_cpu = (void *)finesched_select_cpu,
-               .enqueue = (void *)finesched_enqueue, .set_cpumask = (void *)finesched_set_cpumask,
-               .running = (void *)finesched_running, .stopping = (void *)finesched_stopping,
-               .quiescent = (void *)finesched_quiescent,
+               .enqueue = (void *)finesched_enqueue, .dispatch = (void *)finesched_dispatch,
+               .set_cpumask = (void *)finesched_set_cpumask, .running = (void *)finesched_running,
+               .stopping = (void *)finesched_stopping, .quiescent = (void *)finesched_quiescent,
                .update_idle = (void *)finesched_update_idle,
                .init_task = (void *)finesched_init_task, .exit_task = (void *)finesched_exit_task,
                .init = (void *)finesched_init, .exit = (void *)finesched_exit,
