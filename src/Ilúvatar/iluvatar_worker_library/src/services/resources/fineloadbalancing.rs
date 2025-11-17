@@ -560,14 +560,15 @@ impl ConsistentHashing {
     fn pick_next_domain(&self, starting_id: DomainId, func_name: &String, cpus: u32) -> Option<Arc<Domain>> {
         let domains = self.domains.immutable_clone();
         let total_domains = domains.len();
-        let mut domain_id = starting_id + 1;
-        while (domain_id % total_domains) != starting_id {
+        let next_domain_id = |domain_id| (domain_id + 1) % total_domains;
+        let mut domain_id = next_domain_id(starting_id);
+        while domain_id != starting_id {
             let domain = domains[domain_id].clone();
             if domain.can_serve_and_acquire_empty_or_assigned(func_name, cpus).is_ok() {
                 return Some(domain);
             }
 
-            domain_id = (domain_id + 1) % total_domains;
+            domain_id = next_domain_id(domain_id);
         }
 
         let domain = self.least_loaded_domain();
