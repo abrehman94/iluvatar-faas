@@ -333,12 +333,13 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 
     info("[info][finesched_select_cpu] [%s:%d] cpu: %d ts: %d ", p->comm, p->pid, cpu, timeslice);
 
-    u64 vtime = fifo_vtime();
-    vtime = wakeup_boost_to_front_of_queue(vtime, cpu, timeslice);
+    // u64 vtime = fifo_vtime();
+    // vtime = wakeup_boost_to_front_of_queue(vtime, cpu, timeslice);
 
     timeslice = shorten_timeslice_by_dsqlen(timeslice, cpu);
 
-    scx_bpf_dsq_insert_vtime(p, DSQ_PRIO_PER_CPU_START + cpu, timeslice, vtime, 0);
+    // scx_bpf_dsq_insert_vtime(p, DSQ_PRIO_PER_CPU_START + cpu, timeslice, vtime, 0);
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, timeslice, 0);
     return cpu;
 }
 
@@ -358,9 +359,9 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
-    s32 task_count = 2;
-    s32 i;
-    bpf_for(i, 0, task_count) { scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu); }
+    if (!scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu)) {
+        worksteal_from_neighbors(cpu);
+    }
 }
 
 void BPF_STRUCT_OPS(finesched_set_cpumask, struct task_struct *p, const struct cpumask *cpumask) {

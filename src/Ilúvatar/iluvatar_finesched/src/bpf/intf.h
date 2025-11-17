@@ -91,6 +91,8 @@ struct cpumask {
             bpf_printk(fmt, ##args);                                                               \
     } while (0)
 
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
 ////////////////////////////
 // Group Related Definitions
 typedef s32 SchedGroupID;

@@ -354,12 +354,17 @@ static s32 __noinline create_priority_dsqs_per_cpu() {
     return err;
 }
 
+static s32 __inline local_and_custom_dsq_len_for(s32 cpu) {
+    return scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) +
+           scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + cpu);
+}
+
 static bool __inline lookup_and_update_min_dsq_len(s32 current_cpu, s32 *old_cpu, s32 *old_len) {
     if (!old_cpu || !old_len) {
         return false;
     }
 
-    s32 current_len = scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + current_cpu);
+    s32 current_len = local_and_custom_dsq_len_for(current_cpu);
     if (current_len < *old_len) {
         *old_cpu = current_cpu;
         *old_len = current_len;
@@ -385,6 +390,48 @@ static s32 __noinline least_loaded_local_dsq_cpu(struct cpumask *bitmask) {
     }
 
     return min_dsq_cpu;
+}
+
+static s32 __always_inline clip_cpu_to_bounds(s32 cpu) {
+    cpu = cpu < 0 ? 0 : cpu;
+    cpu = cpu >= MAX_CPUS ? MAX_CPUS - 1 : cpu;
+    return cpu;
+}
+
+static bool __noinline worksteal_from_n_neighbors(s32 cpu, s32 n) {
+    // n: N, > 0
+    // stealing from n neighbors on each side of the cpu
+    cpu = clip_cpu_to_bounds(cpu);
+
+    s32 start_cpu = cpu - n;
+    s32 end_cpu = cpu + n;
+
+    start_cpu = clip_cpu_to_bounds(start_cpu);
+    end_cpu = clip_cpu_to_bounds(end_cpu);
+
+    s32 cpu_i;
+    bpf_for(cpu_i, cpu, end_cpu + 1) {
+        if (scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu_i)) {
+            return true;
+        }
+    }
+    bpf_for(cpu_i, start_cpu, cpu + 1) {
+        if (scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu_i)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void __noinline worksteal_from_neighbors(s32 cpu) {
+    s32 neighbor_count = MAX(cpu, MAX_CPUS - cpu);
+    s32 n;
+    bpf_for(n, 1, neighbor_count) {
+        if (worksteal_from_n_neighbors(cpu, n)) {
+            return;
+        }
+    }
 }
 
 ////////////////////////////
@@ -614,12 +661,12 @@ static void __noinline switch_to_scx_cmap_checked(struct task_struct *p) {
 static u64 __always_inline fifo_vtime() { return bpf_ktime_get_ns(); }
 
 static u64 __noinline wakeup_boost_to_front_of_queue(u64 vtime, s32 cpu, u64 timeslice) {
-    s32 current_len = scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + cpu);
+    s32 current_len = local_and_custom_dsq_len_for(cpu);
     return vtime - (timeslice * current_len);
 }
 
 static u64 __noinline shorten_timeslice_by_dsqlen(u64 timeslice, s32 cpu) {
-    s32 current_len = scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + cpu);
+    s32 current_len = local_and_custom_dsq_len_for(cpu);
     current_len = current_len > 0 ? current_len : 1;
 
     timeslice = timeslice / current_len;
