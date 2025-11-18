@@ -354,6 +354,20 @@ static s32 __noinline create_priority_dsqs_per_cpu() {
     return err;
 }
 
+static s32 __inline move_from_custom_to_local_dsq(s32 cpu, s32 task_count) {
+    s32 tasks_moved = 0;
+    s32 i;
+    bpf_for(i, 0, task_count) {
+        if (scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu)) {
+            tasks_moved += 1;
+        } else {
+            return tasks_moved;
+        }
+    }
+
+    return tasks_moved;
+}
+
 static s32 __inline local_and_custom_dsq_len_for(s32 cpu) {
     return scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) +
            scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + cpu);
@@ -398,7 +412,7 @@ static s32 __always_inline clip_cpu_to_bounds(s32 cpu) {
     return cpu;
 }
 
-static bool __noinline worksteal_from_n_neighbors(s32 cpu, s32 n) {
+static s32 __noinline worksteal_from_n_neighbors(s32 cpu, s32 n, s32 task_count) {
     // n: N, > 0
     // stealing from n neighbors on each side of the cpu
     cpu = clip_cpu_to_bounds(cpu);
@@ -409,26 +423,35 @@ static bool __noinline worksteal_from_n_neighbors(s32 cpu, s32 n) {
     start_cpu = clip_cpu_to_bounds(start_cpu);
     end_cpu = clip_cpu_to_bounds(end_cpu);
 
+    s32 tasks_leftover = task_count;
+    s32 tasks_moved = 0;
+
     s32 cpu_i;
     bpf_for(cpu_i, cpu, end_cpu + 1) {
-        if (scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu_i)) {
-            return true;
+        tasks_moved += move_from_custom_to_local_dsq(cpu_i, tasks_leftover);
+        tasks_leftover = task_count - tasks_moved;
+        if (tasks_leftover == 0) {
+            return tasks_moved;
         }
     }
     bpf_for(cpu_i, start_cpu, cpu + 1) {
-        if (scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu_i)) {
-            return true;
+        tasks_moved += move_from_custom_to_local_dsq(cpu_i, tasks_leftover);
+        tasks_leftover = task_count - tasks_moved;
+        if (tasks_leftover == 0) {
+            return tasks_moved;
         }
     }
 
-    return false;
+    return tasks_moved;
 }
 
-static void __noinline worksteal_from_neighbors(s32 cpu) {
+static void __noinline worksteal_from_neighbors(s32 cpu, s32 task_count) {
     s32 neighbor_count = MAX(cpu, MAX_CPUS - cpu);
     s32 n;
+    s32 tasks_leftover = task_count;
     bpf_for(n, 1, neighbor_count) {
-        if (worksteal_from_n_neighbors(cpu, n)) {
+        tasks_leftover = tasks_leftover - worksteal_from_n_neighbors(cpu, n, tasks_leftover);
+        if (tasks_leftover == 0) {
             return;
         }
     }

@@ -359,8 +359,12 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
-    if (!scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu)) {
-        worksteal_from_neighbors(cpu);
+    s32 task_count = 2;
+    s32 tasks_leftover;
+
+    tasks_leftover = task_count - move_from_custom_to_local_dsq(cpu, task_count);
+    if (tasks_leftover) {
+        worksteal_from_neighbors(cpu, tasks_leftover);
     }
 }
 
