@@ -74,9 +74,15 @@ impl PreAllocatedGroups {
         // populate the sharedmap with it
         gh.iter().for_each(|ent| {
             let (gid, group) = (ent.key(), ent.value());
+            let reserved_start = 0 as usize;
+            let reserved_end = group.cores.len() / 3;
+            let regular_start = group.cores.len() / 3;
+            let regular_end = group.cores.len();
+
             let sg = SchedGroupChrs {
                 id: *gid,
-                corebitmask: vec_to_cpumask(&group.cores),
+                reserved_corebitmask: vec_to_cpumask(&group.cores[reserved_start..reserved_end]),
+                corebitmask: vec_to_cpumask(&group.cores[regular_start..regular_end]),
                 core_count: group.cores.len() as u64,
                 timeslice: group.ts, // in ms
                 fifo: group.fifo,

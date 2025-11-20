@@ -15,7 +15,7 @@ u32 bpf_cpumask_first_and(const struct cpumask *src1, const struct cpumask *src2
  * Allocate/re-allocate a new cpumask.
  * Thanks to andrea from bpfland code.
  */
-static int calloc_cpumask(struct bpf_cpumask **p_cpumask) {
+static s32 calloc_cpumask(struct bpf_cpumask **p_cpumask) {
     struct bpf_cpumask *cpumask;
 
     cpumask = bpf_cpumask_create();
@@ -336,6 +336,110 @@ static s32 __noinline create_priority_dsqs_per_domain() {
     return 0;
 }
 
+struct global_reserved_corebitmask_kfunc_map_value {
+    struct bpf_cpumask __kptr *bpf_cpumask;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, int);
+    __type(value, struct global_reserved_corebitmask_kfunc_map_value);
+    __uint(max_entries, 1);
+} global_reserved_corebitmask_kfunc_map SEC(".maps");
+
+__always_inline struct global_reserved_corebitmask_kfunc_map_value *
+get_global_reserved_corebitmask_map_value() {
+    s32 err;
+    int key = 0;
+    struct global_reserved_corebitmask_kfunc_map_value *v;
+
+    v = bpf_map_lookup_elem(&global_reserved_corebitmask_kfunc_map, &key);
+    if (!v) {
+        struct global_reserved_corebitmask_kfunc_map_value default_v;
+        default_v.bpf_cpumask = NULL;
+        err = bpf_map_update_elem(&global_reserved_corebitmask_kfunc_map, &key,
+                                  (const void *)&default_v, BPF_ANY);
+        if (err < 0) {
+            return NULL;
+        }
+
+        v = bpf_map_lookup_elem(&global_reserved_corebitmask_kfunc_map, &key);
+        if (!v) {
+            return NULL;
+        }
+
+        err = calloc_cpumask(&v->bpf_cpumask);
+        if (err < 0) {
+            return NULL;
+        }
+    }
+    return v;
+}
+
+static __noinline void global_reserved_corebitmask_or_and_store(const struct cpumask *corebitmask) {
+    s32 err;
+    struct global_reserved_corebitmask_kfunc_map_value *v;
+
+    v = get_global_reserved_corebitmask_map_value();
+    if (!v) {
+        return;
+    }
+
+    if (v->bpf_cpumask) {
+        struct bpf_cpumask *map_mask = NULL;
+
+        map_mask = bpf_kptr_xchg(&v->bpf_cpumask, NULL);
+        if (map_mask) {
+            bpf_cpumask_or(map_mask, (const struct cpumask *)map_mask, corebitmask);
+            map_mask = bpf_kptr_xchg(&v->bpf_cpumask, map_mask);
+            if (map_mask) {
+                bpf_cpumask_release(map_mask);
+            }
+        }
+    }
+}
+
+static __noinline bool global_reserved_corebitmask_is_set(s32 cpu) {
+    s32 err;
+    struct global_reserved_corebitmask_kfunc_map_value *v;
+
+    v = get_global_reserved_corebitmask_map_value();
+    if (!v) {
+        return false;
+    }
+
+    if (v->bpf_cpumask) {
+        return bpf_cpumask_test_cpu(cpu, v->bpf_cpumask);
+    }
+
+    return false;
+}
+
+static long __noinline callback_gmap_populate_reserved_corebitmask_iter(struct bpf_map *map,
+                                                                        const void *key, void *val,
+                                                                        void *ctx) {
+
+    if (!key || !val) {
+        return 1;
+    }
+
+    SchedGroupID *gid = (SchedGroupID *)key;
+    SchedGroupChrs_t *chrs = (SchedGroupChrs_t *)val;
+
+    global_reserved_corebitmask_or_and_store(&chrs->reserved_corebitmask);
+    return 0;
+}
+
+static s32 __noinline create_global_reserved_corebitmask() {
+
+    int count;
+    count =
+        bpf_for_each_map_elem(&gMap, &callback_gmap_populate_reserved_corebitmask_iter, &count, 0);
+    info("[dsqs][gmap] iterated total of %d elements to populate reserved corebitmask", count);
+
+    return 0;
+}
+
 static s32 __noinline create_priority_dsqs_per_cpu() {
     s32 cpu;
     s32 numa_node;
@@ -354,15 +458,19 @@ static s32 __noinline create_priority_dsqs_per_cpu() {
     return err;
 }
 
-static s32 __inline move_from_custom_to_local_dsq(s32 cpu, s32 task_count) {
+// bpf verifier does not allow scx_bpf_dsq_move_to_local call within a
+// bpf_for loop. This function only moves three tasks at max.
+static s32 __noinline move_from_custom_to_local_dsq(s32 cpu, s32 task_count) {
     s32 tasks_moved = 0;
-    s32 i;
-    bpf_for(i, 0, task_count) {
-        if (scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu)) {
-            tasks_moved += 1;
-        } else {
-            return tasks_moved;
-        }
+
+    if (task_count != tasks_moved && scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu)) {
+        tasks_moved += 1;
+    }
+    if (task_count != tasks_moved && scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu)) {
+        tasks_moved += 1;
+    }
+    if (task_count != tasks_moved && scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu)) {
+        tasks_moved += 1;
     }
 
     return tasks_moved;
@@ -713,6 +821,30 @@ static void __noinline update_from_assigned_domain(s32 *cpu, u64 *timeslice,
         if (sched_chrs != NULL) {
             struct bpf_cpumask *allowed_cpus_mask =
                 cpu_mask_intersection(p->cpus_ptr, &sched_chrs->corebitmask);
+            if (allowed_cpus_mask) {
+                if (!bpf_cpumask_empty((struct cpumask *)allowed_cpus_mask)) {
+                    *cpu = least_loaded_local_dsq_cpu((struct cpumask *)allowed_cpus_mask);
+                }
+                bpf_cpumask_release(allowed_cpus_mask);
+            }
+
+            *timeslice = sched_chrs->timeslice;
+        }
+    }
+}
+
+static void __noinline update_from_assigned_domain_for_high_priority_tasks(s32 *cpu, u64 *timeslice,
+                                                                           struct task_struct *p) {
+    if (!cpu || !timeslice || !p) {
+        return;
+    }
+
+    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
+    if (cgrp_chrs != NULL) {
+        SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(cgrp_chrs->gid);
+        if (sched_chrs != NULL) {
+            struct bpf_cpumask *allowed_cpus_mask =
+                cpu_mask_intersection(p->cpus_ptr, &sched_chrs->reserved_corebitmask);
             if (allowed_cpus_mask) {
                 if (!bpf_cpumask_empty((struct cpumask *)allowed_cpus_mask)) {
                     *cpu = least_loaded_local_dsq_cpu((struct cpumask *)allowed_cpus_mask);

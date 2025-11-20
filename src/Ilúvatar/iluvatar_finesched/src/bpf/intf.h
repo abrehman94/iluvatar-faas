@@ -120,13 +120,13 @@ typedef struct SchedGroupStats {
 // Group Characteristics Structure
 typedef struct SchedGroupChrs {
     SchedGroupID id;
-    struct cpumask corebitmask; // bitmask for the cores that belong
-                                // to this group
-    u64 core_count;             // number of cores in the group
-    u64 timeslice;              // in ms
-    u32 fifo;                   // single queue should be fifo or not
-    u32 prio;                   // enqueue priority type:
-    u32 perf;                   // the perf setting for the set of cores of this group
+    struct cpumask reserved_corebitmask; // for high priority tasks
+    struct cpumask corebitmask;          // for regular tasks
+    u64 core_count;
+    u64 timeslice; // ms
+    u32 fifo;      // single queue should be fifo or not
+    u32 prio;      // enqueue priority type:
+    u32 perf;      // frequency setting
 
 } SchedGroupChrs_t;
 
