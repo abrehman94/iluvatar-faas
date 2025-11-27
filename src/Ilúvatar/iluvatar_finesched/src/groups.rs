@@ -75,8 +75,8 @@ impl PreAllocatedGroups {
         gh.iter().for_each(|ent| {
             let (gid, group) = (ent.key(), ent.value());
             let reserved_start = 0 as usize;
-            let reserved_end = group.cores.len() / 3;
-            let regular_start = group.cores.len() / 3;
+            let reserved_end = group.cores.len() / 2;
+            let regular_start = group.cores.len() / 2;
             let regular_end = group.cores.len();
 
             let sg = SchedGroupChrs {

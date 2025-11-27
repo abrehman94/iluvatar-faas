@@ -367,9 +367,10 @@ void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
 
     tasks_leftover = task_count - move_from_custom_to_local_dsq(cpu, task_count);
     if (tasks_leftover) {
-        if (!global_reserved_corebitmask_is_set(cpu)) {
-            worksteal_from_neighbors(cpu, tasks_leftover);
-        }
+        // if (!global_reserved_corebitmask_is_set(cpu)) {
+        //     worksteal_from_neighbors(cpu, tasks_leftover);
+        // }
+        worksteal_from_neighbors(cpu, tasks_leftover);
     }
 }
 
