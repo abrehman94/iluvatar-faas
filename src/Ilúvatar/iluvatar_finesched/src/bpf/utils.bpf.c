@@ -801,7 +801,7 @@ static u64 __noinline shorten_timeslice_by_dsqlen(u64 timeslice, s32 cpu) {
     current_len = current_len > 0 ? current_len : 1;
 
     timeslice = timeslice / current_len;
-    u64 min_timeslice = 2; // ms
+    u64 min_timeslice = 2 * NSEC_PER_MSEC; // ms
     if (timeslice < min_timeslice) {
         timeslice = min_timeslice;
     }
@@ -828,7 +828,7 @@ static void __noinline update_from_assigned_domain(s32 *cpu, u64 *timeslice,
                 bpf_cpumask_release(allowed_cpus_mask);
             }
 
-            *timeslice = sched_chrs->timeslice;
+            *timeslice = sched_chrs->timeslice * NSEC_PER_MSEC;
         }
     }
 }
@@ -852,7 +852,7 @@ static void __noinline update_from_assigned_domain_for_high_priority_tasks(s32 *
                 bpf_cpumask_release(allowed_cpus_mask);
             }
 
-            *timeslice = sched_chrs->timeslice;
+            *timeslice = sched_chrs->timeslice * NSEC_PER_MSEC;
         }
     }
 }
