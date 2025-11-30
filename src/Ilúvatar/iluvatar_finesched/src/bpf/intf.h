@@ -49,6 +49,11 @@ enum consts {
     DSQ_PRIO_GRPS_START = 0x200,    // starting id for prio dsqs for the sched
                                     // grps
     DSQ_PRIO_PER_CPU_START = 0x300, // starting id for prio dsqs for the sched
+
+    DSQ_PRIO_Q_PER_DOM_START = 0x400,
+    DSQ_REG_Q_PER_DOM_START = 0x500,
+    DSQ_GLOBAL_Q_ID = 0x600,
+
     DSQ_MAX_COUNT = 0x20,
 
     INACTIVE_GRPS_TS = (10 * NSEC_PER_MSEC),

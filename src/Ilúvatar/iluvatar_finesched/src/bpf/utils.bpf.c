@@ -263,311 +263,6 @@ static void __noinline dump_gMap() {
     }
 }
 
-////////////////////////////
-// DSQ helpers
-//   it's possible to iterate dsqs see in ext.c kernel
-//     bpf_iter_scx_dsq_new
-//     bpf_iter_scx_dsq_next
-//     bpf_iter_scx_dsq_destroy
-
-static void __noinline q_inactive_task(struct task_struct *p) {
-
-    // TODO: putting all inactive tasks to a single Q will make transition to
-    // active slower - need to solve this problem
-    //    all such delays can be circumvented by creating a Q for dispatches in
-    //    CP - classic another level of Queueing/indirection to solve a problem
-    struct task_ctx *tctx;
-    tctx = try_lookup_task_ctx(p);
-    if (!tctx) {
-        error("[q_inactive_task] task context not found for task %d - %s", p->pid, p->comm);
-        return;
-    }
-    if (tctx->active_q) {
-        return;
-    }
-
-    // check if p is allowed on inactive group cores - Q accordingly
-    if (cores_inact_grp_mask && !bpf_cpumask_intersects(cores_inact_grp_mask, p->cpus_ptr)) {
-        // Q that consumes on all cores
-        scx_bpf_dsq_insert(p, DSQ_INACTIVE_GRPS_N1, INACTIVE_GRPS_TS, 0);
-        info("[info][dispatch][inactive] to DSQ_INACTIVE_GRPS_N1 task %d - %s", p->pid, p->comm);
-    } else {
-        // Q that consumes on only inactive group cores
-        scx_bpf_dsq_insert(p, DSQ_INACTIVE_GRPS_N0, INACTIVE_GRPS_TS, 0);
-        info("[info][dispatch][inactive] to DSQ_INACTIVE_GRPS_N0 task %d - %s", p->pid, p->comm);
-    }
-}
-
-static long __noinline callback_gmap_create_dsqs_iter(struct bpf_map *map, const void *key,
-                                                      void *val, void *ctx) {
-
-    int err;
-
-    if (!key || !val) {
-        return 1;
-    }
-
-    SchedGroupID *gid = (SchedGroupID *)key;
-    SchedGroupChrs_t *chrs = (SchedGroupChrs_t *)val;
-
-    int numa_node = cpumask_to_numanode(&chrs->corebitmask);
-    if (numa_node < 0) {
-        error("[dsqs][gmap] numa node of gid %d is incorrectly identified", *gid);
-        return 1;
-    }
-
-    int dsqid = DSQ_PRIO_GRPS_START + *gid;
-
-    info("[dsqs][gmap] created dsq %d on numa node %d for gid %d", dsqid, numa_node, *gid);
-    err = scx_bpf_create_dsq(dsqid, numa_node);
-    if (err < 0)
-        return 1;
-
-    return 0;
-}
-
-static s32 __noinline create_priority_dsqs_per_domain() {
-
-    int count;
-    count = bpf_for_each_map_elem(&gMap, &callback_gmap_create_dsqs_iter, &count, 0);
-    info("[dsqs][gmap] iterated total of %d elements to create priority dsqs", count);
-    prio_dsq_count = count;
-
-    return 0;
-}
-
-struct global_reserved_corebitmask_kfunc_map_value {
-    struct bpf_cpumask __kptr *bpf_cpumask;
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, int);
-    __type(value, struct global_reserved_corebitmask_kfunc_map_value);
-    __uint(max_entries, 1);
-} global_reserved_corebitmask_kfunc_map SEC(".maps");
-
-__always_inline struct global_reserved_corebitmask_kfunc_map_value *
-get_global_reserved_corebitmask_map_value() {
-    s32 err;
-    int key = 0;
-    struct global_reserved_corebitmask_kfunc_map_value *v;
-
-    v = bpf_map_lookup_elem(&global_reserved_corebitmask_kfunc_map, &key);
-    if (!v) {
-        struct global_reserved_corebitmask_kfunc_map_value default_v;
-        default_v.bpf_cpumask = NULL;
-        err = bpf_map_update_elem(&global_reserved_corebitmask_kfunc_map, &key,
-                                  (const void *)&default_v, BPF_ANY);
-        if (err < 0) {
-            return NULL;
-        }
-
-        v = bpf_map_lookup_elem(&global_reserved_corebitmask_kfunc_map, &key);
-        if (!v) {
-            return NULL;
-        }
-
-        err = calloc_cpumask(&v->bpf_cpumask);
-        if (err < 0) {
-            return NULL;
-        }
-    }
-    return v;
-}
-
-static __noinline void global_reserved_corebitmask_or_and_store(const struct cpumask *corebitmask) {
-    s32 err;
-    struct global_reserved_corebitmask_kfunc_map_value *v;
-
-    v = get_global_reserved_corebitmask_map_value();
-    if (!v) {
-        return;
-    }
-
-    if (v->bpf_cpumask) {
-        struct bpf_cpumask *map_mask = NULL;
-
-        map_mask = bpf_kptr_xchg(&v->bpf_cpumask, NULL);
-        if (map_mask) {
-            bpf_cpumask_or(map_mask, (const struct cpumask *)map_mask, corebitmask);
-            map_mask = bpf_kptr_xchg(&v->bpf_cpumask, map_mask);
-            if (map_mask) {
-                bpf_cpumask_release(map_mask);
-            }
-        }
-    }
-}
-
-static __noinline bool global_reserved_corebitmask_is_set(s32 cpu) {
-    s32 err;
-    struct global_reserved_corebitmask_kfunc_map_value *v;
-
-    v = get_global_reserved_corebitmask_map_value();
-    if (!v) {
-        return false;
-    }
-
-    if (v->bpf_cpumask) {
-        return bpf_cpumask_test_cpu(cpu, v->bpf_cpumask);
-    }
-
-    return false;
-}
-
-static long __noinline callback_gmap_populate_reserved_corebitmask_iter(struct bpf_map *map,
-                                                                        const void *key, void *val,
-                                                                        void *ctx) {
-
-    if (!key || !val) {
-        return 1;
-    }
-
-    SchedGroupID *gid = (SchedGroupID *)key;
-    SchedGroupChrs_t *chrs = (SchedGroupChrs_t *)val;
-
-    global_reserved_corebitmask_or_and_store(&chrs->reserved_corebitmask);
-    return 0;
-}
-
-static s32 __noinline create_global_reserved_corebitmask() {
-
-    int count;
-    count =
-        bpf_for_each_map_elem(&gMap, &callback_gmap_populate_reserved_corebitmask_iter, &count, 0);
-    info("[dsqs][gmap] iterated total of %d elements to populate reserved corebitmask", count);
-
-    return 0;
-}
-
-static s32 __noinline create_priority_dsqs_per_cpu() {
-    s32 cpu;
-    s32 numa_node;
-    u64 dsqid;
-    s32 err = 0;
-
-    bpf_for(cpu, 0, MAX_CPUS) {
-        numa_node = cpu_to_numanode(cpu);
-        dsqid = DSQ_PRIO_PER_CPU_START + cpu;
-        err = scx_bpf_create_dsq(dsqid, numa_node);
-        if (err < 0) {
-            return err;
-        }
-    }
-
-    return err;
-}
-
-// bpf verifier does not allow scx_bpf_dsq_move_to_local call within a
-// bpf_for loop. This function only moves three tasks at max.
-static s32 __noinline move_from_custom_to_local_dsq(s32 cpu, s32 task_count) {
-    s32 tasks_moved = 0;
-
-    if (task_count != tasks_moved && scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu)) {
-        tasks_moved += 1;
-    }
-    if (task_count != tasks_moved && scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu)) {
-        tasks_moved += 1;
-    }
-    if (task_count != tasks_moved && scx_bpf_dsq_move_to_local(DSQ_PRIO_PER_CPU_START + cpu)) {
-        tasks_moved += 1;
-    }
-
-    return tasks_moved;
-}
-
-static s32 __inline local_and_custom_dsq_len_for(s32 cpu) {
-    return scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) +
-           scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + cpu);
-}
-
-static bool __inline lookup_and_update_min_dsq_len(s32 current_cpu, s32 *old_cpu, s32 *old_len) {
-    if (!old_cpu || !old_len) {
-        return false;
-    }
-
-    s32 current_len = local_and_custom_dsq_len_for(current_cpu);
-    if (current_len < *old_len) {
-        *old_cpu = current_cpu;
-        *old_len = current_len;
-        return true;
-    }
-
-    return false;
-}
-
-static s32 __noinline least_loaded_local_dsq_cpu(struct cpumask *bitmask) {
-    s32 cpu;
-    s32 min_dsq_cpu = 0;
-    s32 min_dsq_len = INT_MAX;
-
-    bpf_for(cpu, 0, MAX_CPUS) {
-        if (bitmask) {
-            if (bpf_cpumask_test_cpu(cpu, bitmask)) {
-                lookup_and_update_min_dsq_len(cpu, &min_dsq_cpu, &min_dsq_len);
-            }
-        } else {
-            lookup_and_update_min_dsq_len(cpu, &min_dsq_cpu, &min_dsq_len);
-        }
-    }
-
-    return min_dsq_cpu;
-}
-
-static s32 __always_inline clip_cpu_to_bounds(s32 cpu) {
-    cpu = cpu < 0 ? 0 : cpu;
-    cpu = cpu >= MAX_CPUS ? MAX_CPUS - 1 : cpu;
-    return cpu;
-}
-
-static s32 __noinline worksteal_from_n_neighbors(s32 cpu, s32 n, s32 task_count) {
-    // n: N, > 0
-    // stealing from n neighbors on each side of the cpu
-    cpu = clip_cpu_to_bounds(cpu);
-
-    s32 start_cpu = cpu - n;
-    s32 end_cpu = cpu + n;
-
-    start_cpu = clip_cpu_to_bounds(start_cpu);
-    end_cpu = clip_cpu_to_bounds(end_cpu);
-
-    s32 tasks_leftover = task_count;
-    s32 tasks_moved = 0;
-
-    s32 cpu_i;
-    bpf_for(cpu_i, cpu, end_cpu + 1) {
-        tasks_moved += move_from_custom_to_local_dsq(cpu_i, tasks_leftover);
-        tasks_leftover = task_count - tasks_moved;
-        if (tasks_leftover == 0) {
-            return tasks_moved;
-        }
-    }
-    bpf_for(cpu_i, start_cpu, cpu + 1) {
-        tasks_moved += move_from_custom_to_local_dsq(cpu_i, tasks_leftover);
-        tasks_leftover = task_count - tasks_moved;
-        if (tasks_leftover == 0) {
-            return tasks_moved;
-        }
-    }
-
-    return tasks_moved;
-}
-
-static void __noinline worksteal_from_neighbors(s32 cpu, s32 task_count) {
-    s32 neighbor_count = MAX(cpu, MAX_CPUS - cpu);
-    s32 n;
-    s32 tasks_leftover = task_count;
-    bpf_for(n, 1, neighbor_count) {
-        tasks_leftover = tasks_leftover - worksteal_from_n_neighbors(cpu, n, tasks_leftover);
-        if (tasks_leftover == 0) {
-            return;
-        }
-    }
-}
-
-////////////////////////////
-// Scheduling Logic Helpers
-
 //////
 // Task -> SchedGroupChrs_t, CgroupChrs_t, SchedGroupID
 
@@ -741,6 +436,440 @@ static void __noinline poll_update_pid_gid_cache() {
     count = bpf_for_each_map_elem(&pid_chrs_cache, &callback_pid_chrs_cache_iter, &count, 0);
     info("[pid_chrs_cache] iterated total of %d elements", count);
 }
+
+////////////////////////////
+// DSQ helpers
+//   it's possible to iterate dsqs see in ext.c kernel
+//     bpf_iter_scx_dsq_new
+//     bpf_iter_scx_dsq_next
+//     bpf_iter_scx_dsq_destroy
+
+static void __noinline q_inactive_task(struct task_struct *p) {
+
+    // TODO: putting all inactive tasks to a single Q will make transition to
+    // active slower - need to solve this problem
+    //    all such delays can be circumvented by creating a Q for dispatches in
+    //    CP - classic another level of Queueing/indirection to solve a problem
+    struct task_ctx *tctx;
+    tctx = try_lookup_task_ctx(p);
+    if (!tctx) {
+        error("[q_inactive_task] task context not found for task %d - %s", p->pid, p->comm);
+        return;
+    }
+    if (tctx->active_q) {
+        return;
+    }
+
+    // check if p is allowed on inactive group cores - Q accordingly
+    if (cores_inact_grp_mask && !bpf_cpumask_intersects(cores_inact_grp_mask, p->cpus_ptr)) {
+        // Q that consumes on all cores
+        scx_bpf_dsq_insert(p, DSQ_INACTIVE_GRPS_N1, INACTIVE_GRPS_TS, 0);
+        info("[info][dispatch][inactive] to DSQ_INACTIVE_GRPS_N1 task %d - %s", p->pid, p->comm);
+    } else {
+        // Q that consumes on only inactive group cores
+        scx_bpf_dsq_insert(p, DSQ_INACTIVE_GRPS_N0, INACTIVE_GRPS_TS, 0);
+        info("[info][dispatch][inactive] to DSQ_INACTIVE_GRPS_N0 task %d - %s", p->pid, p->comm);
+    }
+}
+
+static __noinline long callback_gmap_create_dsqs_iter(struct bpf_map *map, const void *key,
+                                                      void *val, void *ctx) {
+
+    int err;
+
+    if (!key || !val) {
+        return 1;
+    }
+
+    SchedGroupID *gid = (SchedGroupID *)key;
+    SchedGroupChrs_t *chrs = (SchedGroupChrs_t *)val;
+
+    int numa_node = cpumask_to_numanode(&chrs->corebitmask);
+    if (numa_node < 0) {
+        error("[dsqs][gmap] numa node of gid %d is incorrectly identified", *gid);
+        return 1;
+    }
+
+    int dsqid;
+    dsqid = DSQ_PRIO_Q_PER_DOM_START + *gid;
+    err = scx_bpf_create_dsq(dsqid, numa_node);
+    if (err < 0)
+        return 1;
+
+    dsqid = DSQ_REG_Q_PER_DOM_START + *gid;
+    err = scx_bpf_create_dsq(dsqid, numa_node);
+    if (err < 0)
+        return 1;
+
+    return 0;
+}
+
+static s32 __noinline create_dsqs_per_domain() {
+
+    s32 count;
+    count = bpf_for_each_map_elem(&gMap, &callback_gmap_create_dsqs_iter, &count, 0);
+    info("[dsqs][gmap] iterated total of %d elements to create priority dsqs", count);
+    domains_count = count;
+
+    return 0;
+}
+
+static __always_inline s32 clip_dsqid_to_bounds(u64 dsqid, u64 starting_offset) {
+    dsqid = dsqid < starting_offset ? starting_offset : dsqid;
+    dsqid =
+        dsqid >= (starting_offset + domains_count) ? (starting_offset + domains_count) - 1 : dsqid;
+    return dsqid;
+}
+
+static s32 __noinline create_global_dsq() {
+    s32 dsqid;
+
+    dsqid = DSQ_GLOBAL_Q_ID + 0;
+    return scx_bpf_create_dsq(dsqid, 0);
+}
+
+static u64 cpu_to_domain_id[MAX_CPUS] = {0};
+
+static __noinline long callback_gmap_populate_cpu_to_domain_id_map_iter(struct bpf_map *map,
+                                                                        const void *key, void *val,
+                                                                        void *ctx) {
+
+    if (!key || !val) {
+        return 1;
+    }
+
+    SchedGroupID *gid = (SchedGroupID *)key;
+    SchedGroupChrs_t *chrs = (SchedGroupChrs_t *)val;
+
+    s32 cpu;
+    bpf_for(cpu, 0, MAX_CPUS) {
+        if (bpf_cpumask_test_cpu(cpu, &chrs->corebitmask)) {
+            cpu_to_domain_id[cpu] = *gid;
+        }
+    }
+
+    return 0;
+}
+
+static s32 __noinline populate_cpu_to_domain_id_map() {
+    s32 count;
+    count =
+        bpf_for_each_map_elem(&gMap, &callback_gmap_populate_cpu_to_domain_id_map_iter, &count, 0);
+
+    return 0;
+}
+
+static __always_inline s32 clip_cpu_to_bounds(s32 cpu) {
+    cpu = cpu < 0 ? 0 : cpu;
+    cpu = cpu >= MAX_CPUS ? MAX_CPUS - 1 : cpu;
+    return cpu;
+}
+
+static u64 __noinline cpu_to_domain_highpriority_dsqid(s32 cpu) {
+    cpu = clip_cpu_to_bounds(cpu);
+    return cpu_to_domain_id[cpu] + DSQ_PRIO_Q_PER_DOM_START;
+}
+
+static u64 __noinline cpu_to_domain_regular_dsqid(s32 cpu) {
+    cpu = clip_cpu_to_bounds(cpu);
+    return cpu_to_domain_id[cpu] + DSQ_REG_Q_PER_DOM_START;
+}
+
+struct global_reserved_corebitmask_kfunc_map_value {
+    struct bpf_cpumask __kptr *bpf_cpumask;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, int);
+    __type(value, struct global_reserved_corebitmask_kfunc_map_value);
+    __uint(max_entries, 1);
+} global_reserved_corebitmask_kfunc_map SEC(".maps");
+
+__always_inline struct global_reserved_corebitmask_kfunc_map_value *
+get_global_reserved_corebitmask_map_value() {
+    s32 err;
+    int key = 0;
+    struct global_reserved_corebitmask_kfunc_map_value *v;
+
+    v = bpf_map_lookup_elem(&global_reserved_corebitmask_kfunc_map, &key);
+    if (!v) {
+        struct global_reserved_corebitmask_kfunc_map_value default_v;
+        default_v.bpf_cpumask = NULL;
+        err = bpf_map_update_elem(&global_reserved_corebitmask_kfunc_map, &key,
+                                  (const void *)&default_v, BPF_ANY);
+        if (err < 0) {
+            return NULL;
+        }
+
+        v = bpf_map_lookup_elem(&global_reserved_corebitmask_kfunc_map, &key);
+        if (!v) {
+            return NULL;
+        }
+
+        err = calloc_cpumask(&v->bpf_cpumask);
+        if (err < 0) {
+            return NULL;
+        }
+    }
+    return v;
+}
+
+static __noinline void global_reserved_corebitmask_or_and_store(const struct cpumask *corebitmask) {
+    s32 err;
+    struct global_reserved_corebitmask_kfunc_map_value *v;
+
+    v = get_global_reserved_corebitmask_map_value();
+    if (!v) {
+        return;
+    }
+
+    if (v->bpf_cpumask) {
+        struct bpf_cpumask *map_mask = NULL;
+
+        map_mask = bpf_kptr_xchg(&v->bpf_cpumask, NULL);
+        if (map_mask) {
+            bpf_cpumask_or(map_mask, (const struct cpumask *)map_mask, corebitmask);
+            map_mask = bpf_kptr_xchg(&v->bpf_cpumask, map_mask);
+            if (map_mask) {
+                bpf_cpumask_release(map_mask);
+            }
+        }
+    }
+}
+
+static __noinline bool global_reserved_corebitmask_is_set(s32 cpu) {
+    s32 err;
+    struct global_reserved_corebitmask_kfunc_map_value *v;
+
+    v = get_global_reserved_corebitmask_map_value();
+    if (!v) {
+        return false;
+    }
+
+    if (v->bpf_cpumask) {
+        return bpf_cpumask_test_cpu(cpu, v->bpf_cpumask);
+    }
+
+    return false;
+}
+
+static long __noinline callback_gmap_populate_reserved_corebitmask_iter(struct bpf_map *map,
+                                                                        const void *key, void *val,
+                                                                        void *ctx) {
+
+    if (!key || !val) {
+        return 1;
+    }
+
+    SchedGroupID *gid = (SchedGroupID *)key;
+    SchedGroupChrs_t *chrs = (SchedGroupChrs_t *)val;
+
+    global_reserved_corebitmask_or_and_store(&chrs->reserved_corebitmask);
+    return 0;
+}
+
+static s32 __noinline create_global_reserved_corebitmask() {
+
+    int count;
+    count =
+        bpf_for_each_map_elem(&gMap, &callback_gmap_populate_reserved_corebitmask_iter, &count, 0);
+    info("[dsqs][gmap] iterated total of %d elements to populate reserved corebitmask", count);
+
+    return 0;
+}
+
+static s32 __noinline create_priority_dsqs_per_cpu() {
+    s32 cpu;
+    s32 numa_node;
+    u64 dsqid;
+    s32 err = 0;
+
+    bpf_for(cpu, 0, MAX_CPUS) {
+        numa_node = cpu_to_numanode(cpu);
+        dsqid = DSQ_PRIO_PER_CPU_START + cpu;
+        err = scx_bpf_create_dsq(dsqid, numa_node);
+        if (err < 0) {
+            return err;
+        }
+    }
+
+    return err;
+}
+
+// bpf verifier does not allow scx_bpf_dsq_move_to_local call within a
+// bpf_for loop. This function only moves three tasks at max.
+static s32 __noinline move_from_custom_queue_to_local_dsq(u64 dsqid, s32 task_count) {
+    s32 tasks_moved = 0;
+
+    if (task_count != tasks_moved && scx_bpf_dsq_move_to_local(dsqid)) {
+        tasks_moved += 1;
+    }
+    if (task_count != tasks_moved && scx_bpf_dsq_move_to_local(dsqid)) {
+        tasks_moved += 1;
+    }
+    if (task_count != tasks_moved && scx_bpf_dsq_move_to_local(dsqid)) {
+        tasks_moved += 1;
+    }
+
+    return tasks_moved;
+}
+
+static s32 __noinline move_from_per_cpu_custom_to_local_dsq(s32 cpu, s32 task_count) {
+    return move_from_custom_queue_to_local_dsq(DSQ_PRIO_PER_CPU_START + cpu, task_count);
+}
+
+static s32 __inline local_and_custom_dsq_len_for(s32 cpu) {
+    return scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) +
+           scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + cpu);
+}
+
+static bool __inline lookup_and_update_min_dsq_len(s32 current_cpu, s32 *old_cpu, s32 *old_len) {
+    if (!old_cpu || !old_len) {
+        return false;
+    }
+
+    s32 current_len = local_and_custom_dsq_len_for(current_cpu);
+    if (current_len < *old_len) {
+        *old_cpu = current_cpu;
+        *old_len = current_len;
+        return true;
+    }
+
+    return false;
+}
+
+static __noinline s32 least_loaded_local_dsq_cpu(struct cpumask *bitmask) {
+    s32 cpu;
+    s32 min_dsq_cpu = 0;
+    s32 min_dsq_len = INT_MAX;
+
+    bpf_for(cpu, 0, MAX_CPUS) {
+        if (bitmask) {
+            if (bpf_cpumask_test_cpu(cpu, bitmask)) {
+                lookup_and_update_min_dsq_len(cpu, &min_dsq_cpu, &min_dsq_len);
+            }
+        } else {
+            lookup_and_update_min_dsq_len(cpu, &min_dsq_cpu, &min_dsq_len);
+        }
+    }
+
+    return min_dsq_cpu;
+}
+
+static __noinline s32 worksteal_from_n_neighbors(s32 cpu, s32 n, s32 task_count) {
+    // n: N, > 0
+    // stealing from n neighbors on each side of the cpu
+    cpu = clip_cpu_to_bounds(cpu);
+
+    s32 start_cpu = cpu - n;
+    s32 end_cpu = cpu + n;
+
+    start_cpu = clip_cpu_to_bounds(start_cpu);
+    end_cpu = clip_cpu_to_bounds(end_cpu);
+
+    s32 tasks_leftover = task_count;
+    s32 tasks_moved = 0;
+
+    s32 cpu_i;
+    bpf_for(cpu_i, cpu, end_cpu + 1) {
+        tasks_moved += move_from_per_cpu_custom_to_local_dsq(cpu_i, tasks_leftover);
+        tasks_leftover = task_count - tasks_moved;
+        if (tasks_leftover == 0) {
+            return tasks_moved;
+        }
+    }
+    bpf_for(cpu_i, start_cpu, cpu + 1) {
+        tasks_moved += move_from_per_cpu_custom_to_local_dsq(cpu_i, tasks_leftover);
+        tasks_leftover = task_count - tasks_moved;
+        if (tasks_leftover == 0) {
+            return tasks_moved;
+        }
+    }
+
+    return tasks_moved;
+}
+
+static __noinline void worksteal_from_neighbors(s32 cpu, s32 task_count) {
+    s32 neighbor_count = MAX(cpu, MAX_CPUS - cpu);
+    s32 n;
+    s32 tasks_leftover = task_count;
+    bpf_for(n, 1, neighbor_count) {
+        tasks_leftover = tasks_leftover - worksteal_from_n_neighbors(cpu, n, tasks_leftover);
+        if (tasks_leftover == 0) {
+            return;
+        }
+    }
+}
+
+static __noinline s32 worksteal_from_neighbors_domain_queue(bool from_highpriority_queue, s32 cpu,
+                                                            s32 task_count) {
+    u64 dsqid = from_highpriority_queue ? cpu_to_domain_highpriority_dsqid(cpu)
+                                        : cpu_to_domain_regular_dsqid(cpu);
+    u64 starting_offset =
+        from_highpriority_queue ? DSQ_PRIO_Q_PER_DOM_START : DSQ_REG_Q_PER_DOM_START;
+    u64 domain_id = dsqid - starting_offset;
+
+    s32 neighbor_count = MAX(domain_id, domains_count - domain_id);
+    neighbor_count = clip_dsqid_to_bounds(neighbor_count, 0);
+
+    s32 tasks_leftover = task_count;
+    s32 tasks_moved = 0;
+
+    u64 steal_from_dsqid;
+
+    // bpf_for causes verifier to panic saying program is too complex
+#define STEAL_FROM_NTH_NEIGHBOR(nth)                                                               \
+    steal_from_dsqid = dsqid - nth;                                                                \
+    steal_from_dsqid = clip_dsqid_to_bounds(steal_from_dsqid, starting_offset);                    \
+    tasks_moved += move_from_custom_queue_to_local_dsq(steal_from_dsqid, tasks_leftover);          \
+    tasks_leftover = task_count - tasks_moved;                                                     \
+    if (tasks_leftover == 0) {                                                                     \
+        return tasks_moved;                                                                        \
+    }
+    STEAL_FROM_NTH_NEIGHBOR(1)
+    STEAL_FROM_NTH_NEIGHBOR(-1)
+    STEAL_FROM_NTH_NEIGHBOR(2)
+    STEAL_FROM_NTH_NEIGHBOR(-2)
+    STEAL_FROM_NTH_NEIGHBOR(3)
+    STEAL_FROM_NTH_NEIGHBOR(-3)
+    STEAL_FROM_NTH_NEIGHBOR(4)
+    STEAL_FROM_NTH_NEIGHBOR(-4)
+
+    return tasks_moved;
+}
+
+static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
+                                                        bool to_highpriority_queue) {
+    if (!p) {
+        return false;
+    }
+
+    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
+    if (cgrp_chrs != NULL) {
+        SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(cgrp_chrs->gid);
+        if (sched_chrs != NULL) {
+            u64 timeslice = sched_chrs->timeslice * NSEC_PER_MSEC;
+            u64 dsqid = to_highpriority_queue ? DSQ_PRIO_Q_PER_DOM_START : DSQ_REG_Q_PER_DOM_START;
+            dsqid = dsqid + cgrp_chrs->gid;
+
+            scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static __noinline void enqueue_to_global_queue(struct task_struct *p) {
+    u64 timeslice = DEFAULT_TS;
+    u64 dsqid = DSQ_GLOBAL_Q_ID;
+
+    scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
+}
+
+////////////////////////////
+// Scheduling Logic Helpers
 
 //////
 // Task -> SCX switch

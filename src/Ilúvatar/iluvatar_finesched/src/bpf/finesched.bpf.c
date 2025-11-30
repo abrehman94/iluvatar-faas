@@ -28,7 +28,7 @@ char _license[] SEC("license") = "GPL";
 bool cpu_boost_config = false;
 bool enable_timer_callback = false;
 u32 enqueue_config = SCHED_CONFIG_PRIO_DSQ;
-u64 prio_dsq_count = 0;
+u64 domains_count = 0;
 
 SchedGroupChrs_t empty_sched_chrs = {0};
 
@@ -325,50 +325,49 @@ int perf_sample_handler(struct bpf_perf_event_data *ctx) {
 // dispatch the task @p to least loaded local dsq of a core that belongs
 // to the domain assigned by CP
 s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags) {
-    s32 dsqlen_threshold = 3;
-    s32 cpu;
-    u64 timeslice = DEFAULT_TS;
 
-    cpu = least_loaded_local_dsq_cpu(p->cpus_ptr);
-
-    // only assigns from reserved cores in a domain
-    // it reduces delay for I/O and newly forked tasks
-    update_from_assigned_domain_for_high_priority_tasks(&cpu, &timeslice, p);
-    if (local_and_custom_dsq_len_for(cpu) > dsqlen_threshold) {
-        update_from_assigned_domain(&cpu, &timeslice, p);
+    if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
+        enqueue_to_global_queue(p);
     }
 
-    timeslice = shorten_timeslice_by_dsqlen(timeslice, cpu);
-
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, timeslice, 0);
-
-    info("[info][finesched_select_cpu] [%s:%d] cpu: %d ts: %d ", p->comm, p->pid, cpu, timeslice);
-    return cpu;
+    return prev_cpu;
 }
 
 // replinish the task @p timeslice
 void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
-    s32 cpu = bpf_get_smp_processor_id();
-    u64 timeslice = DEFAULT_TS;
 
-    cpu = least_loaded_local_dsq_cpu(p->cpus_ptr);
-    update_from_assigned_domain(&cpu, &timeslice, p);
-
-    timeslice = shorten_timeslice_by_dsqlen(timeslice, cpu);
-
-    scx_bpf_dsq_insert_vtime(p, DSQ_PRIO_PER_CPU_START + cpu, timeslice, fifo_vtime(), 0);
-
-    info("[info][finesched_enqueue] [%s:%d] cpu: %d ts: %d ", p->comm, p->pid, cpu, timeslice);
+    if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/false)) {
+        enqueue_to_global_queue(p);
+    }
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
     s32 task_count = 3;
     s32 tasks_leftover;
+    s32 dsq_id;
 
-    tasks_leftover = task_count - move_from_custom_to_local_dsq(cpu, task_count);
+    dsq_id = cpu_to_domain_highpriority_dsqid(cpu);
+    tasks_leftover = task_count - move_from_custom_queue_to_local_dsq(dsq_id, task_count);
+
     if (tasks_leftover) {
-        if (!global_reserved_corebitmask_is_set(cpu)) {
-            worksteal_from_neighbors(cpu, tasks_leftover);
+
+        dsq_id = cpu_to_domain_regular_dsqid(cpu);
+        tasks_leftover = tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, task_count);
+
+        if (tasks_leftover) {
+            tasks_leftover =
+                tasks_leftover - move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, task_count);
+
+            if (tasks_leftover) {
+                tasks_leftover =
+                    tasks_leftover - worksteal_from_neighbors_domain_queue(
+                                         /*from_highpriority_queue=*/true, cpu, tasks_leftover);
+                if (tasks_leftover) {
+                    tasks_leftover = tasks_leftover -
+                                     worksteal_from_neighbors_domain_queue(
+                                         /*from_highpriority_queue=*/false, cpu, tasks_leftover);
+                }
+            }
         }
     }
 }
@@ -500,15 +499,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(finesched_init) {
     if (err < 0)
         return err;
 
-    err = scx_bpf_create_dsq(DSQ_INACTIVE_GRPS_N0, 0);
+    err = populate_cpu_to_domain_id_map();
     if (err < 0)
         return err;
 
-    err = scx_bpf_create_dsq(DSQ_INACTIVE_GRPS_N1, 0);
+    err = create_global_dsq();
     if (err < 0)
         return err;
 
-    err = create_priority_dsqs_per_domain();
+    err = create_dsqs_per_domain();
     if (err < 0)
         return err;
 
