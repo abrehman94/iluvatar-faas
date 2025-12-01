@@ -330,6 +330,8 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
         enqueue_to_global_queue(p);
     }
 
+    kick_all_cpus();
+
     return prev_cpu;
 }
 
@@ -339,6 +341,8 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
     if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/false)) {
         enqueue_to_global_queue(p);
     }
+
+    kick_all_cpus();
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {

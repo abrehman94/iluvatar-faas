@@ -1261,6 +1261,11 @@ static void __noinline kick_prio_dsq_cpus() {
     info("[dsqs][gmap] iterated total of %d elements to kick cpus", count);
 }
 
+static __noinline void kick_all_cpus() {
+    s32 cpu;
+    bpf_for(cpu, 0, MAX_CPUS) { scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE); }
+}
+
 static long __noinline callback_gmap_capture_stats_cpus_iter(struct bpf_map *map, const void *key,
                                                              void *val, void *ctx) {
 
