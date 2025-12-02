@@ -1261,17 +1261,17 @@ static void __noinline kick_prio_dsq_cpus() {
     info("[dsqs][gmap] iterated total of %d elements to kick cpus", count);
 }
 
-#define ENQUEUED_TASK_COUNT_THRESHOLD (MAX_CPUS / 2)
-static s32 enqueued_task_count = 0;
+#define KICK_ALL_CPUS_CALL_COUNT_THRESHOLD (MAX_CPUS / 4)
+static s32 kick_all_cpus_call_count = 0;
 
-// kicks all cpus only when number of enqueued tasks exceed
+// kicks all cpus only when number of calls exceed
 // a threshold
-static __noinline void kick_all_cpus() {
-    enqueued_task_count += 1;
-    if (enqueued_task_count < ENQUEUED_TASK_COUNT_THRESHOLD) {
+static __noinline void kick_all_cpus_every_nth_call() {
+    kick_all_cpus_call_count += 1;
+    if (kick_all_cpus_call_count < KICK_ALL_CPUS_CALL_COUNT_THRESHOLD) {
         return;
     }
-    enqueued_task_count = 0;
+    kick_all_cpus_call_count = 0;
 
     s32 cpu;
     bpf_for(cpu, 0, MAX_CPUS) { scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE); }

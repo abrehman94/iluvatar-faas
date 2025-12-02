@@ -330,7 +330,11 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
         enqueue_to_global_queue(p);
     }
 
-    kick_all_cpus();
+    s32 cpu;
+    cpu = least_loaded_local_dsq_cpu(/*bitmask=*/NULL);
+    scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+
+    kick_all_cpus_every_nth_call();
 
     return prev_cpu;
 }
@@ -342,25 +346,26 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
         enqueue_to_global_queue(p);
     }
 
-    kick_all_cpus();
+    kick_all_cpus_every_nth_call();
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
     s32 task_count = 2;
-    s32 tasks_leftover;
+    s32 tasks_leftover = task_count;
     s32 dsq_id;
 
-    dsq_id = cpu_to_domain_highpriority_dsqid(cpu);
-    tasks_leftover = task_count - move_from_custom_queue_to_local_dsq(dsq_id, task_count);
+    tasks_leftover =
+        tasks_leftover - move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, tasks_leftover);
 
     if (tasks_leftover) {
-
-        dsq_id = cpu_to_domain_regular_dsqid(cpu);
-        tasks_leftover = tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, task_count);
+        dsq_id = cpu_to_domain_highpriority_dsqid(cpu);
+        tasks_leftover =
+            tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
 
         if (tasks_leftover) {
+            dsq_id = cpu_to_domain_regular_dsqid(cpu);
             tasks_leftover =
-                tasks_leftover - move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, task_count);
+                tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
 
             if (tasks_leftover) {
                 tasks_leftover =
