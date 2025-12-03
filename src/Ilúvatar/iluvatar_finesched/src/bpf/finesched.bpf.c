@@ -116,8 +116,9 @@ __always_inline struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu) {
  */
 struct task_context {
     u64 running_start_time;
-    u64 cpu_time;
     u64 cpu_time_avg;
+
+    u64 enqueue_count;
 };
 
 /* Map that contains task-local storage. */
@@ -314,6 +315,7 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
     if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
         enqueue_to_global_queue(p);
     }
+    task_stats_task_enqueued(p);
 
     s32 cpu;
     cpu = least_loaded_local_dsq_cpu(/*bitmask=*/NULL);
@@ -329,9 +331,19 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 // replinish the task @p timeslice
 void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 
-    if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/false)) {
-        enqueue_to_global_queue(p);
+    struct task_context *tctx;
+    tctx = try_lookup_task_ctx(p);
+
+    if (tctx && tctx->enqueue_count <= TASK_LIFETIME_THRESHOLD) {
+        if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
+            enqueue_to_global_queue(p);
+        }
+    } else {
+        if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/false)) {
+            enqueue_to_global_queue(p);
+        }
     }
+    task_stats_task_enqueued(p);
 
     kick_all_cpus_every_nth_call();
 
@@ -441,7 +453,6 @@ s32 BPF_STRUCT_OPS(finesched_init_task, struct task_struct *p, struct scx_init_t
 //    sched_ext do cleanup)
 void BPF_STRUCT_OPS(finesched_exit_task, struct task_struct *p, struct scx_exit_task_args *args) {
     info("[exit_task] exiting task %d - %s", p->pid, p->comm);
-    cgroup_ctx_stop_task(p);
 }
 
 // CPU is entering idle state if idle is true.

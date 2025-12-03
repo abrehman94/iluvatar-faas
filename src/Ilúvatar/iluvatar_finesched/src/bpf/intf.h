@@ -64,6 +64,9 @@ enum consts {
 
     DEFAULT_TS = (20 * NSEC_PER_MSEC),
     MIN_TS = (1 * NSEC_PER_MSEC),
+
+    TASK_LIFETIME_THRESHOLD = 1000, // tasks older then 1000*10 -> 10secs are too
+                                    // old
 };
 
 // TODO: not sure why scx_utils builder is not

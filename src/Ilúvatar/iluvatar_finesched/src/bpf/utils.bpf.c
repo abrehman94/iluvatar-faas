@@ -348,45 +348,6 @@ static SchedGroupChrs_t *__noinline get_schedchrs_cached(struct task_struct *p) 
     return chrs;
 }
 
-static void __noinline cgroup_ctx_new_task(struct task_struct *p) {
-
-    cgroup_ctx_t *cgrp_ctx = get_cgroup_ctx_for_p(p);
-    if (cgrp_ctx == NULL) {
-        return;
-    }
-
-    struct task_context *tctx = try_lookup_task_ctx(p);
-    if (!tctx) {
-        error("[cgroup_ctx_new_task] task context not found for task %d - %s", p->pid, p->comm);
-        return;
-    }
-
-    if (!cgrp_ctx->init) {
-        cgrp_ctx->init = true;
-        cgrp_ctx->task_count = 1;
-        tctx->cgroup_tskcnt_prio = 0;
-    } else {
-        cgrp_ctx->task_count++;
-        tctx->cgroup_tskcnt_prio = 1;
-    }
-    info("[cgroup_ctx_new_task] task %d - %s cgrp_init: %d cgrp_task_count: %d cgrp_prio: %d",
-         p->pid, p->comm, cgrp_ctx->init, cgrp_ctx->task_count, tctx->cgroup_tskcnt_prio);
-}
-
-static void __noinline cgroup_ctx_stop_task(struct task_struct *p) {
-    cgroup_ctx_t *cgrp_ctx = get_cgroup_ctx_for_p(p);
-    if (cgrp_ctx == NULL) {
-        return;
-    }
-
-    if (!cgrp_ctx->init) {
-        error("[cgroup_ctx_stop_task] cgroup_ctx_new_task was missed for task %d - %s", p->pid,
-              p->comm);
-    } else {
-        cgrp_ctx->task_count--;
-    }
-}
-
 static void __noinline update_caches(struct task_struct *p) {
 
     pid_t pid = p->pid;
@@ -848,10 +809,13 @@ static __noinline u64 shorten_timeslice_by_cputime_to_timeslice_ratio(u64 timesl
     }
 
     u64 cpu_time = tctx->cpu_time_avg;
-    cpu_time = cpu_time == 0 ? 1 : cpu_time;
-
     u64 cputime_by_timeslice = (cpu_time * 100) / timeslice; // %[1,100]
+
+    info("[timeslice_shortening][%s:%d] cputime_by_timeslice %lld ", p->comm, p->pid,
+         cputime_by_timeslice);
+
     // to penalize tasks that consume whole timeslice
+    cputime_by_timeslice = cputime_by_timeslice / 10;
     return shorten_timeslice_by_factor(timeslice, cputime_by_timeslice);
 }
 
@@ -873,12 +837,6 @@ static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
             u64 timeslice = sched_chrs->timeslice * NSEC_PER_MSEC;
             u64 dsqid = to_highpriority_queue ? DSQ_PRIO_Q_PER_DOM_START : DSQ_REG_Q_PER_DOM_START;
             dsqid = dsqid + cgrp_chrs->gid;
-
-            timeslice = shorten_timeslice_by_dsqlen(timeslice, dsqid);
-
-            if (!to_highpriority_queue) {
-                timeslice = shorten_timeslice_by_factor(timeslice, 3);
-            }
 
             timeslice = shorten_timeslice_by_cputime_to_timeslice_ratio(timeslice, p);
 
@@ -915,34 +873,6 @@ static void __noinline switch_to_scx_if_cgroup_exists(struct task_struct *p) {
     cgroup_ctx_t *cgroup_ctx = bpf_map_lookup_elem(&cgroup_ctx_stor, name);
     if (cgroup_ctx != NULL) {
         scx_bpf_switch_to_scx(p);
-    }
-}
-
-static void __noinline switch_to_scx_is_docker(struct task_struct *p) {
-    // TODO: also switches runc - container runtime shim - shouldn't impact the
-    // warm time of the invokes
-    if (is_docker_schedcgroup(p)) {
-
-        scx_bpf_switch_to_scx(p);
-        update_caches(p);
-        cgroup_ctx_new_task(p);
-
-        info("[switch_to_scx] switched to scx docker cgroup task %d - %s ", p->pid, p->comm);
-    }
-}
-
-// causes 13.7 % slowdown as compared to base case
-static void __noinline switch_to_scx_cmap_checked(struct task_struct *p) {
-
-    char *cg_name = get_schedcgroup_name(p);
-    if (cg_name == NULL) {
-        return;
-    }
-
-    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs(cg_name, MAX_PATH);
-    if (cgrp_chrs) {
-        scx_bpf_switch_to_scx(p);
-        info("[switch_to_scx] switched to scx task %d - %s cgroup %s ", p->pid, p->comm, cg_name);
     }
 }
 
@@ -1100,150 +1030,6 @@ static u64 __always_inline prio_short_first_over(u64 cvtime, u64 tconsumed) {
 //////
 // Task -> Priority DSQ
 
-static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
-
-    s32 cpu = bpf_get_smp_processor_id();
-    struct cpu_ctx *cctx = try_lookup_cpu_ctx(cpu);
-    if (!cctx) {
-        error("[enqueue_prio_dsq] cctx not found for cpu %d ", cpu);
-        return -1;
-    }
-
-    struct task_context *tctx;
-    tctx = try_lookup_task_ctx(p);
-    if (!tctx) {
-        error("[enqueue_prio_dsq] task context not found for task %d - %s", p->pid, p->comm);
-        return -1;
-    }
-
-    cgroup_ctx_t *cgrp_ctx;
-    cgrp_ctx = get_cgroup_ctx_for_p(p);
-    if (!cgrp_ctx) {
-        error("[enqueue_prio_dsq] cgroup context not found for task %d - %s", p->pid, p->comm);
-        return -1;
-    }
-
-    // We can directly use the slow get_schedchrs instead of the cached
-    // because enqueue is no longer on the critical path in prio dsq design.
-    // besides the assumption is tasks would be longer in ms - so it really
-    // doesn't matter - we defer system tasks to CFS
-    CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
-    if (cgrp_chrs == NULL) {
-        error("[enqueue_prio_dsq] no cgrp_chrs found for task %d - %s", p->pid, p->comm);
-        goto out_no_enqueue;
-    }
-
-    SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(cgrp_chrs->gid);
-    if (sched_chrs == NULL) {
-        error("[enqueue_prio_dsq] no sched_chrs found for task %d - %s gid: %d ", p->pid, p->comm,
-              cgrp_chrs->gid);
-        goto out_no_enqueue;
-    }
-
-    // Switch back to normal scheduling for higher priority.
-    if (sched_chrs->id == RESERVED_GID_SWITCH_BACK) {
-        scx_bpf_switch_to_normal(p);
-        return -1;
-    }
-
-    if (bpf_cpumask_first_and(&sched_chrs->corebitmask, p->cpus_ptr) >= MAX_CPUS) {
-        error("[enqueue_prio_dsq] no intersection with allowed cores for task %d - %s", p->pid,
-              p->comm);
-        goto out_no_enqueue;
-    }
-
-    tctx->active_q = true;
-    int dsqid = DSQ_PRIO_GRPS_START + sched_chrs->id;
-
-    if (tctx->vtime == 0) {
-        if (sched_chrs->prio == QEnqPrioSRPTover) {
-            tctx->vtime = cgrp_chrs->workerdur * 2 * NSEC_PER_MSEC;
-        } else {
-            tctx->vtime = cctx->last_vtime;
-        }
-    }
-
-    if (sched_chrs->perf != 0) {
-        scx_bpf_cpuperf_set(cpu, sched_chrs->perf);
-    }
-
-    if (sched_chrs->fifo) {
-        scx_bpf_dsq_insert(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, 0);
-    } else {
-        if (sched_chrs->prio == QEnqPrioINVOC) {
-
-            tctx->vtime = prio_invoke_time(tctx->vtime, cgrp_chrs->invoke_ts, tctx->tconsumed);
-            info("[enqueue_prio_dsq][invok] hist dur: %d vtime: %llu ", cgrp_chrs->invoke_ts,
-                 tctx->vtime);
-
-        } else if (sched_chrs->prio == QEnqPrioSRPTreset) {
-
-            tctx->vtime =
-                prio_short_first_reset(tctx->vtime, cgrp_chrs->workerdur, tctx->tconsumed);
-            info("[enqueue_prio_dsq][srptreset] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur,
-                 tctx->vtime);
-
-        } else if (sched_chrs->prio == QEnqPrioSRPTover) {
-
-            tctx->vtime = prio_short_first_over(tctx->vtime, tctx->tconsumed);
-            info("[enqueue_prio_dsq][srptover] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur,
-                 tctx->vtime);
-
-        } else if (sched_chrs->prio == QEnqPrioSHRTDUR) {
-
-            tctx->vtime = prio_short_duration(tctx->vtime, cgrp_chrs->workerdur, tctx->tconsumed);
-            info("[enqueue_prio_dsq][shrtdur] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur,
-                 tctx->vtime);
-
-        } else if (sched_chrs->prio == QEnqPrioSHRTDURUW) {
-
-            tctx->vtime =
-                prio_short_duration_unweighted(tctx->vtime, cgrp_chrs->workerdur, tctx->tconsumed);
-            info("[enqueue_prio_dsq][shrtduruw] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur,
-                 tctx->vtime);
-
-        } else if (sched_chrs->prio == QEnqPrioPLAIN) {
-
-            tctx->vtime = prio_plain_tconsumed(tctx->vtime, tctx->tconsumed);
-            info("[enqueue_prio_dsq][plain] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur,
-                 tctx->vtime);
-
-        } else if (sched_chrs->prio == QEnqPrioTaskCount) {
-
-            tctx->vtime =
-                prio_taskcount_tconsumed(tctx->vtime, tctx->tconsumed, tctx->cgroup_tskcnt_prio);
-            info("[enqueue_prio_dsq][taskcount] hist dur: %d vtime: %llu ", cgrp_chrs->workerdur,
-                 tctx->vtime);
-
-        } else {
-            error("[enqueue_prio_dsq][sched_chrs] bad priority sched_chrs->prio: %d",
-                  sched_chrs->prio);
-        }
-
-        scx_bpf_dsq_insert_vtime(p, dsqid, sched_chrs->timeslice * NSEC_PER_MSEC, tctx->vtime, 0);
-    }
-
-    info("[enqueue_prio_dsq][task_stats] task %d - %s to dsq %d invo_t: %lld act_t: %lld "
-         "vtime: %lld ts: %lld tconsum: %d cgrp_init: %d cgrp_task_count: %d cgrp_prio: %d",
-         p->pid, p->comm, dsqid, tctx->invoke_time, tctx->act_time, tctx->vtime,
-         sched_chrs->timeslice, tctx->tconsumed, cgrp_ctx->init, cgrp_ctx->task_count,
-         tctx->cgroup_tskcnt_prio);
-    tctx->tconsumed = 0;
-
-    if (cctx->last_vtime < tctx->vtime) {
-        cctx->last_vtime = tctx->vtime;
-    }
-
-    return 0;
-
-out_no_enqueue:
-    tctx->active_q = false;
-    tctx->invoke_time = 0;
-    tctx->act_time = 0;
-    tctx->vtime = 0;
-    return -1;
-}
-
 static long __noinline callback_gmap_kick_cpus_iter(struct bpf_map *map, const void *key, void *val,
                                                     void *ctx) {
     if (!key || !val) {
@@ -1394,7 +1180,16 @@ static u64 calc_avg(u64 old_val, u64 new_val) {
     return (old_val - (old_val >> 2)) + (new_val >> 2);
 }
 
-static __noinline void task_stats_start_running(struct task_context *tctx) {
+static __noinline void task_stats_task_enqueued(struct task_struct *p) {
+    struct task_context *tctx;
+    tctx = try_lookup_task_ctx(p);
+
+    if (tctx) {
+        tctx->enqueue_count = tctx->enqueue_count + 1;
+    }
+}
+
+static __noinline void task_stats_start_running(struct task_struct *p) {
     struct task_context *tctx;
     tctx = try_lookup_task_ctx(p);
 
@@ -1403,7 +1198,11 @@ static __noinline void task_stats_start_running(struct task_context *tctx) {
     }
 }
 
-static __noinline void task_stats_stop_running(struct task_context *tctx) {
+static __noinline void task_stats_stop_running(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
     struct task_context *tctx;
     tctx = try_lookup_task_ctx(p);
 
@@ -1415,6 +1214,8 @@ static __noinline void task_stats_stop_running(struct task_context *tctx) {
         u64 cpu_time = current_time - start_time;
         if (cpu_time != 1) {
             tctx->cpu_time_avg = calc_avg(tctx->cpu_time_avg, cpu_time);
+            info("[timeslice_shortening][%s:%d] tctx->cpu_time_avg %lld ", p->comm, p->pid,
+                 tctx->cpu_time_avg);
         }
     }
 }
