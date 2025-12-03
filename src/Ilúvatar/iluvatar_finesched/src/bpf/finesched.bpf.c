@@ -114,25 +114,10 @@ __always_inline struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu) {
  *
  * This contain all the per-task information used internally by the BPF code.
  */
-struct task_ctx {
-    bool active_q;
-    bool running;
-
-    u64 cgroup_tskcnt_prio;
-
-    // invoke time from CgroupChrs_t
-    u64 invoke_time;
-
-    /*
-     * Task's activation time (got enqueued into the priority DSQ for a
-     * specific sched group).
-     */
-    u64 act_time;
-
-    u64 vtime;
-
-    u64 ts_start;
-    u64 tconsumed;
+struct task_context {
+    u64 running_start_time;
+    u64 cpu_time;
+    u64 cpu_time_avg;
 };
 
 /* Map that contains task-local storage. */
@@ -140,13 +125,13 @@ struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, int);
-    __type(value, struct task_ctx);
+    __type(value, struct task_context);
 } task_ctx_stor SEC(".maps");
 
 /*
  * Return a local task context from a generic task.
  */
-struct task_ctx *try_lookup_task_ctx(const struct task_struct *p) {
+struct task_context *try_lookup_task_ctx(const struct task_struct *p) {
     return bpf_task_storage_get(&task_ctx_stor, (struct task_struct *)p, 0,
                                 BPF_LOCAL_STORAGE_GET_F_CREATE);
 }
@@ -336,6 +321,8 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 
     kick_all_cpus_every_nth_call();
 
+    check_dsqlen_of_each_dsq_for_tracing();
+
     return prev_cpu;
 }
 
@@ -347,10 +334,12 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
     }
 
     kick_all_cpus_every_nth_call();
+
+    check_dsqlen_of_each_dsq_for_tracing();
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
-    s32 task_count = 2;
+    s32 task_count = 1;
     s32 tasks_leftover = task_count;
     s32 dsq_id;
 
@@ -386,26 +375,14 @@ void BPF_STRUCT_OPS(finesched_set_cpumask, struct task_struct *p, const struct c
          p->comm, cpumask);
 }
 
-void BPF_STRUCT_OPS(finesched_running, struct task_struct *p) {
-
-    struct task_ctx *tctx;
-    tctx = try_lookup_task_ctx(p);
-    stats_task_start(tctx);
-}
+void BPF_STRUCT_OPS(finesched_running, struct task_struct *p) { task_stats_start_running(p); }
 
 void BPF_STRUCT_OPS(finesched_stopping, struct task_struct *p, bool runnable) {
-
-    struct task_ctx *tctx;
-    tctx = try_lookup_task_ctx(p);
-    stats_task_stop(tctx);
+    task_stats_stop_running(p);
 }
 
 void BPF_STRUCT_OPS(finesched_quiescent, struct task_struct *p, u64 deq_flags) {
-
     info("[quiescent_task] sleeping task %d - %s", p->pid, p->comm);
-    struct task_ctx *tctx;
-    tctx = try_lookup_task_ctx(p);
-    stats_task_stop(tctx);
 }
 
 // Remember all newly created cgroups.

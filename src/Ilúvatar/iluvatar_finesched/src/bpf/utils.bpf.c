@@ -355,7 +355,7 @@ static void __noinline cgroup_ctx_new_task(struct task_struct *p) {
         return;
     }
 
-    struct task_ctx *tctx = try_lookup_task_ctx(p);
+    struct task_context *tctx = try_lookup_task_ctx(p);
     if (!tctx) {
         error("[cgroup_ctx_new_task] task context not found for task %d - %s", p->pid, p->comm);
         return;
@@ -443,34 +443,6 @@ static void __noinline poll_update_pid_gid_cache() {
 //     bpf_iter_scx_dsq_new
 //     bpf_iter_scx_dsq_next
 //     bpf_iter_scx_dsq_destroy
-
-static void __noinline q_inactive_task(struct task_struct *p) {
-
-    // TODO: putting all inactive tasks to a single Q will make transition to
-    // active slower - need to solve this problem
-    //    all such delays can be circumvented by creating a Q for dispatches in
-    //    CP - classic another level of Queueing/indirection to solve a problem
-    struct task_ctx *tctx;
-    tctx = try_lookup_task_ctx(p);
-    if (!tctx) {
-        error("[q_inactive_task] task context not found for task %d - %s", p->pid, p->comm);
-        return;
-    }
-    if (tctx->active_q) {
-        return;
-    }
-
-    // check if p is allowed on inactive group cores - Q accordingly
-    if (cores_inact_grp_mask && !bpf_cpumask_intersects(cores_inact_grp_mask, p->cpus_ptr)) {
-        // Q that consumes on all cores
-        scx_bpf_dsq_insert(p, DSQ_INACTIVE_GRPS_N1, INACTIVE_GRPS_TS, 0);
-        info("[info][dispatch][inactive] to DSQ_INACTIVE_GRPS_N1 task %d - %s", p->pid, p->comm);
-    } else {
-        // Q that consumes on only inactive group cores
-        scx_bpf_dsq_insert(p, DSQ_INACTIVE_GRPS_N0, INACTIVE_GRPS_TS, 0);
-        info("[info][dispatch][inactive] to DSQ_INACTIVE_GRPS_N0 task %d - %s", p->pid, p->comm);
-    }
-}
 
 static __noinline long callback_gmap_create_dsqs_iter(struct bpf_map *map, const void *key,
                                                       void *val, void *ctx) {
@@ -715,13 +687,29 @@ static s32 __noinline move_from_custom_queue_to_local_dsq(u64 dsqid, s32 task_co
     return tasks_moved;
 }
 
-static s32 __noinline move_from_per_cpu_custom_to_local_dsq(s32 cpu, s32 task_count) {
+static __noinline s32 move_from_per_cpu_custom_to_local_dsq(s32 cpu, s32 task_count) {
     return move_from_custom_queue_to_local_dsq(DSQ_PRIO_PER_CPU_START + cpu, task_count);
 }
 
-static s32 __inline local_and_custom_dsq_len_for(s32 cpu) {
+static __inline s32 local_and_custom_dsq_len_for(s32 cpu) {
     return scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) +
            scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + cpu);
+}
+
+static __noinline void check_dsqlen_of_each_dsq_for_tracing() {
+    u64 dsqid;
+    u64 max_dsqs = domains_count;
+    max_dsqs = max_dsqs > DSQ_MAX_COUNT ? DSQ_MAX_COUNT : max_dsqs;
+
+    bpf_for(dsqid, DSQ_PRIO_Q_PER_DOM_START, DSQ_PRIO_Q_PER_DOM_START + max_dsqs) {
+        scx_bpf_dsq_nr_queued(dsqid);
+    }
+
+    bpf_for(dsqid, DSQ_REG_Q_PER_DOM_START, DSQ_REG_Q_PER_DOM_START + max_dsqs) {
+        scx_bpf_dsq_nr_queued(dsqid);
+    }
+
+    scx_bpf_dsq_nr_queued(DSQ_GLOBAL_Q_ID);
 }
 
 static bool __inline lookup_and_update_min_dsq_len(s32 current_cpu, s32 *old_cpu, s32 *old_len) {
@@ -839,6 +827,39 @@ static __noinline s32 worksteal_from_neighbors_domain_queue(bool from_highpriori
     return tasks_moved;
 }
 
+static __noinline u64 shorten_timeslice_by_factor(u64 timeslice, u64 factor) {
+    factor = factor > 0 ? factor : 1;
+
+    timeslice = timeslice / factor;
+    if (timeslice < MIN_TS) {
+        timeslice = MIN_TS;
+    }
+
+    return timeslice;
+}
+
+static __noinline u64 shorten_timeslice_by_cputime_to_timeslice_ratio(u64 timeslice,
+                                                                      struct task_struct *p) {
+    struct task_context *tctx;
+    tctx = try_lookup_task_ctx(p);
+
+    if (!tctx) {
+        return timeslice;
+    }
+
+    u64 cpu_time = tctx->cpu_time_avg;
+    cpu_time = cpu_time == 0 ? 1 : cpu_time;
+
+    u64 cputime_by_timeslice = (cpu_time * 100) / timeslice; // %[1,100]
+    // to penalize tasks that consume whole timeslice
+    return shorten_timeslice_by_factor(timeslice, cputime_by_timeslice);
+}
+
+static __noinline u64 shorten_timeslice_by_dsqlen(u64 timeslice, u64 dsqid) {
+    s32 current_len = scx_bpf_dsq_nr_queued(dsqid);
+    return shorten_timeslice_by_factor(timeslice, current_len);
+}
+
 static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
                                                         bool to_highpriority_queue) {
     if (!p) {
@@ -853,6 +874,14 @@ static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
             u64 dsqid = to_highpriority_queue ? DSQ_PRIO_Q_PER_DOM_START : DSQ_REG_Q_PER_DOM_START;
             dsqid = dsqid + cgrp_chrs->gid;
 
+            timeslice = shorten_timeslice_by_dsqlen(timeslice, dsqid);
+
+            if (!to_highpriority_queue) {
+                timeslice = shorten_timeslice_by_factor(timeslice, 3);
+            }
+
+            timeslice = shorten_timeslice_by_cputime_to_timeslice_ratio(timeslice, p);
+
             scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
             return true;
         }
@@ -864,6 +893,8 @@ static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
 static __noinline void enqueue_to_global_queue(struct task_struct *p) {
     u64 timeslice = DEFAULT_TS;
     u64 dsqid = DSQ_GLOBAL_Q_ID;
+
+    timeslice = shorten_timeslice_by_dsqlen(timeslice, dsqid);
 
     scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
 }
@@ -923,19 +954,6 @@ static u64 __always_inline fifo_vtime() { return bpf_ktime_get_ns(); }
 static u64 __noinline wakeup_boost_to_front_of_queue(u64 vtime, s32 cpu, u64 timeslice) {
     s32 current_len = local_and_custom_dsq_len_for(cpu);
     return vtime - (timeslice * current_len);
-}
-
-static u64 __noinline shorten_timeslice_by_dsqlen(u64 timeslice, s32 cpu) {
-    s32 current_len = local_and_custom_dsq_len_for(cpu);
-    current_len = current_len > 0 ? current_len : 1;
-
-    timeslice = timeslice / current_len;
-    u64 min_timeslice = 2 * NSEC_PER_MSEC; // ms
-    if (timeslice < min_timeslice) {
-        timeslice = min_timeslice;
-    }
-
-    return timeslice;
 }
 
 static void __noinline update_from_assigned_domain(s32 *cpu, u64 *timeslice,
@@ -1091,7 +1109,7 @@ static s32 __noinline enqueue_prio_dsq(struct task_struct *p) {
         return -1;
     }
 
-    struct task_ctx *tctx;
+    struct task_context *tctx;
     tctx = try_lookup_task_ctx(p);
     if (!tctx) {
         error("[enqueue_prio_dsq] task context not found for task %d - %s", p->pid, p->comm);
@@ -1367,24 +1385,6 @@ static void __noinline boost_cpus() {
 ////////
 // stats capturing
 
-static void __always_inline stats_task_start(struct task_ctx *tctx) {
-    if (tctx) {
-        if (!tctx->running) {
-            tctx->ts_start = bpf_ktime_get_ns();
-            tctx->running = true;
-        }
-    }
-}
-
-static void __always_inline stats_task_stop(struct task_ctx *tctx) {
-    if (tctx) {
-        if (tctx->running) {
-            tctx->tconsumed += bpf_ktime_get_ns() - tctx->ts_start;
-            tctx->running = false;
-        }
-    }
-}
-
 // Credits to Changwoo author of scx_lavd
 static u64 calc_avg(u64 old_val, u64 new_val) {
     /*
@@ -1392,6 +1392,31 @@ static u64 calc_avg(u64 old_val, u64 new_val) {
      *  - EWMA = (0.75 * old) + (0.25 * new)
      */
     return (old_val - (old_val >> 2)) + (new_val >> 2);
+}
+
+static __noinline void task_stats_start_running(struct task_context *tctx) {
+    struct task_context *tctx;
+    tctx = try_lookup_task_ctx(p);
+
+    if (tctx) {
+        tctx->running_start_time = bpf_ktime_get_tai_ns();
+    }
+}
+
+static __noinline void task_stats_stop_running(struct task_context *tctx) {
+    struct task_context *tctx;
+    tctx = try_lookup_task_ctx(p);
+
+    if (tctx) {
+        u64 current_time = bpf_ktime_get_tai_ns();
+        u64 start_time = tctx->running_start_time;
+        start_time = current_time > start_time ? start_time : current_time - 1;
+
+        u64 cpu_time = current_time - start_time;
+        if (cpu_time != 1) {
+            tctx->cpu_time_avg = calc_avg(tctx->cpu_time_avg, cpu_time);
+        }
+    }
 }
 
 static void __always_inline stats_update_percpu_util(struct cpu_ctx *c) {

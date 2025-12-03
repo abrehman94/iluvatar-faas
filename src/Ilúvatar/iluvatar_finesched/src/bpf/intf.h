@@ -63,6 +63,7 @@ enum consts {
     RESERVED_GID_SWITCH_BACK = 101,
 
     DEFAULT_TS = (20 * NSEC_PER_MSEC),
+    MIN_TS = (1 * NSEC_PER_MSEC),
 };
 
 // TODO: not sure why scx_utils builder is not
