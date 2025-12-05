@@ -26,7 +26,7 @@ char _license[] SEC("license") = "GPL";
 // Global Data for bpf scheduler
 
 bool cpu_boost_config = false;
-bool enable_timer_callback = false;
+bool enable_timer_callback = true;
 u32 enqueue_config = SCHED_CONFIG_PRIO_DSQ;
 u64 domains_count = 0;
 
@@ -118,6 +118,9 @@ struct task_context {
     u64 running_start_time;
     u64 cpu_time_avg;
 
+    u64 last_wakeup_time;
+    u64 wakeup_roundtrip_time_avg;
+
     u64 enqueue_count;
 };
 
@@ -135,6 +138,43 @@ struct {
 struct task_context *try_lookup_task_ctx(const struct task_struct *p) {
     return bpf_task_storage_get(&task_ctx_stor, (struct task_struct *)p, 0,
                                 BPF_LOCAL_STORAGE_GET_F_CREATE);
+}
+
+/*
+ * Per-dsq map.
+ *
+ * This contain all the per-dsq context information.
+ */
+struct dsq_context {
+    u64 last_consume_time;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_MAP_ENTRIES_CMAP);
+    __uint(key_size, sizeof(u64));                  // key: dsqid
+    __uint(value_size, sizeof(struct dsq_context)); // value: dsq_context
+} dsq_context_store SEC(".maps");
+
+static __noinline struct dsq_context *try_lookup_dsq_context(u64 dsqid) {
+    s32 err;
+
+    struct dsq_context *context = bpf_map_lookup_elem(&dsq_context_store, &dsqid);
+    if (!context) {
+        struct dsq_context default_context;
+        memset(&default_context, 0, sizeof(default_context));
+
+        err = bpf_map_update_elem(&dsq_context_store, (const void *)&dsqid,
+                                  (const void *)&default_context, BPF_ANY);
+        if (err < 0) {
+            dbg("[dsq_context_store] error(%d) failed to update elem in map", err);
+            return NULL;
+        }
+
+        context = bpf_map_lookup_elem(&dsq_context_store, &dsqid);
+    }
+
+    return context;
 }
 
 /*
@@ -158,7 +198,7 @@ struct {
 } cgroup_ctx_stor SEC(".maps");
 
 static cgroup_ctx_t *__noinline lookup_or_build_cgroup_ctx(const char *name, u32 max_len) {
-    long err;
+    s32 err;
 
     if (name == NULL || max_len > MAX_PATH) {
         dbg("[cmap][get_cgroup_ctx][cpu_cgroup_attach] invalid args: %s %u", name, max_len);
@@ -229,18 +269,14 @@ struct {
  * Heartbeat scheduler timer callback.
  */
 
-static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer) {
-    s32 cpu = bpf_get_smp_processor_id();
-    int err = 0;
+static s32 usersched_timer_fn(void *map, s32 *key, struct bpf_timer *timer) {
+    s32 err = 0;
 
-    info("[callback][timer] heartbeat timer fired on cpu %d", cpu);
-
-    // stats_update_global();
-    // capture_stats_for_gmap();
-
-    // if (cpu_boost_config) {
-    //     boost_cpus();
-    // }
+    u64 tasks_count = tasks_enqueued_on_bpfscheduler();
+    if (tasks_count > 0) {
+        kick_all_cpus();
+    }
+    info("[heartbeat_timer] tasks_enqueued_on_bpfscheduler %lld ", tasks_count);
 
     /* Re-arm the timer */
     err = bpf_timer_start(timer, HEARTBEAT_INTERVAL, 0);
@@ -312,16 +348,20 @@ int perf_sample_handler(struct bpf_perf_event_data *ctx) {
 // to the domain assigned by CP
 s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags) {
 
-    if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
-        enqueue_to_global_queue(p);
+    struct task_context *tctx = try_lookup_task_ctx(p);
+
+    if (tctx && (tctx->enqueue_count > TASK_LIFETIME_THRESHOLD &&
+                 tctx->wakeup_roundtrip_time_avg > TASK_ROUNDTRIPTIME_PRIO_THRESHOLD)) {
+        if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/false)) {
+            enqueue_to_global_queue(p);
+        }
+    } else {
+        if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
+            enqueue_to_global_queue(p);
+        }
     }
     task_stats_task_enqueued(p);
-
-    s32 cpu;
-    cpu = least_loaded_local_dsq_cpu(/*bitmask=*/NULL);
-    scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-
-    kick_all_cpus_every_nth_call();
+    task_stats_task_roundtrip_since_last_wakeup(p);
 
     check_dsqlen_of_each_dsq_for_tracing();
 
@@ -331,10 +371,10 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 // replinish the task @p timeslice
 void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 
-    struct task_context *tctx;
-    tctx = try_lookup_task_ctx(p);
+    struct task_context *tctx = try_lookup_task_ctx(p);
 
-    if (tctx && tctx->enqueue_count <= TASK_LIFETIME_THRESHOLD) {
+    if (tctx && (tctx->enqueue_count <= TASK_LIFETIME_THRESHOLD ||
+                 tctx->wakeup_roundtrip_time_avg <= TASK_ROUNDTRIPTIME_PRIO_THRESHOLD)) {
         if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
             enqueue_to_global_queue(p);
         }
@@ -345,41 +385,40 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
     }
     task_stats_task_enqueued(p);
 
-    kick_all_cpus_every_nth_call();
-
     check_dsqlen_of_each_dsq_for_tracing();
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
-    s32 task_count = 1;
+    s32 task_count = 2;
     s32 tasks_leftover = task_count;
     s32 dsq_id;
 
-    tasks_leftover =
-        tasks_leftover - move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, tasks_leftover);
+    dsq_id = cpu_to_domain_highpriority_dsqid(cpu);
+    tasks_leftover = tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
 
     if (tasks_leftover) {
-        dsq_id = cpu_to_domain_highpriority_dsqid(cpu);
+        dsq_id = cpu_to_domain_regular_dsqid(cpu);
         tasks_leftover =
             tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
 
         if (tasks_leftover) {
-            dsq_id = cpu_to_domain_regular_dsqid(cpu);
             tasks_leftover =
-                tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
-
+                tasks_leftover - worksteal_from_neighbors_domain_queue(
+                                     /*from_highpriority_queue=*/true, cpu, tasks_leftover);
             if (tasks_leftover) {
                 tasks_leftover =
                     tasks_leftover - worksteal_from_neighbors_domain_queue(
-                                         /*from_highpriority_queue=*/true, cpu, tasks_leftover);
-                if (tasks_leftover) {
-                    tasks_leftover = tasks_leftover -
-                                     worksteal_from_neighbors_domain_queue(
                                          /*from_highpriority_queue=*/false, cpu, tasks_leftover);
-                }
             }
         }
     }
+
+    // avoid stalling tasks in regular queue if there are too many high
+    // priority tasks
+    dsq_id = cpu_to_domain_regular_dsqid(cpu);
+    move_from_custom_queue_to_local_dsq_if_over_period(dsq_id, task_count);
+
+    move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, 1);
 }
 
 void BPF_STRUCT_OPS(finesched_set_cpumask, struct task_struct *p, const struct cpumask *cpumask) {

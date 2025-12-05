@@ -74,9 +74,10 @@ impl PreAllocatedGroups {
         // populate the sharedmap with it
         gh.iter().for_each(|ent| {
             let (gid, group) = (ent.key(), ent.value());
+            // bpf scheduler ignores the reserved cores in current implementation
             let reserved_start = 0 as usize;
             let reserved_end = group.cores.len() / 3;
-            let regular_start = group.cores.len() / 3;
+            let regular_start = 0;
             let regular_end = group.cores.len();
 
             let sg = SchedGroupChrs {

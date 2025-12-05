@@ -34,11 +34,11 @@ enum consts {
     MAX_CPU_UTIL = 1000, // 100.0%
 
     NSEC_PER_USEC = 1000ULL,
-    NSEC_PER_MSEC = (1000ULL * NSEC_PER_USEC),
-    NSEC_PER_SEC = (1000ULL * NSEC_PER_MSEC),
+    NSEC_PER_MSEC = 1000000ULL,
+    NSEC_PER_SEC = 1000000000ULL, // Bug: It overflows the resultant when used as multiplier during
+                                  // compilation.
 
-    HEARTBEAT_INTERVAL = 200 * NSEC_PER_MSEC,
-    // HEARTBEAT_INTERVAL = 100 * NSEC_PER_MSEC,
+    HEARTBEAT_INTERVAL = 1000 * NSEC_PER_MSEC,
 
     DSQ_INACTIVE_GRPS_N0 = 0x10,    // custom DSQ on numa node 0 - custom DSQs can
                                     // be allocated on any node, if no node is
@@ -65,8 +65,14 @@ enum consts {
     DEFAULT_TS = (20 * NSEC_PER_MSEC),
     MIN_TS = (1 * NSEC_PER_MSEC),
 
-    TASK_LIFETIME_THRESHOLD = 1000, // tasks older then 1000*10 -> 10secs are too
-                                    // old
+    TASK_LIFETIME_THRESHOLD = 50, // tasks older then 50*10ms -> 500ms are too
+                                  // old
+
+    TASK_ROUNDTRIPTIME_AVG_CAPTURE_THRESHOLD = 3000000000ULL, // 3secs
+    TASK_ROUNDTRIPTIME_PRIO_THRESHOLD = (50 * NSEC_PER_MSEC),
+
+    REGULAR_QUEUE_CONSUME_PERIOD_THRESHOLD = (100 * NSEC_PER_MSEC),
+
 };
 
 // TODO: not sure why scx_utils builder is not

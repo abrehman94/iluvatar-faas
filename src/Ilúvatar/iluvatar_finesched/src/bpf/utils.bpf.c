@@ -159,6 +159,48 @@ static struct bpf_cpumask *__noinline cpu_mask_intersection(struct cpumask *mask
     return cpumask;
 }
 
+//////
+// CPU helpers
+
+#define KICK_ALL_CPUS_CALL_COUNT_THRESHOLD (MAX_CPUS / 4)
+static s32 kick_all_cpus_call_count = 0;
+
+static __always_inline void kick_cpus(struct cpumask *mask) {
+    s32 cpu;
+    bpf_for(cpu, 0, MAX_CPUS) {
+        if (bpf_cpumask_test_cpu(cpu, mask)) {
+            scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+        }
+    }
+}
+
+static __always_inline void kick_all_cpus() {
+    s32 cpu;
+    bpf_for(cpu, 0, MAX_CPUS) { scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE); }
+}
+
+// kicks all cpus only when number of calls exceed
+// a threshold
+static __noinline void kick_all_cpus_every_nth_call() {
+    kick_all_cpus_call_count += 1;
+    if (kick_all_cpus_call_count < KICK_ALL_CPUS_CALL_COUNT_THRESHOLD) {
+        return;
+    }
+    kick_all_cpus_call_count = 0;
+
+    kick_all_cpus();
+}
+
+static void __noinline boost_cpus() {
+    u32 cpu;
+    u32 cpu_perf_lvl;
+
+    bpf_for(cpu, 0, MAX_CPUS) {
+        cpu_perf_lvl = scx_bpf_cpuperf_cur(cpu);
+        info("[dsqs][cpufreq] cpu: %d cur perf lvl: %d", cpu, cpu_perf_lvl);
+        scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
+    }
+}
 ////////////////////////////
 // Map Lookup
 
@@ -396,6 +438,222 @@ static void __noinline poll_update_pid_gid_cache() {
     int count;
     count = bpf_for_each_map_elem(&pid_chrs_cache, &callback_pid_chrs_cache_iter, &count, 0);
     info("[pid_chrs_cache] iterated total of %d elements", count);
+}
+
+////////
+// stats capturing
+
+// Credits to Changwoo author of scx_lavd
+static u64 calc_avg(u64 old_val, u64 new_val) {
+    /*
+     * Calculate the exponential weighted moving average (EWMA).
+     *  - EWMA = (0.75 * old) + (0.25 * new)
+     */
+    return (old_val - (old_val >> 2)) + (new_val >> 2);
+}
+
+static __noinline void task_stats_task_roundtrip_since_last_wakeup(struct task_struct *p) {
+    struct task_context *tctx;
+    tctx = try_lookup_task_ctx(p);
+
+    if (p && tctx) {
+        u64 last_wakeup_time = tctx->last_wakeup_time;
+        u64 current_time = bpf_ktime_get_tai_ns();
+
+        // corner case for the starting point
+        last_wakeup_time = last_wakeup_time == 0 ? current_time : last_wakeup_time;
+
+        last_wakeup_time = current_time > last_wakeup_time ? last_wakeup_time : current_time - 1;
+        u64 roundtrip_time = current_time - last_wakeup_time;
+        tctx->last_wakeup_time = current_time;
+
+        if (roundtrip_time != 1 && roundtrip_time < TASK_ROUNDTRIPTIME_AVG_CAPTURE_THRESHOLD) {
+            // corner case for the starting point
+            tctx->wakeup_roundtrip_time_avg = tctx->wakeup_roundtrip_time_avg == 0
+                                                  ? roundtrip_time
+                                                  : tctx->wakeup_roundtrip_time_avg;
+
+            tctx->wakeup_roundtrip_time_avg =
+                calc_avg(tctx->wakeup_roundtrip_time_avg, roundtrip_time);
+        }
+    }
+}
+
+static __noinline void task_stats_task_enqueued_reset(struct task_struct *p) {
+    struct task_context *tctx;
+    tctx = try_lookup_task_ctx(p);
+
+    if (p && tctx) {
+        tctx->enqueue_count = 0;
+        info("[timeslice_shortening][%s:%d] tctx->enqueue_count %lld ", p->comm, p->pid,
+             tctx->enqueue_count);
+    }
+}
+
+static __noinline void task_stats_task_enqueued(struct task_struct *p) {
+    struct task_context *tctx;
+    tctx = try_lookup_task_ctx(p);
+
+    if (p && tctx) {
+        tctx->enqueue_count = tctx->enqueue_count + 1;
+        info("[timeslice_shortening][%s:%d] tctx->enqueue_count %lld ", p->comm, p->pid,
+             tctx->enqueue_count);
+    }
+}
+
+static __noinline void task_stats_start_running(struct task_struct *p) {
+    struct task_context *tctx;
+    tctx = try_lookup_task_ctx(p);
+
+    if (tctx) {
+        tctx->running_start_time = bpf_ktime_get_tai_ns();
+    }
+}
+
+static __noinline void task_stats_stop_running(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
+    struct task_context *tctx;
+    tctx = try_lookup_task_ctx(p);
+
+    if (tctx) {
+        u64 current_time = bpf_ktime_get_tai_ns();
+        u64 start_time = tctx->running_start_time;
+        start_time = current_time > start_time ? start_time : current_time - 1;
+
+        u64 cpu_time = current_time - start_time;
+        if (cpu_time != 1) {
+            tctx->cpu_time_avg = calc_avg(tctx->cpu_time_avg, cpu_time);
+            info("[timeslice_shortening][%s:%d] tctx->cpu_time_avg %lld ", p->comm, p->pid,
+                 tctx->cpu_time_avg);
+        }
+    }
+}
+
+static __noinline void dsq_stats_task_consumed(u64 dsqid) {
+    struct dsq_context *dsq_context = try_lookup_dsq_context(dsqid);
+    if (!dsq_context) {
+        return;
+    }
+
+    dsq_context->last_consume_time = bpf_ktime_get_tai_ns();
+}
+
+static void __always_inline stats_update_percpu_util(struct cpu_ctx *c) {
+    u64 now = bpf_ktime_get_ns();
+    if (!c) {
+        return;
+    }
+
+    // update idle time
+    u64 old_clk = c->idle_start;
+    if (old_clk != 0) {
+        bool ret = __sync_bool_compare_and_swap(&c->idle_start, old_clk, now);
+        if (ret) {
+            c->idle_time += now - old_clk;
+        }
+    }
+
+    u64 idle_dur = c->idle_time - c->prev_idle_time;
+    c->prev_idle_time = c->idle_time;
+
+    u64 wclk = now - c->last_calc_time;
+    c->last_calc_time = now;
+
+    u64 compute = wclk - idle_dur;
+    u64 util;
+    util = (compute * MAX_CPU_UTIL) / wclk;
+    if (util > MAX_CPU_UTIL) {
+        // drop bad reading it happens during init only
+        return;
+    }
+    c->util = util;
+    c->avg_util = calc_avg(c->avg_util, c->util);
+}
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(key_size, sizeof(u32));
+    /* double size because verifier can't follow length calculation */
+    __uint(value_size, sizeof(u64) * DSQ_MAX_COUNT);
+    __uint(max_entries, 1);
+} dom_util_bufs SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(key_size, sizeof(u32));
+    /* double size because verifier can't follow length calculation */
+    __uint(value_size, sizeof(u64) * DSQ_MAX_COUNT);
+    __uint(max_entries, 1);
+} dom_autil_bufs SEC(".maps");
+
+__always_inline void *get_dom_buf(struct bpf_map *map) {
+    u32 zero = 0;
+    void *buff = bpf_map_lookup_elem(map, &zero);
+    return buff;
+}
+
+static void __noinline stats_update_global() {
+    s32 cpu;
+    u64 dsqid = 0;
+    u64 util = 0;
+    u64 autil = 0;
+
+    u64 *dom_util = get_dom_buf(&dom_util_bufs);
+    u64 *dom_autil = get_dom_buf(&dom_autil_bufs);
+    if (!dom_util || !dom_autil) {
+        return;
+    }
+
+    SchedGroupID gid = 0;
+    struct cpu_ctx *cctx = NULL;
+    SchedGroupStats_t *stats = NULL;
+    SchedGroupChrs_t *chrs = NULL;
+
+    bpf_for(cpu, 0, MAX_CPUS) {
+        // TODO: it causes contention across cores! every 200ms
+        // maybe use a lockless structure to accumulate stuff
+        // that would have to write to shared memory on each call
+        // this is just asking for every 200ms
+        // trace dump is delayed because of it but the numbers are
+        // still every 200ms
+
+        cctx = try_lookup_cpu_ctx(cpu);
+        if (cctx) {
+            stats_update_percpu_util(cctx);
+            util += cctx->util;
+            autil += cctx->avg_util;
+
+            dsqid = cctx->prio_dsqid;
+            if (dsqid != 0) {
+                gid = dsqid - DSQ_PRIO_GRPS_START;
+            }
+            if (0 <= gid && gid < DSQ_MAX_COUNT) {
+                dom_util[gid] += cctx->util;
+                dom_autil[gid] += cctx->avg_util;
+            }
+        }
+    }
+
+    bpf_for(gid, 0, DSQ_MAX_COUNT) {
+        stats = get_schedgroup_stats(gid);
+        chrs = get_schedgroup_chrs(gid);
+        if (chrs && stats) {
+            dom_util[gid] /= chrs->core_count;
+            stats->util = dom_util[gid];
+
+            dom_autil[gid] /= chrs->core_count;
+            stats->avg_util = dom_autil[gid];
+
+            info("[stats][dev] found stats for gid: %llu util: %llu autil: %llu core_count %llu",
+                 gid, stats->util, stats->avg_util, chrs->core_count);
+        }
+    }
+    util /= 48;
+    autil /= 48;
+    info("[stats][cpu] across 48 cores util: %llu avg util: %llu", util, autil);
 }
 
 ////////////////////////////
@@ -636,6 +894,7 @@ static s32 __noinline move_from_custom_queue_to_local_dsq(u64 dsqid, s32 task_co
     s32 tasks_moved = 0;
 
     if (task_count != tasks_moved && scx_bpf_dsq_move_to_local(dsqid)) {
+        dsq_stats_task_consumed(dsqid);
         tasks_moved += 1;
     }
     if (task_count != tasks_moved && scx_bpf_dsq_move_to_local(dsqid)) {
@@ -648,6 +907,30 @@ static s32 __noinline move_from_custom_queue_to_local_dsq(u64 dsqid, s32 task_co
     return tasks_moved;
 }
 
+static __noinline s32 move_from_custom_queue_to_local_dsq_if_over_period(u64 dsqid,
+                                                                         s32 task_count) {
+    struct dsq_context *dsq_context = try_lookup_dsq_context(dsqid);
+    if (!dsq_context) {
+        return 0;
+    }
+
+    u64 last_consume_time = dsq_context->last_consume_time;
+    u64 current_time = bpf_ktime_get_tai_ns();
+
+    // corner case for the starting point
+    if (last_consume_time == 0) {
+        dsq_context->last_consume_time = current_time;
+        last_consume_time = current_time;
+    }
+
+    u64 time_since = current_time - last_consume_time;
+
+    if (time_since > REGULAR_QUEUE_CONSUME_PERIOD_THRESHOLD) {
+        return move_from_custom_queue_to_local_dsq(dsqid, task_count);
+    }
+    return 0;
+}
+
 static __noinline s32 move_from_per_cpu_custom_to_local_dsq(s32 cpu, s32 task_count) {
     return move_from_custom_queue_to_local_dsq(DSQ_PRIO_PER_CPU_START + cpu, task_count);
 }
@@ -657,21 +940,26 @@ static __inline s32 local_and_custom_dsq_len_for(s32 cpu) {
            scx_bpf_dsq_nr_queued(DSQ_PRIO_PER_CPU_START + cpu);
 }
 
-static __noinline void check_dsqlen_of_each_dsq_for_tracing() {
+static __noinline u64 tasks_enqueued_on_bpfscheduler() {
     u64 dsqid;
     u64 max_dsqs = domains_count;
     max_dsqs = max_dsqs > DSQ_MAX_COUNT ? DSQ_MAX_COUNT : max_dsqs;
+    u64 count = 0;
 
     bpf_for(dsqid, DSQ_PRIO_Q_PER_DOM_START, DSQ_PRIO_Q_PER_DOM_START + max_dsqs) {
-        scx_bpf_dsq_nr_queued(dsqid);
+        count += scx_bpf_dsq_nr_queued(dsqid);
     }
 
     bpf_for(dsqid, DSQ_REG_Q_PER_DOM_START, DSQ_REG_Q_PER_DOM_START + max_dsqs) {
-        scx_bpf_dsq_nr_queued(dsqid);
+        count += scx_bpf_dsq_nr_queued(dsqid);
     }
 
-    scx_bpf_dsq_nr_queued(DSQ_GLOBAL_Q_ID);
+    count += scx_bpf_dsq_nr_queued(DSQ_GLOBAL_Q_ID);
+
+    return count;
 }
+
+static __noinline void check_dsqlen_of_each_dsq_for_tracing() { tasks_enqueued_on_bpfscheduler(); }
 
 static bool __inline lookup_and_update_min_dsq_len(s32 current_cpu, s32 *old_cpu, s32 *old_len) {
     if (!old_cpu || !old_len) {
@@ -841,6 +1129,7 @@ static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
             timeslice = shorten_timeslice_by_cputime_to_timeslice_ratio(timeslice, p);
 
             scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
+            kick_cpus(&sched_chrs->corebitmask);
             return true;
         }
     }
@@ -855,6 +1144,7 @@ static __noinline void enqueue_to_global_queue(struct task_struct *p) {
     timeslice = shorten_timeslice_by_dsqlen(timeslice, dsqid);
 
     scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
+    kick_all_cpus();
 }
 
 ////////////////////////////
@@ -1025,314 +1315,6 @@ static u64 __always_inline prio_short_first_over(u64 cvtime, u64 tconsumed) {
     }
 
     return cvtime;
-}
-
-//////
-// Task -> Priority DSQ
-
-static long __noinline callback_gmap_kick_cpus_iter(struct bpf_map *map, const void *key, void *val,
-                                                    void *ctx) {
-    if (!key || !val) {
-        return 1;
-    }
-
-    SchedGroupID *gid = (SchedGroupID *)key;
-    SchedGroupChrs_t *chrs = (SchedGroupChrs_t *)val;
-
-    // cpu_mask has more bits then cpu_max therefore it would be
-    // costly to use bit_iterator helpers here
-    s32 cpu;
-    s32 len;
-    bpf_for(cpu, 0, MAX_CPUS) {
-        // TODO: check if dsq is not empty
-        len = scx_bpf_dsq_nr_queued(DSQ_PRIO_GRPS_START + *gid);
-        if (len == 0) {
-            continue;
-        }
-
-        if (bpf_cpumask_test_cpu(cpu, &chrs->corebitmask)) {
-            scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-            info("[dsqs][gmap] kicked cpu %d for gid %d", cpu, *gid);
-        }
-    }
-
-    return 0;
-}
-
-static void __noinline kick_prio_dsq_cpus() {
-    int count;
-    count = bpf_for_each_map_elem(&gMap, &callback_gmap_kick_cpus_iter, &count, 0);
-    info("[dsqs][gmap] iterated total of %d elements to kick cpus", count);
-}
-
-#define KICK_ALL_CPUS_CALL_COUNT_THRESHOLD (MAX_CPUS / 4)
-static s32 kick_all_cpus_call_count = 0;
-
-// kicks all cpus only when number of calls exceed
-// a threshold
-static __noinline void kick_all_cpus_every_nth_call() {
-    kick_all_cpus_call_count += 1;
-    if (kick_all_cpus_call_count < KICK_ALL_CPUS_CALL_COUNT_THRESHOLD) {
-        return;
-    }
-    kick_all_cpus_call_count = 0;
-
-    s32 cpu;
-    bpf_for(cpu, 0, MAX_CPUS) { scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE); }
-}
-
-static long __noinline callback_gmap_capture_stats_cpus_iter(struct bpf_map *map, const void *key,
-                                                             void *val, void *ctx) {
-
-    if (!key || !val) {
-        return 1;
-    }
-
-    SchedGroupID *gid = (SchedGroupID *)key;
-    SchedGroupChrs_t *chrs = (SchedGroupChrs_t *)val;
-    SchedGroupStats_t *sched_stats = get_schedgroup_stats(*gid);
-    if (!sched_stats) {
-        return 1;
-    }
-
-    sched_stats->dsqlen = scx_bpf_dsq_nr_queued(DSQ_PRIO_GRPS_START + *gid);
-
-    // cpu_mask has more bits then cpu_max therefore it would be
-    // costly to use bit_iterator helpers here
-    s32 cpu;
-    s32 cpucount = 0;
-    u64 temp_val;
-    struct cpu_ctx *cctx = NULL;
-    struct cpucycles_ctx *lcpucycles_ctx;
-
-    sched_stats->avg_freq_mhz = 0;
-    sched_stats->util = 0;
-    sched_stats->avg_util = 0;
-
-    cpucount = 0;
-    bpf_for(cpu, 0, MAX_CPUS) {
-
-        if (bpf_cpumask_test_cpu(cpu, &chrs->corebitmask)) {
-
-            lcpucycles_ctx = try_lookup_cpucycles_ctx(cpu);
-            if (!lcpucycles_ctx) {
-                break;
-            }
-
-            cctx = try_lookup_cpu_ctx(cpu);
-            if (!cctx) {
-                break;
-            }
-
-            sched_stats->util += cctx->util;
-            sched_stats->avg_util += cctx->avg_util;
-
-            sched_stats->avg_freq_mhz += lcpucycles_ctx->cycles_per_sec;
-
-            cpucount += 1;
-        }
-    }
-
-    cpucount = 0;
-    bpf_for(cpu, 0, MAX_CPUS) {
-        if (bpf_cpumask_test_cpu(cpu, &chrs->corebitmask)) {
-            cpucount += 1;
-        }
-    }
-
-    if (cpucount > 0) {
-        sched_stats->util /= cpucount;
-        sched_stats->avg_util /= cpucount;
-        sched_stats->avg_freq_mhz /= cpucount;
-        info("[stats][gstats] sched domain %d util: %llu avg util: %llu avg freq: %llu", *gid,
-             sched_stats->util, sched_stats->avg_util, sched_stats->avg_freq_mhz);
-    }
-
-    return 0;
-}
-
-static void __noinline capture_stats_for_gmap() {
-    int count;
-    count = bpf_for_each_map_elem(&gMap, &callback_gmap_capture_stats_cpus_iter, &count, 0);
-    info("[dsqs][gmap][gStats] iterated total of %d elements to capture stats", count);
-}
-
-static void __noinline boost_cpus() {
-    u32 cpu;
-    u32 cpu_perf_lvl;
-
-    bpf_for(cpu, 0, MAX_CPUS) {
-        cpu_perf_lvl = scx_bpf_cpuperf_cur(cpu);
-        info("[dsqs][cpufreq] cpu: %d cur perf lvl: %d", cpu, cpu_perf_lvl);
-        scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
-    }
-}
-
-////////
-// stats capturing
-
-// Credits to Changwoo author of scx_lavd
-static u64 calc_avg(u64 old_val, u64 new_val) {
-    /*
-     * Calculate the exponential weighted moving average (EWMA).
-     *  - EWMA = (0.75 * old) + (0.25 * new)
-     */
-    return (old_val - (old_val >> 2)) + (new_val >> 2);
-}
-
-static __noinline void task_stats_task_enqueued(struct task_struct *p) {
-    struct task_context *tctx;
-    tctx = try_lookup_task_ctx(p);
-
-    if (tctx) {
-        tctx->enqueue_count = tctx->enqueue_count + 1;
-    }
-}
-
-static __noinline void task_stats_start_running(struct task_struct *p) {
-    struct task_context *tctx;
-    tctx = try_lookup_task_ctx(p);
-
-    if (tctx) {
-        tctx->running_start_time = bpf_ktime_get_tai_ns();
-    }
-}
-
-static __noinline void task_stats_stop_running(struct task_struct *p) {
-    if (!p) {
-        return;
-    }
-
-    struct task_context *tctx;
-    tctx = try_lookup_task_ctx(p);
-
-    if (tctx) {
-        u64 current_time = bpf_ktime_get_tai_ns();
-        u64 start_time = tctx->running_start_time;
-        start_time = current_time > start_time ? start_time : current_time - 1;
-
-        u64 cpu_time = current_time - start_time;
-        if (cpu_time != 1) {
-            tctx->cpu_time_avg = calc_avg(tctx->cpu_time_avg, cpu_time);
-            info("[timeslice_shortening][%s:%d] tctx->cpu_time_avg %lld ", p->comm, p->pid,
-                 tctx->cpu_time_avg);
-        }
-    }
-}
-
-static void __always_inline stats_update_percpu_util(struct cpu_ctx *c) {
-    u64 now = bpf_ktime_get_ns();
-    if (!c) {
-        return;
-    }
-
-    // update idle time
-    u64 old_clk = c->idle_start;
-    if (old_clk != 0) {
-        bool ret = __sync_bool_compare_and_swap(&c->idle_start, old_clk, now);
-        if (ret) {
-            c->idle_time += now - old_clk;
-        }
-    }
-
-    u64 idle_dur = c->idle_time - c->prev_idle_time;
-    c->prev_idle_time = c->idle_time;
-
-    u64 wclk = now - c->last_calc_time;
-    c->last_calc_time = now;
-
-    u64 compute = wclk - idle_dur;
-    u64 util;
-    util = (compute * MAX_CPU_UTIL) / wclk;
-    if (util > MAX_CPU_UTIL) {
-        // drop bad reading it happens during init only
-        return;
-    }
-    c->util = util;
-    c->avg_util = calc_avg(c->avg_util, c->util);
-}
-
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(key_size, sizeof(u32));
-    /* double size because verifier can't follow length calculation */
-    __uint(value_size, sizeof(u64) * DSQ_MAX_COUNT);
-    __uint(max_entries, 1);
-} dom_util_bufs SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(key_size, sizeof(u32));
-    /* double size because verifier can't follow length calculation */
-    __uint(value_size, sizeof(u64) * DSQ_MAX_COUNT);
-    __uint(max_entries, 1);
-} dom_autil_bufs SEC(".maps");
-
-__always_inline void *get_dom_buf(struct bpf_map *map) {
-    u32 zero = 0;
-    void *buff = bpf_map_lookup_elem(map, &zero);
-    return buff;
-}
-
-static void __noinline stats_update_global() {
-    s32 cpu;
-    u64 dsqid = 0;
-    u64 util = 0;
-    u64 autil = 0;
-
-    u64 *dom_util = get_dom_buf(&dom_util_bufs);
-    u64 *dom_autil = get_dom_buf(&dom_autil_bufs);
-    if (!dom_util || !dom_autil) {
-        return;
-    }
-
-    SchedGroupID gid = 0;
-    struct cpu_ctx *cctx = NULL;
-    SchedGroupStats_t *stats = NULL;
-    SchedGroupChrs_t *chrs = NULL;
-
-    bpf_for(cpu, 0, MAX_CPUS) {
-        // TODO: it causes contention across cores! every 200ms
-        // maybe use a lockless structure to accumulate stuff
-        // that would have to write to shared memory on each call
-        // this is just asking for every 200ms
-        // trace dump is delayed because of it but the numbers are
-        // still every 200ms
-
-        cctx = try_lookup_cpu_ctx(cpu);
-        if (cctx) {
-            stats_update_percpu_util(cctx);
-            util += cctx->util;
-            autil += cctx->avg_util;
-
-            dsqid = cctx->prio_dsqid;
-            if (dsqid != 0) {
-                gid = dsqid - DSQ_PRIO_GRPS_START;
-            }
-            if (0 <= gid && gid < DSQ_MAX_COUNT) {
-                dom_util[gid] += cctx->util;
-                dom_autil[gid] += cctx->avg_util;
-            }
-        }
-    }
-
-    bpf_for(gid, 0, DSQ_MAX_COUNT) {
-        stats = get_schedgroup_stats(gid);
-        chrs = get_schedgroup_chrs(gid);
-        if (chrs && stats) {
-            dom_util[gid] /= chrs->core_count;
-            stats->util = dom_util[gid];
-
-            dom_autil[gid] /= chrs->core_count;
-            stats->avg_util = dom_autil[gid];
-
-            info("[stats][dev] found stats for gid: %llu util: %llu autil: %llu core_count %llu",
-                 gid, stats->util, stats->avg_util, chrs->core_count);
-        }
-    }
-    util /= 48;
-    autil /= 48;
-    info("[stats][cpu] across 48 cores util: %llu avg util: %llu", util, autil);
 }
 
 #endif // __UTILS_F
