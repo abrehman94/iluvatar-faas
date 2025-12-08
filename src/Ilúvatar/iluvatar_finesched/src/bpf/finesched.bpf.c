@@ -386,7 +386,7 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
-    s32 task_count = 2;
+    s32 task_count = 1;
     s32 tasks_leftover = task_count;
     s32 dsq_id;
 

@@ -1169,8 +1169,6 @@ static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
             u64 dsqid = to_highpriority_queue ? DSQ_PRIO_Q_PER_DOM_START : DSQ_REG_Q_PER_DOM_START;
             dsqid = dsqid + cgrp_chrs->gid;
 
-            timeslice = shorten_timeslice_by_cputime_to_timeslice_ratio(timeslice, p);
-
             scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
             kick_cpus(&sched_chrs->corebitmask);
             return true;
