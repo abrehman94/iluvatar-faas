@@ -532,6 +532,49 @@ static __noinline void task_stats_stop_running(struct task_struct *p) {
     }
 }
 
+static __noinline void task_stats_is_worker(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
+    struct task_context *tctx = try_lookup_task_ctx(p);
+    if (!tctx) {
+        return;
+    }
+
+    char *name = get_schedcgroup_name(p);
+    if (!name) {
+        return;
+    }
+
+    cgroup_ctx_t *cgroup_ctx = bpf_map_lookup_elem(&cgroup_ctx_stor, name);
+    if (!cgroup_ctx) {
+        return;
+    }
+
+    tctx->is_worker = cgroup_ctx->task_count > 2 ? true : false;
+    info("[task_stats][%s:%d] tctx->is_worker %d  cgroup_ctx->task_count %d ", p->comm, p->pid,
+         tctx->is_worker, cgroup_ctx->task_count);
+}
+
+static __noinline void cgroup_stats_task_init(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
+    char *name = get_schedcgroup_name(p);
+    if (!name) {
+        return;
+    }
+
+    cgroup_ctx_t *cgroup_ctx = bpf_map_lookup_elem(&cgroup_ctx_stor, name);
+    if (!cgroup_ctx) {
+        return;
+    }
+
+    cgroup_ctx->task_count += 1;
+}
+
 static __noinline void dsq_stats_task_consumed(u64 dsqid) {
     struct dsq_context *dsq_context = try_lookup_dsq_context(dsqid);
     if (!dsq_context) {
@@ -1156,12 +1199,12 @@ static __noinline void enqueue_to_global_queue(struct task_struct *p) {
 static void __noinline switch_to_scx_if_cgroup_exists(struct task_struct *p) {
 
     char *name = get_schedcgroup_name(p);
-    if (name == NULL) {
+    if (!name) {
         return;
     }
 
     cgroup_ctx_t *cgroup_ctx = bpf_map_lookup_elem(&cgroup_ctx_stor, name);
-    if (cgroup_ctx != NULL) {
+    if (cgroup_ctx) {
         scx_bpf_switch_to_scx(p);
     }
 }

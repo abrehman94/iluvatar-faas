@@ -122,6 +122,8 @@ struct task_context {
     u64 wakeup_roundtrip_time_avg;
 
     u64 enqueue_count;
+
+    bool is_worker;
 };
 
 /* Map that contains task-local storage. */
@@ -350,18 +352,15 @@ s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 
     struct task_context *tctx = try_lookup_task_ctx(p);
 
-    if (tctx && (tctx->enqueue_count > TASK_LIFETIME_THRESHOLD &&
-                 tctx->wakeup_roundtrip_time_avg > TASK_ROUNDTRIPTIME_PRIO_THRESHOLD)) {
-        if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/false)) {
-            enqueue_to_global_queue(p);
-        }
-    } else {
+    if (tctx && tctx->is_worker) {
         if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
             enqueue_to_global_queue(p);
         }
+    } else {
+        if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/false)) {
+            enqueue_to_global_queue(p);
+        }
     }
-    task_stats_task_enqueued(p);
-    task_stats_task_roundtrip_since_last_wakeup(p);
 
     check_dsqlen_of_each_dsq_for_tracing();
 
@@ -373,8 +372,7 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 
     struct task_context *tctx = try_lookup_task_ctx(p);
 
-    if (tctx && (tctx->enqueue_count <= TASK_LIFETIME_THRESHOLD ||
-                 tctx->wakeup_roundtrip_time_avg <= TASK_ROUNDTRIPTIME_PRIO_THRESHOLD)) {
+    if (tctx && tctx->is_worker) {
         if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
             enqueue_to_global_queue(p);
         }
@@ -383,7 +381,6 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
             enqueue_to_global_queue(p);
         }
     }
-    task_stats_task_enqueued(p);
 
     check_dsqlen_of_each_dsq_for_tracing();
 }
@@ -422,8 +419,7 @@ void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
 }
 
 void BPF_STRUCT_OPS(finesched_set_cpumask, struct task_struct *p, const struct cpumask *cpumask) {
-    info("[info][set_cpumask] ignoring sched_setaffinity for pid: %d comm: %s mask:  %p", p->pid,
-         p->comm, cpumask);
+    info("[info][set_cpumask][%s:%d]  updated", p->comm, p->pid);
 }
 
 void BPF_STRUCT_OPS(finesched_running, struct task_struct *p) { task_stats_start_running(p); }
@@ -471,16 +467,12 @@ int BPF_PROG(cpu_cgroup_attach, struct cgroup_taskset *tset) {
 //  have scx as sched class, so they don't come into other callbacks
 s32 BPF_STRUCT_OPS(finesched_init_task, struct task_struct *p, struct scx_init_task_args *args) {
 
-    info("[init_task] initializing task %d - %s", p->pid, p->comm);
+    info("[init_task][%s:%d] task born", p->comm, p->pid);
 
     switch_to_scx_if_cgroup_exists(p);
 
-    // TODO: Does not work in some cases.
-    // switch_to_scx_is_docker(p);
-
-    // TODO: CMAP may not yet have been populated - I don't know of a way to
-    // make sure of that yet
-    // switch_to_scx_cmap_checked(p);
+    cgroup_stats_task_init(p);
+    task_stats_is_worker(p);
 
     return 0;
 }
