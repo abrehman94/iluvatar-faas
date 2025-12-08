@@ -115,6 +115,8 @@ __always_inline struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu) {
  * This contain all the per-task information used internally by the BPF code.
  */
 struct task_context {
+    u64 vtime;
+
     u64 running_start_time;
     u64 cpu_time_avg;
 
@@ -472,7 +474,7 @@ s32 BPF_STRUCT_OPS(finesched_init_task, struct task_struct *p, struct scx_init_t
     switch_to_scx_if_cgroup_exists(p);
 
     cgroup_stats_task_init(p);
-    task_stats_is_worker(p);
+    task_stats_task_init(p);
 
     return 0;
 }

@@ -525,6 +525,9 @@ static __noinline void task_stats_stop_running(struct task_struct *p) {
 
         u64 cpu_time = current_time - start_time;
         if (cpu_time != 1) {
+            // prioritize tasks that consume less cpu time
+            tctx->vtime += cpu_time;
+
             tctx->cpu_time_avg = calc_avg(tctx->cpu_time_avg, cpu_time);
             info("[timeslice_shortening][%s:%d] tctx->cpu_time_avg %lld ", p->comm, p->pid,
                  tctx->cpu_time_avg);
@@ -532,7 +535,7 @@ static __noinline void task_stats_stop_running(struct task_struct *p) {
     }
 }
 
-static __noinline void task_stats_is_worker(struct task_struct *p) {
+static __noinline void task_stats_task_init(struct task_struct *p) {
     if (!p) {
         return;
     }
@@ -552,6 +555,10 @@ static __noinline void task_stats_is_worker(struct task_struct *p) {
         return;
     }
 
+    // tasks born earlier are prioritized
+    tctx->vtime = bpf_ktime_get_tai_ns();
+
+    // third or later tasks in a cgroup belong to worker threads
     tctx->is_worker = cgroup_ctx->task_count > 2 ? true : false;
     info("[task_stats][%s:%d] tctx->is_worker %d  cgroup_ctx->task_count %d ", p->comm, p->pid,
          tctx->is_worker, cgroup_ctx->task_count);
@@ -1132,9 +1139,7 @@ static __noinline u64 shorten_timeslice_by_factor(u64 timeslice, u64 factor) {
 
 static __noinline u64 shorten_timeslice_by_cputime_to_timeslice_ratio(u64 timeslice,
                                                                       struct task_struct *p) {
-    struct task_context *tctx;
-    tctx = try_lookup_task_ctx(p);
-
+    struct task_context *tctx = try_lookup_task_ctx(p);
     if (!tctx) {
         return timeslice;
     }
@@ -1162,29 +1167,43 @@ static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
     }
 
     CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
-    if (cgrp_chrs != NULL) {
-        SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(cgrp_chrs->gid);
-        if (sched_chrs != NULL) {
-            u64 timeslice = sched_chrs->timeslice * NSEC_PER_MSEC;
-            u64 dsqid = to_highpriority_queue ? DSQ_PRIO_Q_PER_DOM_START : DSQ_REG_Q_PER_DOM_START;
-            dsqid = dsqid + cgrp_chrs->gid;
-
-            scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
-            kick_cpus(&sched_chrs->corebitmask);
-            return true;
-        }
+    if (!cgrp_chrs) {
+        return false;
     }
 
-    return false;
+    SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(cgrp_chrs->gid);
+    if (!sched_chrs) {
+        return false;
+    }
+
+    struct task_context *tctx = try_lookup_task_ctx(p);
+    if (!tctx) {
+        return false;
+    }
+
+    u64 timeslice = sched_chrs->timeslice * NSEC_PER_MSEC;
+    u64 dsqid = to_highpriority_queue ? DSQ_PRIO_Q_PER_DOM_START : DSQ_REG_Q_PER_DOM_START;
+    dsqid = dsqid + cgrp_chrs->gid;
+
+    scx_bpf_dsq_insert_vtime(p, dsqid, timeslice, tctx->vtime, 0);
+    kick_cpus(&sched_chrs->corebitmask);
+    return true;
 }
 
 static __noinline void enqueue_to_global_queue(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
+    struct task_context *tctx = try_lookup_task_ctx(p);
+    if (!tctx) {
+        return;
+    }
+
     u64 timeslice = DEFAULT_TS;
     u64 dsqid = DSQ_GLOBAL_Q_ID;
 
-    timeslice = shorten_timeslice_by_dsqlen(timeslice, dsqid);
-
-    scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
+    scx_bpf_dsq_insert_vtime(p, dsqid, timeslice, tctx->vtime, 0);
     kick_all_cpus();
 }
 
