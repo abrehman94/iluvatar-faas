@@ -72,7 +72,6 @@ enum consts {
     TASK_ROUNDTRIPTIME_PRIO_THRESHOLD = (200 * NSEC_PER_MSEC),
 
     REGULAR_QUEUE_CONSUME_PERIOD_THRESHOLD = (1000 * NSEC_PER_MSEC),
-
 };
 
 // TODO: not sure why scx_utils builder is not

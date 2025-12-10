@@ -74,7 +74,7 @@ static void dump_cpumask(struct cpumask *bitmask) {
         bpf_rcu_read_unlock();                                                                     \
     } while (0)
 
-static int __noinline populate_cpumasks() {
+static __noinline int populate_cpumasks() {
     int err;
     int i;
 
@@ -88,9 +88,9 @@ static int __noinline populate_cpumasks() {
     return 0;
 }
 
-static s32 __noinline cpu_to_numanode(s32 cpu) { return cpu < (MAX_CPUS / 2) ? 0 : 1; }
+static __noinline s32 cpu_to_numanode(s32 cpu) { return cpu < (MAX_CPUS / 2) ? 0 : 1; }
 
-static int __noinline cpumask_to_numanode(struct bpf_cpumask *cpumask) {
+static __noinline int cpumask_to_numanode(struct bpf_cpumask *cpumask) {
 
     int r = -1;
 
@@ -109,7 +109,7 @@ static int __noinline cpumask_to_numanode(struct bpf_cpumask *cpumask) {
     return r;
 }
 
-static long __noinline callback_gmap_populate_cpu_to_dsq_iter(struct bpf_map *map, const void *key,
+static __noinline long callback_gmap_populate_cpu_to_dsq_iter(struct bpf_map *map, const void *key,
                                                               void *val, void *ctx) {
 
     int err;
@@ -140,7 +140,7 @@ static long __noinline callback_gmap_populate_cpu_to_dsq_iter(struct bpf_map *ma
     return 0;
 }
 
-static s32 __noinline populate_cpu_to_dsq() {
+static __noinline s32 populate_cpu_to_dsq() {
 
     int count;
     count = bpf_for_each_map_elem(&gMap, &callback_gmap_populate_cpu_to_dsq_iter, &count, 0);
@@ -149,7 +149,7 @@ static s32 __noinline populate_cpu_to_dsq() {
     return 0;
 }
 
-static struct bpf_cpumask *__noinline cpu_mask_intersection(struct cpumask *mask0,
+static __noinline struct bpf_cpumask *cpu_mask_intersection(struct cpumask *mask0,
                                                             struct cpumask *mask1) {
     struct bpf_cpumask *cpumask = bpf_cpumask_create();
     if (!cpumask)
@@ -529,7 +529,7 @@ static __noinline void task_stats_stop_running(struct task_struct *p) {
             tctx->vtime += cpu_time;
 
             tctx->cpu_time_avg = calc_avg(tctx->cpu_time_avg, cpu_time);
-            info("[timeslice_shortening][%s:%d] tctx->cpu_time_avg %lld ", p->comm, p->pid,
+            info("[task_stats][%s:%d] tctx->cpu_time_avg %lld ", p->comm, p->pid,
                  tctx->cpu_time_avg);
         }
     }
@@ -545,6 +545,9 @@ static __noinline void task_stats_task_init(struct task_struct *p) {
         return;
     }
 
+    // starting point
+    tctx->vtime = last_max_vtime;
+
     char *name = get_schedcgroup_name(p);
     if (!name) {
         return;
@@ -555,13 +558,37 @@ static __noinline void task_stats_task_init(struct task_struct *p) {
         return;
     }
 
-    // tasks born earlier are prioritized
-    tctx->vtime = bpf_ktime_get_tai_ns();
-
     // third or later tasks in a cgroup belong to worker threads
     tctx->is_worker = cgroup_ctx->task_count > 2 ? true : false;
     info("[task_stats][%s:%d] tctx->is_worker %d  cgroup_ctx->task_count %d ", p->comm, p->pid,
          tctx->is_worker, cgroup_ctx->task_count);
+}
+
+static __noinline void task_stats_task_wokenup(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
+    struct task_context *tctx = try_lookup_task_ctx(p);
+    if (!tctx) {
+        return;
+    }
+
+    info("[task_stats][%s:%d] woken up tctx->vtime %llu ", p->comm, p->pid, tctx->vtime);
+}
+
+static __noinline void task_stats_task_mask_updated(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
+    struct task_context *tctx = try_lookup_task_ctx(p);
+    if (!tctx) {
+        return;
+    }
+
+    u32 number_of_set_cpus = bpf_cpumask_weight(p->cpus_ptr);
+    tctx->use_specified_cpus = number_of_set_cpus <= MAX_CPUS / 2;
 }
 
 static __noinline void cgroup_stats_task_init(struct task_struct *p) {
@@ -1185,6 +1212,9 @@ static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
     u64 dsqid = to_highpriority_queue ? DSQ_PRIO_Q_PER_DOM_START : DSQ_REG_Q_PER_DOM_START;
     dsqid = dsqid + cgrp_chrs->gid;
 
+    info("[task_stats][%s:%d] insert to dsq(0x%x) tctx->vtime %llu ", p->comm, p->pid, dsqid,
+         tctx->vtime);
+    last_max_vtime = MAX(tctx->vtime, last_max_vtime);
     scx_bpf_dsq_insert_vtime(p, dsqid, timeslice, tctx->vtime, 0);
     kick_cpus(&sched_chrs->corebitmask);
     return true;
@@ -1202,9 +1232,23 @@ static __noinline void enqueue_to_global_queue(struct task_struct *p) {
 
     u64 timeslice = DEFAULT_TS;
     u64 dsqid = DSQ_GLOBAL_Q_ID;
+    // restrict tasks belonging to global queue to last domain only
+    dsqid = cpu_to_domain_regular_dsqid(MAX_CPUS - 1);
 
+    info("[task_stats][%s:%d] insert to dsq(0x%x) tctx->vtime %llu ", p->comm, p->pid, dsqid,
+         tctx->vtime);
+    last_max_vtime = MAX(tctx->vtime, last_max_vtime);
     scx_bpf_dsq_insert_vtime(p, dsqid, timeslice, tctx->vtime, 0);
     kick_all_cpus();
+}
+
+static __noinline void enqueue_to_per_cpu_custom_dsq(struct task_struct *p) {
+    s32 cpu = bpf_get_smp_processor_id();
+    u64 timeslice = DEFAULT_TS;
+
+    cpu = least_loaded_local_dsq_cpu(p->cpus_ptr);
+    scx_bpf_dsq_insert(p, DSQ_PRIO_PER_CPU_START + cpu, timeslice, 0);
+    kick_cpus(p->cpus_ptr);
 }
 
 ////////////////////////////

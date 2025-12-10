@@ -29,6 +29,7 @@ bool cpu_boost_config = false;
 bool enable_timer_callback = true;
 u32 enqueue_config = SCHED_CONFIG_PRIO_DSQ;
 u64 domains_count = 0;
+u64 last_max_vtime = 0;
 
 SchedGroupChrs_t empty_sched_chrs = {0};
 
@@ -126,6 +127,7 @@ struct task_context {
     u64 enqueue_count;
 
     bool is_worker;
+    bool use_specified_cpus;
 };
 
 /* Map that contains task-local storage. */
@@ -351,21 +353,8 @@ int perf_sample_handler(struct bpf_perf_event_data *ctx) {
 // dispatch the task @p to least loaded local dsq of a core that belongs
 // to the domain assigned by CP
 s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags) {
-
-    struct task_context *tctx = try_lookup_task_ctx(p);
-
-    if (tctx && tctx->is_worker) {
-        if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
-            enqueue_to_global_queue(p);
-        }
-    } else {
-        if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/false)) {
-            enqueue_to_global_queue(p);
-        }
-    }
-
-    check_dsqlen_of_each_dsq_for_tracing();
-
+    // all tasks are enqueued on bpf_scheduler first
+    task_stats_task_wokenup(p);
     return prev_cpu;
 }
 
@@ -374,7 +363,9 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 
     struct task_context *tctx = try_lookup_task_ctx(p);
 
-    if (tctx && tctx->is_worker) {
+    if (tctx && tctx->use_specified_cpus) {
+        enqueue_to_per_cpu_custom_dsq(p);
+    } else if (tctx && tctx->is_worker) {
         if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
             enqueue_to_global_queue(p);
         }
@@ -388,29 +379,23 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
-    s32 task_count = 1;
+    s32 task_count = 1; // 2 or more makes it worse across aile
     s32 tasks_leftover = task_count;
     s32 dsq_id;
 
     dsq_id = cpu_to_domain_highpriority_dsqid(cpu);
     tasks_leftover = tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
 
-    if (tasks_leftover) {
-        dsq_id = cpu_to_domain_regular_dsqid(cpu);
-        tasks_leftover =
-            tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
+    dsq_id = cpu_to_domain_regular_dsqid(cpu);
+    tasks_leftover = tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
 
-        if (tasks_leftover) {
-            tasks_leftover =
-                tasks_leftover - worksteal_from_neighbors_domain_queue(
-                                     /*from_highpriority_queue=*/true, cpu, tasks_leftover);
-            if (tasks_leftover) {
-                tasks_leftover =
-                    tasks_leftover - worksteal_from_neighbors_domain_queue(
-                                         /*from_highpriority_queue=*/false, cpu, tasks_leftover);
-            }
-        }
-    }
+    tasks_leftover = tasks_leftover - move_from_per_cpu_custom_to_local_dsq(cpu, tasks_leftover);
+
+    tasks_leftover = tasks_leftover - worksteal_from_neighbors_domain_queue(
+                                          /*from_highpriority_queue=*/true, cpu, tasks_leftover);
+
+    tasks_leftover = tasks_leftover - worksteal_from_neighbors_domain_queue(
+                                          /*from_highpriority_queue=*/false, cpu, tasks_leftover);
 
     // avoid stalling tasks in regular queue if there are too many high
     // priority tasks
@@ -422,6 +407,8 @@ void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
 
 void BPF_STRUCT_OPS(finesched_set_cpumask, struct task_struct *p, const struct cpumask *cpumask) {
     info("[info][set_cpumask][%s:%d]  updated", p->comm, p->pid);
+
+    task_stats_task_mask_updated(p);
 }
 
 void BPF_STRUCT_OPS(finesched_running, struct task_struct *p) { task_stats_start_running(p); }
