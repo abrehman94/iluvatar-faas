@@ -191,6 +191,31 @@ static __noinline void kick_all_cpus_every_nth_call() {
     kick_all_cpus();
 }
 
+static long __noinline callback_gmap_kick_cpus_iter(struct bpf_map *map, const void *key, void *val,
+                                                    void *ctx) {
+    if (!key || !val) {
+        return 1;
+    }
+
+    SchedGroupID *gid = (SchedGroupID *)key;
+    SchedGroupChrs_t *chrs = (SchedGroupChrs_t *)val;
+
+    s32 len;
+    len = scx_bpf_dsq_nr_queued(DSQ_PRIO_Q_PER_DOM_START + *gid);
+    len += scx_bpf_dsq_nr_queued(DSQ_REG_Q_PER_DOM_START + *gid);
+    if (len > 0) {
+        kick_cpus(&chrs->corebitmask);
+    }
+
+    return 0;
+}
+
+static void __noinline kick_filled_domains_cpus() {
+    int count;
+    count = bpf_for_each_map_elem(&gMap, &callback_gmap_kick_cpus_iter, &count, 0);
+    info("[kick_cpus][gmap] %d domains in gmap", count);
+}
+
 static void __noinline boost_cpus() {
     u32 cpu;
     u32 cpu_perf_lvl;
@@ -479,13 +504,26 @@ static __noinline void task_stats_task_roundtrip_since_last_wakeup(struct task_s
     }
 }
 
+static __noinline void task_stats_task_wokenup(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
+    struct task_context *tctx = try_lookup_task_ctx(p);
+    if (!tctx) {
+        return;
+    }
+
+    info("[task_stats][%s:%d] woken up tctx->vtime %llu ", p->comm, p->pid, tctx->vtime);
+}
+
 static __noinline void task_stats_task_enqueued_reset(struct task_struct *p) {
     struct task_context *tctx;
     tctx = try_lookup_task_ctx(p);
 
     if (p && tctx) {
         tctx->enqueue_count = 0;
-        info("[timeslice_shortening][%s:%d] tctx->enqueue_count %lld ", p->comm, p->pid,
+        info("[timeslice_shortening][%s:%d] tctx->enqueue_count %llu ", p->comm, p->pid,
              tctx->enqueue_count);
     }
 }
@@ -496,7 +534,7 @@ static __noinline void task_stats_task_enqueued(struct task_struct *p) {
 
     if (p && tctx) {
         tctx->enqueue_count = tctx->enqueue_count + 1;
-        info("[timeslice_shortening][%s:%d] tctx->enqueue_count %lld ", p->comm, p->pid,
+        info("[timeslice_shortening][%s:%d] tctx->enqueue_count %llu ", p->comm, p->pid,
              tctx->enqueue_count);
     }
 }
@@ -525,14 +563,65 @@ static __noinline void task_stats_stop_running(struct task_struct *p) {
 
         u64 cpu_time = current_time - start_time;
         if (cpu_time != 1) {
+            u64 sleep_freq_avg = tctx->sleep_freq_avg;
+            sleep_freq_avg = sleep_freq_avg == 0 ? 1 : sleep_freq_avg;
+
             // prioritize tasks that consume less cpu time
-            tctx->vtime += cpu_time;
+            // and sleep often
+            tctx->vtime += cpu_time / sleep_freq_avg;
+
+            // every nth enqueue reset to current time to
+            // preserve fairness
+            if ((tctx->enqueue_count % 5) == 0) {
+                tctx->vtime = bpf_ktime_get_tai_ns();
+            }
 
             tctx->cpu_time_avg = calc_avg(tctx->cpu_time_avg, cpu_time);
-            info("[task_stats][%s:%d] tctx->cpu_time_avg %lld ", p->comm, p->pid,
+            info("[task_stats][%s:%d] tctx->cpu_time_avg %llu ", p->comm, p->pid,
                  tctx->cpu_time_avg);
         }
     }
+}
+
+static __noinline void task_stats_sleeping(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
+    struct task_context *tctx = try_lookup_task_ctx(p);
+    if (!tctx) {
+        return;
+    }
+
+    // sleep counter
+    tctx->sleeps_count += 1;
+
+    // update avg freq each second
+    u64 current_time = bpf_ktime_get_tai_ns();
+    u64 last_sleep_freq_update_time = tctx->last_sleep_freq_update_time; // starts
+                                                                         // from
+                                                                         // zero
+    last_sleep_freq_update_time =
+        current_time > last_sleep_freq_update_time ? last_sleep_freq_update_time : current_time - 1;
+
+    u64 time_elapsed = current_time - last_sleep_freq_update_time;
+    u64 ns_in_one_sec = 1000 * NSEC_PER_MSEC;
+    if (time_elapsed < ns_in_one_sec) {
+        return;
+    }
+    time_elapsed = time_elapsed / ns_in_one_sec;
+
+    u64 sleep_freq = tctx->sleeps_count / time_elapsed;
+    sleep_freq = sleep_freq == 0 ? 1 : sleep_freq;
+
+    u64 sleep_freq_avg = tctx->sleep_freq_avg;
+    sleep_freq_avg = sleep_freq_avg == 0 ? sleep_freq : sleep_freq_avg;
+
+    tctx->sleep_freq_avg = calc_avg(sleep_freq_avg, sleep_freq);
+    tctx->last_sleep_freq_update_time = current_time;
+    tctx->sleeps_count = 0;
+
+    info("[task_stats][%s:%d] tctx->sleep_freq_avg %llu ", p->comm, p->pid, tctx->sleep_freq_avg);
 }
 
 static __noinline void task_stats_task_init(struct task_struct *p) {
@@ -545,8 +634,12 @@ static __noinline void task_stats_task_init(struct task_struct *p) {
         return;
     }
 
-    // starting point
-    tctx->vtime = last_max_vtime;
+    // vtime is current time which is updated on
+    // every nth enqueue
+    // for n-1 enqueues tasks that have less cpu time
+    // and sleep frequently are prioritized
+    // it preserves fairness and prioritizes short tasks
+    tctx->vtime = bpf_ktime_get_tai_ns();
 
     char *name = get_schedcgroup_name(p);
     if (!name) {
@@ -558,23 +651,12 @@ static __noinline void task_stats_task_init(struct task_struct *p) {
         return;
     }
 
-    // third or later tasks in a cgroup belong to worker threads
-    tctx->is_worker = cgroup_ctx->task_count > 2 ? true : false;
+    if (cgroup_ctx->is_function_cgroup) {
+        tctx->is_worker = true;
+    }
+
     info("[task_stats][%s:%d] tctx->is_worker %d  cgroup_ctx->task_count %d ", p->comm, p->pid,
          tctx->is_worker, cgroup_ctx->task_count);
-}
-
-static __noinline void task_stats_task_wokenup(struct task_struct *p) {
-    if (!p) {
-        return;
-    }
-
-    struct task_context *tctx = try_lookup_task_ctx(p);
-    if (!tctx) {
-        return;
-    }
-
-    info("[task_stats][%s:%d] woken up tctx->vtime %llu ", p->comm, p->pid, tctx->vtime);
 }
 
 static __noinline void task_stats_task_mask_updated(struct task_struct *p) {
@@ -589,6 +671,37 @@ static __noinline void task_stats_task_mask_updated(struct task_struct *p) {
 
     u32 number_of_set_cpus = bpf_cpumask_weight(p->cpus_ptr);
     tctx->use_specified_cpus = number_of_set_cpus <= MAX_CPUS / 2;
+}
+
+static __noinline bool is_gunicorn_task(struct task_struct *p) {
+    if (!p->comm) {
+        return false;
+    }
+
+#define MAX_COMM_LEN 0x7f
+    char name[MAX_COMM_LEN] = "gunicorn";
+    char name_len = 8;
+    char comm[MAX_COMM_LEN] = "";
+    char left, right;
+
+    bpf_probe_read_kernel_str(comm, MAX_COMM_LEN, p->comm);
+
+    s32 i;
+    bpf_for(i, 0, MAX_COMM_LEN) {
+
+        left = comm[i];
+        right = name[i];
+
+        if (!left || !right || (left != right)) {
+            return false;
+        }
+
+        if (i == name_len - 1) {
+            return true;
+        }
+    }
+
+    return true;
 }
 
 static __noinline void cgroup_stats_task_init(struct task_struct *p) {
@@ -606,7 +719,53 @@ static __noinline void cgroup_stats_task_init(struct task_struct *p) {
         return;
     }
 
+    if (is_gunicorn_task(p)) {
+        cgroup_ctx->is_function_cgroup = true;
+    }
+
     cgroup_ctx->task_count += 1;
+    info("[cgroup_stats][%s:%d] task_init cgroup_ctx->task_count %llu ", p->comm, p->pid,
+         cgroup_ctx->task_count);
+}
+
+static __noinline void cgroup_stats_task_exit(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
+    char *name = get_schedcgroup_name(p);
+    if (!name) {
+        return;
+    }
+
+    cgroup_ctx_t *cgroup_ctx = bpf_map_lookup_elem(&cgroup_ctx_stor, name);
+    if (!cgroup_ctx) {
+        return;
+    }
+
+    cgroup_ctx->task_count -= 1;
+    info("[cgroup_stats][%s:%d] task_exit cgroup_ctx->task_count %llu ", p->comm, p->pid,
+         cgroup_ctx->task_count);
+}
+
+static __noinline void global_stats_task_init(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
+    global_stats.task_count += 1;
+    info("[global_stats][%s:%d] task_init global_stats.task_count %llu ", p->comm, p->pid,
+         global_stats.task_count);
+}
+
+static __noinline void global_stats_task_exit(struct task_struct *p) {
+    if (!p) {
+        return;
+    }
+
+    global_stats.task_count -= 1;
+    info("[global_stats][%s:%d] task_exit global_stats.task_count %llu ", p->comm, p->pid,
+         global_stats.task_count);
 }
 
 static __noinline void dsq_stats_task_consumed(u64 dsqid) {
@@ -1149,6 +1308,20 @@ static __noinline s32 worksteal_from_neighbors_domain_queue(bool from_highpriori
     STEAL_FROM_NTH_NEIGHBOR(-3)
     STEAL_FROM_NTH_NEIGHBOR(4)
     STEAL_FROM_NTH_NEIGHBOR(-4)
+    STEAL_FROM_NTH_NEIGHBOR(5)
+    STEAL_FROM_NTH_NEIGHBOR(-5)
+    STEAL_FROM_NTH_NEIGHBOR(6)
+    STEAL_FROM_NTH_NEIGHBOR(-6)
+    STEAL_FROM_NTH_NEIGHBOR(7)
+    STEAL_FROM_NTH_NEIGHBOR(-7)
+    STEAL_FROM_NTH_NEIGHBOR(8)
+    STEAL_FROM_NTH_NEIGHBOR(-8)
+    STEAL_FROM_NTH_NEIGHBOR(9)
+    STEAL_FROM_NTH_NEIGHBOR(-9)
+    STEAL_FROM_NTH_NEIGHBOR(10)
+    STEAL_FROM_NTH_NEIGHBOR(-10)
+    STEAL_FROM_NTH_NEIGHBOR(11)
+    STEAL_FROM_NTH_NEIGHBOR(-11)
 
     return tasks_moved;
 }
@@ -1174,7 +1347,7 @@ static __noinline u64 shorten_timeslice_by_cputime_to_timeslice_ratio(u64 timesl
     u64 cpu_time = tctx->cpu_time_avg;
     u64 cputime_by_timeslice = (cpu_time * 100) / timeslice; // %[1,100]
 
-    info("[timeslice_shortening][%s:%d] cputime_by_timeslice %lld ", p->comm, p->pid,
+    info("[timeslice_shortening][%s:%d] cputime_by_timeslice %llu ", p->comm, p->pid,
          cputime_by_timeslice);
 
     // to penalize tasks that consume whole timeslice
@@ -1220,6 +1393,37 @@ static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
     return true;
 }
 
+static __noinline bool enqueue_to_last_domain_queue(struct task_struct *p,
+                                                    bool to_highpriority_queue) {
+    if (!p) {
+        return false;
+    }
+
+    struct task_context *tctx = try_lookup_task_ctx(p);
+    if (!tctx) {
+        return false;
+    }
+
+    u64 dsqid = cpu_to_domain_regular_dsqid(MAX_CPUS - 1);
+    u64 domain_id = dsqid - DSQ_REG_Q_PER_DOM_START;
+
+    SchedGroupChrs_t *sched_chrs = get_schedgroup_chrs(domain_id);
+    if (!sched_chrs) {
+        return false;
+    }
+
+    u64 timeslice = sched_chrs->timeslice * NSEC_PER_MSEC;
+    dsqid = to_highpriority_queue ? DSQ_PRIO_Q_PER_DOM_START : DSQ_REG_Q_PER_DOM_START;
+    dsqid = dsqid + domain_id;
+
+    info("[task_stats][%s:%d] insert to dsq(0x%x) tctx->vtime %llu ", p->comm, p->pid, dsqid,
+         tctx->vtime);
+    last_max_vtime = MAX(tctx->vtime, last_max_vtime);
+    scx_bpf_dsq_insert_vtime(p, dsqid, timeslice, tctx->vtime, 0);
+    kick_cpus(&sched_chrs->corebitmask);
+    return true;
+}
+
 static __noinline void enqueue_to_global_queue(struct task_struct *p) {
     if (!p) {
         return;
@@ -1232,8 +1436,6 @@ static __noinline void enqueue_to_global_queue(struct task_struct *p) {
 
     u64 timeslice = DEFAULT_TS;
     u64 dsqid = DSQ_GLOBAL_Q_ID;
-    // restrict tasks belonging to global queue to last domain only
-    dsqid = cpu_to_domain_regular_dsqid(MAX_CPUS - 1);
 
     info("[task_stats][%s:%d] insert to dsq(0x%x) tctx->vtime %llu ", p->comm, p->pid, dsqid,
          tctx->vtime);

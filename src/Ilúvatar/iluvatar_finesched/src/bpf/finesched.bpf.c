@@ -31,6 +31,11 @@ u32 enqueue_config = SCHED_CONFIG_PRIO_DSQ;
 u64 domains_count = 0;
 u64 last_max_vtime = 0;
 
+struct GlobalStats {
+    u64 task_count;
+};
+struct GlobalStats global_stats;
+
 SchedGroupChrs_t empty_sched_chrs = {0};
 
 private(FINESCHED) struct bpf_cpumask __kptr *cores_inact_grp_mask;
@@ -124,6 +129,10 @@ struct task_context {
     u64 last_wakeup_time;
     u64 wakeup_roundtrip_time_avg;
 
+    u64 sleeps_count;
+    u64 last_sleep_freq_update_time;
+    u64 sleep_freq_avg;
+
     u64 enqueue_count;
 
     bool is_worker;
@@ -191,8 +200,8 @@ static __noinline struct dsq_context *try_lookup_dsq_context(u64 dsqid) {
 typedef struct cgroup_ctx {
     bool init;
     u64 task_count;
-    // can save actual cgroup structure reference as well
-    // it's better to use cgroup storage for that purpose
+
+    bool is_function_cgroup;
 } cgroup_ctx_t;
 
 /* Map that contains task-local storage. */
@@ -278,11 +287,7 @@ struct {
 static s32 usersched_timer_fn(void *map, s32 *key, struct bpf_timer *timer) {
     s32 err = 0;
 
-    u64 tasks_count = tasks_enqueued_on_bpfscheduler();
-    if (tasks_count > 0) {
-        kick_all_cpus();
-    }
-    info("[heartbeat_timer] tasks_enqueued_on_bpfscheduler %lld ", tasks_count);
+    kick_filled_domains_cpus();
 
     /* Re-arm the timer */
     err = bpf_timer_start(timer, HEARTBEAT_INTERVAL, 0);
@@ -367,21 +372,22 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
         enqueue_to_per_cpu_custom_dsq(p);
     } else if (tctx && tctx->is_worker) {
         if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
-            enqueue_to_global_queue(p);
+            enqueue_to_last_domain_queue(p, /*to_highpriority_queue=*/false);
         }
     } else {
-        if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/false)) {
-            enqueue_to_global_queue(p);
-        }
+        enqueue_to_last_domain_queue(p, /*to_highpriority_queue=*/false);
     }
+    task_stats_task_enqueued(p);
 
     check_dsqlen_of_each_dsq_for_tracing();
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
-    s32 task_count = 1; // 2 or more makes it worse across aile
+    s32 task_count = 2; // 2 or more makes it worse across aile
     s32 tasks_leftover = task_count;
     s32 dsq_id;
+
+    scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
 
     dsq_id = cpu_to_domain_highpriority_dsqid(cpu);
     tasks_leftover = tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
@@ -419,6 +425,8 @@ void BPF_STRUCT_OPS(finesched_stopping, struct task_struct *p, bool runnable) {
 
 void BPF_STRUCT_OPS(finesched_quiescent, struct task_struct *p, u64 deq_flags) {
     info("[quiescent_task] sleeping task %d - %s", p->pid, p->comm);
+
+    task_stats_sleeping(p);
 }
 
 // Remember all newly created cgroups.
@@ -460,6 +468,7 @@ s32 BPF_STRUCT_OPS(finesched_init_task, struct task_struct *p, struct scx_init_t
 
     switch_to_scx_if_cgroup_exists(p);
 
+    global_stats_task_init(p);
     cgroup_stats_task_init(p);
     task_stats_task_init(p);
 
@@ -473,6 +482,9 @@ s32 BPF_STRUCT_OPS(finesched_init_task, struct task_struct *p, struct scx_init_t
 //    sched_ext do cleanup)
 void BPF_STRUCT_OPS(finesched_exit_task, struct task_struct *p, struct scx_exit_task_args *args) {
     info("[exit_task] exiting task %d - %s", p->pid, p->comm);
+
+    global_stats_task_exit(p);
+    cgroup_stats_task_exit(p);
 }
 
 // CPU is entering idle state if idle is true.
