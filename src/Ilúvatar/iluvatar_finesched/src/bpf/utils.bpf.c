@@ -572,7 +572,11 @@ static __noinline void task_stats_stop_running(struct task_struct *p) {
 
             // every nth enqueue reset to current time to
             // preserve fairness
-            if ((tctx->enqueue_count % 5) == 0) {
+            // long task ~1ms
+            // short task ~100us
+            // n = 10
+            // 100*10 = 1000
+            if ((tctx->enqueue_count % 10) == 0) {
                 tctx->vtime = bpf_ktime_get_tai_ns();
             }
 

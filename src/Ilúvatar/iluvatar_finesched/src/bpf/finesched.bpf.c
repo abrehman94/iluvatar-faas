@@ -370,12 +370,8 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 
     if (tctx && tctx->use_specified_cpus) {
         enqueue_to_per_cpu_custom_dsq(p);
-    } else if (tctx && tctx->is_worker) {
-        if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
-            enqueue_to_last_domain_queue(p, /*to_highpriority_queue=*/false);
-        }
-    } else {
-        enqueue_to_last_domain_queue(p, /*to_highpriority_queue=*/false);
+    } else if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
+        enqueue_to_global_queue(p);
     }
     task_stats_task_enqueued(p);
 
@@ -383,32 +379,21 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
-    s32 task_count = 2; // 2 or more makes it worse across aile
+    s32 task_count = 1; // 2 or more makes it worse across aile
     s32 tasks_leftover = task_count;
     s32 dsq_id;
 
     scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
 
-    dsq_id = cpu_to_domain_highpriority_dsqid(cpu);
-    tasks_leftover = tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
+    move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, 1);
 
-    dsq_id = cpu_to_domain_regular_dsqid(cpu);
+    dsq_id = cpu_to_domain_highpriority_dsqid(cpu);
     tasks_leftover = tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
 
     tasks_leftover = tasks_leftover - move_from_per_cpu_custom_to_local_dsq(cpu, tasks_leftover);
 
     tasks_leftover = tasks_leftover - worksteal_from_neighbors_domain_queue(
                                           /*from_highpriority_queue=*/true, cpu, tasks_leftover);
-
-    tasks_leftover = tasks_leftover - worksteal_from_neighbors_domain_queue(
-                                          /*from_highpriority_queue=*/false, cpu, tasks_leftover);
-
-    // avoid stalling tasks in regular queue if there are too many high
-    // priority tasks
-    dsq_id = cpu_to_domain_regular_dsqid(cpu);
-    move_from_custom_queue_to_local_dsq_if_over_period(dsq_id, task_count);
-
-    move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, 1);
 }
 
 void BPF_STRUCT_OPS(finesched_set_cpumask, struct task_struct *p, const struct cpumask *cpumask) {
