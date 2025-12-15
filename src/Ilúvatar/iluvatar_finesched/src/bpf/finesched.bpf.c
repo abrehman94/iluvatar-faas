@@ -139,7 +139,17 @@ struct task_context {
     bool use_specified_cpus;
 };
 
-/* Map that contains task-local storage. */
+// Per-CPU task context:
+//    Each cpu maintains it's own history about tasks. The helper
+//    returns current cpu's history of the tasks.
+
+// Global task context:
+//    Each cpu updates and get's tasks history from
+//    single task_storage map without synchronization.
+#define USE_GLOBAL_TASK_CONTEXT_STORAGE 1
+
+#if USE_GLOBAL_TASK_CONTEXT_STORAGE
+/* Map that contains task context globally for each cpu.*/
 struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
@@ -154,6 +164,41 @@ struct task_context *try_lookup_task_ctx(const struct task_struct *p) {
     return bpf_task_storage_get(&task_ctx_stor, (struct task_struct *)p, 0,
                                 BPF_LOCAL_STORAGE_GET_F_CREATE);
 }
+#else
+/* Map that contains per-cpu task context. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+    __uint(max_entries, MAX_MAP_ENTRIES_TASK_STORE);
+    __type(key, s32); // pid
+    __type(value, struct task_context);
+} task_ctx_stor SEC(".maps");
+
+/*
+ * Return a local task context from a generic task.
+ */
+struct task_context *try_lookup_task_ctx(const struct task_struct *p) {
+    s32 err;
+    s32 pid = p->pid;
+    pid = pid % MAX_MAP_ENTRIES_TASK_STORE; // makes stats for some tasks bad
+
+    struct task_context *context = bpf_map_lookup_elem(&task_ctx_stor, &pid);
+
+    if (!context) {
+        struct task_context default_context;
+        memset(&default_context, 0, sizeof(default_context));
+
+        err = bpf_map_update_elem(&task_ctx_stor, &pid, &default_context, BPF_NOEXIST);
+        if (err < 0) {
+            dbg("[task_stats][task_context_store] error(%d) failed to update elem in map", err);
+            return NULL;
+        }
+
+        context = bpf_map_lookup_elem(&task_ctx_stor, &pid);
+    }
+
+    return context;
+}
+#endif
 
 /*
  * Per-dsq map.
@@ -359,7 +404,6 @@ int perf_sample_handler(struct bpf_perf_event_data *ctx) {
 // to the domain assigned by CP
 s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags) {
     // all tasks are enqueued on bpf_scheduler first
-    task_stats_task_wokenup(p);
     return prev_cpu;
 }
 
@@ -379,13 +423,14 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
-    s32 task_count = 1; // 2 or more makes it worse across aile
-    s32 tasks_leftover = task_count;
-    s32 dsq_id;
 
     scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
 
     move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, 1);
+
+    s32 task_count = 2; // 2 or more makes it worse across aile
+    s32 tasks_leftover = task_count;
+    s32 dsq_id;
 
     dsq_id = cpu_to_domain_highpriority_dsqid(cpu);
     tasks_leftover = tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);

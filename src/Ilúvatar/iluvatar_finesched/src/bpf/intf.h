@@ -28,6 +28,7 @@ typedef unsigned long long u64;
 enum consts {
     MAX_GROUPS = 48,
     MAX_MAP_ENTRIES_CMAP = 1024,
+    MAX_MAP_ENTRIES_TASK_STORE = (16 * 4096),
     MAX_PATH = 100,
     MAX_CPUS = 48,
 
