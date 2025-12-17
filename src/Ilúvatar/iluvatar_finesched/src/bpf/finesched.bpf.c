@@ -26,7 +26,7 @@ char _license[] SEC("license") = "GPL";
 // Global Data for bpf scheduler
 
 bool cpu_boost_config = false;
-bool enable_timer_callback = true;
+bool enable_timer_callback = false;
 u32 enqueue_config = SCHED_CONFIG_PRIO_DSQ;
 u64 domains_count = 0;
 u64 last_max_vtime = 0;
@@ -404,6 +404,7 @@ int perf_sample_handler(struct bpf_perf_event_data *ctx) {
 // to the domain assigned by CP
 s32 BPF_STRUCT_OPS(finesched_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags) {
     // all tasks are enqueued on bpf_scheduler first
+    check_dsqlen_of_each_dsq_for_tracing();
     return prev_cpu;
 }
 
@@ -414,21 +415,19 @@ void BPF_STRUCT_OPS(finesched_enqueue, struct task_struct *p, u64 enq_flags) {
 
     if (tctx && tctx->use_specified_cpus) {
         enqueue_to_per_cpu_custom_dsq(p);
-    } else if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true)) {
-        enqueue_to_global_queue(p);
+    } else if (!enqueue_to_assigned_domain_queue(p, /*to_highpriority_queue=*/true,
+                                                 /*fifo=*/false)) {
+        enqueue_to_global_queue(p, /*fifo=*/false);
     }
-    task_stats_task_enqueued(p);
-
-    check_dsqlen_of_each_dsq_for_tracing();
 }
 
 void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
 
     scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
 
-    move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, 1);
+    move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, 2);
 
-    s32 task_count = 2; // 2 or more makes it worse across aile
+    s32 task_count = 1; // 2 or more makes it worse across aile
     s32 tasks_leftover = task_count;
     s32 dsq_id;
 
@@ -448,14 +447,10 @@ void BPF_STRUCT_OPS(finesched_set_cpumask, struct task_struct *p, const struct c
 }
 
 void BPF_STRUCT_OPS(finesched_running, struct task_struct *p) { task_stats_start_running(p); }
-
 void BPF_STRUCT_OPS(finesched_stopping, struct task_struct *p, bool runnable) {
     task_stats_stop_running(p);
 }
-
 void BPF_STRUCT_OPS(finesched_quiescent, struct task_struct *p, u64 deq_flags) {
-    info("[quiescent_task] sleeping task %d - %s", p->pid, p->comm);
-
     task_stats_sleeping(p);
 }
 
@@ -463,25 +458,26 @@ void BPF_STRUCT_OPS(finesched_quiescent, struct task_struct *p, u64 deq_flags) {
 SEC("fentry/cpu_cgroup_attach")
 int BPF_PROG(cpu_cgroup_attach, struct cgroup_taskset *tset) {
     char cgroup_name[MAX_PATH];
+    char prefix[MAX_PATH] = "docker-";
     int err;
 
     memset(cgroup_name, 0, MAX_PATH);
     err = bpf_probe_read_kernel_str(cgroup_name, MAX_PATH,
                                     tset->cur_cset->dom_cset->dfl_cgrp->kn->name);
     if (err <= 0) {
-        bpf_printk("cpu_cgroup_attach: error(%d) reading cgroup_name \n", err);
+        info("[cgroup_stats]  error(%d) reading cgroup_name", err);
         return 0;
     }
 
     cgroup_ctx_t *cgroup_ctx = lookup_or_build_cgroup_ctx(cgroup_name, MAX_PATH);
     if (cgroup_ctx == NULL) {
-        bpf_printk("cpu_cgroup_attach: error building cgroup_ctx \n");
+        info("[cgroup_stats]  error building cgroup_ctx", err);
         return 0;
     }
     cgroup_ctx->init = true;
     cgroup_ctx->task_count = 0;
 
-    bpf_printk("cpu_cgroup_attach: cgroup = %s\n", cgroup_name);
+    info("[cgroup_stats]  new cgroup attached %s ", cgroup_name);
     return 0;
 }
 

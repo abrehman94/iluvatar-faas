@@ -1365,7 +1365,7 @@ static __noinline u64 shorten_timeslice_by_dsqlen(u64 timeslice, u64 dsqid) {
 }
 
 static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
-                                                        bool to_highpriority_queue) {
+                                                        bool to_highpriority_queue, bool fifo) {
     if (!p) {
         return false;
     }
@@ -1380,19 +1380,25 @@ static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
         return false;
     }
 
-    struct task_context *tctx = try_lookup_task_ctx(p);
-    if (!tctx) {
-        return false;
-    }
-
     u64 timeslice = sched_chrs->timeslice * NSEC_PER_MSEC;
     u64 dsqid = to_highpriority_queue ? DSQ_PRIO_Q_PER_DOM_START : DSQ_REG_Q_PER_DOM_START;
     dsqid = dsqid + cgrp_chrs->gid;
 
-    info("[task_stats][%s:%d] insert to dsq(0x%x) tctx->vtime %llu ", p->comm, p->pid, dsqid,
-         tctx->vtime);
-    last_max_vtime = MAX(tctx->vtime, last_max_vtime);
-    scx_bpf_dsq_insert_vtime(p, dsqid, timeslice, tctx->vtime, 0);
+    if (fifo) {
+        scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
+    } else {
+        struct task_context *tctx = try_lookup_task_ctx(p);
+        if (!tctx) {
+            return false;
+        }
+
+        last_max_vtime = MAX(tctx->vtime, last_max_vtime);
+        scx_bpf_dsq_insert_vtime(p, dsqid, timeslice, tctx->vtime, 0);
+        info("[task_stats][%s:%d] inserted to dsq(0x%x) vtime: %llu ", p->comm, p->pid, dsqid,
+             tctx->vtime);
+    }
+
+    info("[task_stats][%s:%d] inserted to dsq(0x%x) ", p->comm, p->pid, dsqid);
     kick_cpus(&sched_chrs->corebitmask);
     return true;
 }
@@ -1428,33 +1434,43 @@ static __noinline bool enqueue_to_last_domain_queue(struct task_struct *p,
     return true;
 }
 
-static __noinline void enqueue_to_global_queue(struct task_struct *p) {
+static __noinline void enqueue_to_global_queue(struct task_struct *p, bool fifo) {
     if (!p) {
-        return;
-    }
-
-    struct task_context *tctx = try_lookup_task_ctx(p);
-    if (!tctx) {
         return;
     }
 
     u64 timeslice = DEFAULT_TS;
     u64 dsqid = DSQ_GLOBAL_Q_ID;
 
-    info("[task_stats][%s:%d] insert to dsq(0x%x) tctx->vtime %llu ", p->comm, p->pid, dsqid,
-         tctx->vtime);
-    last_max_vtime = MAX(tctx->vtime, last_max_vtime);
-    scx_bpf_dsq_insert_vtime(p, dsqid, timeslice, tctx->vtime, 0);
+    if (fifo) {
+        scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
+    } else {
+        struct task_context *tctx = try_lookup_task_ctx(p);
+        if (!tctx) {
+            return;
+        }
+
+        last_max_vtime = MAX(tctx->vtime, last_max_vtime);
+        scx_bpf_dsq_insert_vtime(p, dsqid, timeslice, tctx->vtime, 0);
+        info("[task_stats][%s:%d] inserted to dsq(0x%x) vtime: %llu ", p->comm, p->pid, dsqid,
+             tctx->vtime);
+    }
+
+    info("[task_stats][%s:%d] inserted to dsq(0x%x) ", p->comm, p->pid, dsqid);
     kick_all_cpus();
 }
 
 static __noinline void enqueue_to_per_cpu_custom_dsq(struct task_struct *p) {
     s32 cpu = bpf_get_smp_processor_id();
     u64 timeslice = DEFAULT_TS;
+    u64 dsqid;
 
     cpu = least_loaded_local_dsq_cpu(p->cpus_ptr);
-    scx_bpf_dsq_insert(p, DSQ_PRIO_PER_CPU_START + cpu, timeslice, 0);
+    dsqid = DSQ_PRIO_PER_CPU_START + cpu;
+    scx_bpf_dsq_insert(p, dsqid, timeslice, 0);
     kick_cpus(p->cpus_ptr);
+
+    info("[task_stats][%s:%d] inserted to dsq(0x%x) ", p->comm, p->pid, dsqid);
 }
 
 ////////////////////////////
@@ -1471,9 +1487,12 @@ static void __noinline switch_to_scx_if_cgroup_exists(struct task_struct *p) {
     }
 
     cgroup_ctx_t *cgroup_ctx = bpf_map_lookup_elem(&cgroup_ctx_stor, name);
-    if (cgroup_ctx) {
-        scx_bpf_switch_to_scx(p);
+    if (!cgroup_ctx) {
+        return;
     }
+
+    scx_bpf_switch_to_scx(p);
+    info("[task_stats][%s:%d] switched to scx ", p->comm, p->pid);
 }
 
 //////
