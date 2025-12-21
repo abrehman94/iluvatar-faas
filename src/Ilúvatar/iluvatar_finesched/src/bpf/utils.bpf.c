@@ -677,6 +677,27 @@ static __noinline void task_stats_task_mask_updated(struct task_struct *p) {
     tctx->use_specified_cpus = number_of_set_cpus <= MAX_CPUS / 2;
 }
 
+static __always_inline bool prefix_match(char *prefix, char *string, s32 len) {
+    if (!prefix || !string) {
+        return false;
+    }
+    len = len > MAX_PATH ? MAX_PATH : len;
+
+    char left, right;
+    s32 i;
+    bpf_for(i, 0, len) {
+
+        left = prefix[i];
+        right = string[i];
+
+        if (!left || !right || (left != right)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static __noinline bool is_gunicorn_task(struct task_struct *p) {
     if (!p->comm) {
         return false;
@@ -686,26 +707,10 @@ static __noinline bool is_gunicorn_task(struct task_struct *p) {
     char name[MAX_COMM_LEN] = "gunicorn";
     char name_len = 8;
     char comm[MAX_COMM_LEN] = "";
-    char left, right;
 
     bpf_probe_read_kernel_str(comm, MAX_COMM_LEN, p->comm);
 
-    s32 i;
-    bpf_for(i, 0, MAX_COMM_LEN) {
-
-        left = comm[i];
-        right = name[i];
-
-        if (!left || !right || (left != right)) {
-            return false;
-        }
-
-        if (i == name_len - 1) {
-            return true;
-        }
-    }
-
-    return true;
+    return prefix_match(name, comm, name_len);
 }
 
 static __noinline void cgroup_stats_task_init(struct task_struct *p) {

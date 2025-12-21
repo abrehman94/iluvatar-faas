@@ -425,8 +425,6 @@ void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
 
     scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
 
-    move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, 2);
-
     s32 task_count = 1; // 2 or more makes it worse across aile
     s32 tasks_leftover = task_count;
     s32 dsq_id;
@@ -438,6 +436,8 @@ void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
 
     tasks_leftover = tasks_leftover - worksteal_from_neighbors_domain_queue(
                                           /*from_highpriority_queue=*/true, cpu, tasks_leftover);
+
+    move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, 1);
 }
 
 void BPF_STRUCT_OPS(finesched_set_cpumask, struct task_struct *p, const struct cpumask *cpumask) {
@@ -456,16 +456,21 @@ void BPF_STRUCT_OPS(finesched_quiescent, struct task_struct *p, u64 deq_flags) {
 
 // Remember all newly created cgroups.
 SEC("fentry/cpu_cgroup_attach")
-int BPF_PROG(cpu_cgroup_attach, struct cgroup_taskset *tset) {
+s32 BPF_PROG(cpu_cgroup_attach, struct cgroup_taskset *tset) {
     char cgroup_name[MAX_PATH];
     char prefix[MAX_PATH] = "docker-";
-    int err;
+    s32 prefix_len = 7;
+    s32 err;
 
     memset(cgroup_name, 0, MAX_PATH);
     err = bpf_probe_read_kernel_str(cgroup_name, MAX_PATH,
                                     tset->cur_cset->dom_cset->dfl_cgrp->kn->name);
     if (err <= 0) {
         info("[cgroup_stats]  error(%d) reading cgroup_name", err);
+        return 0;
+    }
+
+    if (!prefix_match(prefix, cgroup_name, /*len=*/prefix_len)) {
         return 0;
     }
 
