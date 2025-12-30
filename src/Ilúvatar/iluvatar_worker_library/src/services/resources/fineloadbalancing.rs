@@ -585,6 +585,7 @@ impl ConsistentHashing {
 
     pub fn pick_domain(
         &self,
+        tid: &TransactionId,
         reg: Arc<RegisteredFunction>,
         domains_selection: &dyn SelectDomain,
     ) -> Option<SchedGroupID> {
@@ -592,7 +593,7 @@ impl ConsistentHashing {
         let requested_cores = reg.cpus;
 
         let preferred_domains = self.func_preferred_domains.get_or_create(func_name).immutable_clone();
-        debug!( lbpolicy=%"consistent_hashing", fqdn=%func_name, preferred_domains=%dump_domains(&preferred_domains), "[finesched] assign_domain_to_function_request");
+        debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, preferred_domains=%dump_domains(&preferred_domains), "[finesched] assign_domain_to_function_request");
 
         let mut domain;
 
@@ -601,6 +602,7 @@ impl ConsistentHashing {
         } else {
             domain = domains_selection.pick_domain_from_set(reg.clone(), &preferred_domains);
             if domain.is_some() {
+                debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, domain_assigned=%dump_domain(&domain.as_ref().unwrap()), "[finesched] assign_domain_to_function_request");
                 return Some(domain.unwrap().id());
             }
 
@@ -608,6 +610,7 @@ impl ConsistentHashing {
         }
 
         if domain.is_none() {
+            debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, domain_assigned=%"None", "[finesched] assign_domain_to_function_request");
             return None;
         }
 
@@ -619,7 +622,7 @@ impl ConsistentHashing {
                 .push_arc(domain.clone());
         }
 
-        debug!( lbpolicy=%"consistent_hashing", fqdn=%func_name, domain_assigned=%dump_domain(&domain), "[finesched] assign_domain_to_function_request");
+        debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, domain_assigned=%dump_domain(&domain), "[finesched] assign_domain_to_function_request");
         Some(domain.id())
     }
 
@@ -634,10 +637,10 @@ impl ConsistentHashing {
 impl LoadBalancingPolicyTrait for ConsistentHashing {
     fn assign_domain_to_function_request(
         &self,
-        _tid: &TransactionId,
+        tid: &TransactionId,
         reg: Arc<RegisteredFunction>,
     ) -> Option<SchedGroupID> {
-        self.pick_domain(reg.clone(), self)
+        self.pick_domain(tid, reg.clone(), self)
     }
 
     fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
@@ -691,10 +694,10 @@ impl SelectDomain for ConsistentHashingGuardrailsPick {
 impl LoadBalancingPolicyTrait for ConsistentHashingGuardrailsPick {
     fn assign_domain_to_function_request(
         &self,
-        _tid: &TransactionId,
+        tid: &TransactionId,
         reg: Arc<RegisteredFunction>,
     ) -> Option<SchedGroupID> {
-        self.consistent_hashing.pick_domain(reg.clone(), self)
+        self.consistent_hashing.pick_domain(tid, reg.clone(), self)
     }
 
     fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {

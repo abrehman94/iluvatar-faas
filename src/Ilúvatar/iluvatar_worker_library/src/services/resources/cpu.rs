@@ -202,6 +202,7 @@ impl CpuResourceTracker {
             if let Some(domain_id) = domain_id {
                 // Capture stats for the domain assignment.
                 let stats = fineloadbalancing.stats.clone();
+                debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, "[finesched] inserting to tid map");
                 stats.tid_map.insert(tid.clone(), domain_id);
 
                 let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
@@ -210,7 +211,9 @@ impl CpuResourceTracker {
                 debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, "[finesched] domain assigned to function request");
                 return Ok(());
             }
+            debug!( tid=%tid, fqdn=%fqdn, domain_id=%"None", "[finesched] domain not assigned to function request");
         } else {
+            debug!( tid=%tid, fqdn=%fqdn, domain_id=%"no_finesched", "[finesched] domain not assigned to function request");
             return Ok(());
         }
 

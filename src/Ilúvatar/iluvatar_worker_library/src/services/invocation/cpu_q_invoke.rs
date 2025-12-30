@@ -127,16 +127,17 @@ impl CpuQueueingInvoker {
     /// Check the invocation queue, running things when there are sufficient resources
     #[cfg_attr(feature = "full_spans", tracing::instrument(level="debug", skip(self, _tid), fields(tid=_tid)))]
     async fn monitor_queue(self: &Arc<Self>, _tid: &TransactionId) {
-        while let Some(peek_item) = self.queue.peek_queue() {
-            if let Some(permit) = self.acquire_resources_to_run(&peek_item) {
-                let item = self.queue.pop_queue();
-                if !item.lock() {
-                    continue;
+        while let Some(_peek_item) = self.queue.peek_queue() {
+            let item = self.queue.pop_queue();
+            loop {
+                if let Some(permit) = self.acquire_resources_to_run(&item) {
+                    if !item.lock() {
+                        // already acquired
+                        break;
+                    }
+                    self.spawn_tokio_worker(self.clone(), item, permit);
+                    break;
                 }
-                self.spawn_tokio_worker(self.clone(), item, permit);
-            } else {
-                debug!(tid = peek_item.tid, "Insufficient resources to run item");
-                break;
             }
         }
     }
