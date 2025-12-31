@@ -27,6 +27,7 @@ pub trait LoadBalancingPolicyTrait {
         _reg: Arc<RegisteredFunction>,
     ) -> Option<SchedGroupID>;
     fn invoke_is_complete(&self, _cgroup_id: &str, _tid: &TransactionId, _reg: Arc<RegisteredFunction>) {}
+    fn release_domain(&self, _tid: &TransactionId, _reg: Arc<RegisteredFunction>) {}
 }
 type LoadBalancingPolicy = Box<dyn LoadBalancingPolicyTrait + Sync + Send>;
 
@@ -305,6 +306,10 @@ impl LoadBalancingPolicyTrait for Guardrails {
     }
 
     fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.return_domain(tid, reg.clone());
+    }
+
+    fn release_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         self.return_domain(tid, reg.clone());
     }
 }
@@ -646,6 +651,10 @@ impl LoadBalancingPolicyTrait for ConsistentHashing {
     fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         self.return_domain(tid, reg.clone());
     }
+
+    fn release_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.return_domain(tid, reg.clone());
+    }
 }
 
 // Consistent hashing with Guardrails pick
@@ -701,6 +710,11 @@ impl LoadBalancingPolicyTrait for ConsistentHashingGuardrailsPick {
     }
 
     fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.consistent_hashing.return_domain(tid, reg.clone());
+        self.guardrails.return_domain(tid, reg.clone());
+    }
+
+    fn release_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         self.consistent_hashing.return_domain(tid, reg.clone());
         self.guardrails.return_domain(tid, reg.clone());
     }

@@ -117,16 +117,15 @@ impl CpuResourceTracker {
     ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::TryAcquireError> {
         debug!(cpu_sem =? self.concurrency_semaphore, "CPUResourceMananger");
         if let Some(sem) = &self.concurrency_semaphore {
-            return match sem.clone().try_acquire_many_owned(reg.cpus) {
-                Ok(p) => {
-                    if self.assign_domain_to_function_request(tid, reg.clone()).is_ok() {
-                        Ok(Some(p))
-                    } else {
-                        Ok(None)
-                    }
-                },
-                Err(e) => Err(e),
-            };
+            if self.assign_domain_to_function_request(tid, reg.clone()).is_ok() {
+                return match sem.clone().try_acquire_many_owned(reg.cpus) {
+                    Ok(p) => Ok(Some(p)),
+                    Err(e) => {
+                        self.insufficient_resources_for_request(tid, reg.clone());
+                        Err(e)
+                    },
+                };
+            }
         }
         Ok(None)
     }
@@ -139,16 +138,15 @@ impl CpuResourceTracker {
         tid: &TransactionId,
     ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::AcquireError> {
         if let Some(sem) = &self.concurrency_semaphore {
-            return match sem.clone().acquire_many_owned(reg.cpus).await {
-                Ok(p) => {
-                    if self.assign_domain_to_function_request(tid, reg.clone()).is_ok() {
-                        Ok(Some(p))
-                    } else {
-                        Ok(None)
-                    }
-                },
-                Err(e) => Err(e),
-            };
+            if self.assign_domain_to_function_request(tid, reg.clone()).is_ok() {
+                return match sem.clone().acquire_many_owned(reg.cpus).await {
+                    Ok(p) => Ok(Some(p)),
+                    Err(e) => {
+                        self.insufficient_resources_for_request(tid, reg.clone());
+                        Err(e)
+                    },
+                };
+            }
         }
         Ok(None)
     }
@@ -265,6 +263,29 @@ impl CpuResourceTracker {
             scheduled_invocations.fetch_sub(1, Ordering::Relaxed);
 
             debug!( tid=%tid, fqdn=%fqdn, cgroup_id=%cgroup_id, domain_id=%domain_id, "[finesched] domain released for function cgroup");
+        }
+    }
+
+    pub fn insufficient_resources_for_request(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        let fqdn = reg.fqdn.as_str();
+        if let Some(fineloadbalancing) = &self.fineloadbalancing {
+            let lbpolicy = &fineloadbalancing.lbpolicy;
+            let stats = fineloadbalancing.stats.clone();
+            let domain_id = match stats.tid_map.get(tid) {
+                Some(entry) => *entry,
+                None => {
+                    error!(tid=%tid, "[finesched] no domain found for tid in tid_stats map");
+                    return;
+                },
+            };
+
+            lbpolicy.release_domain(tid, reg.clone());
+            stats.tid_map.remove(tid);
+
+            let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
+            scheduled_invocations.fetch_sub(1, Ordering::Relaxed);
+
+            debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, "[finesched] domain released for function request");
         }
     }
 }
