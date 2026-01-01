@@ -195,11 +195,16 @@ impl CpuResourceTracker {
     pub fn assign_domain_to_function_request(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Result<()> {
         let fqdn = reg.fqdn.as_str();
         if let Some(fineloadbalancing) = self.fineloadbalancing.as_ref() {
+            let stats = fineloadbalancing.stats.clone();
+            match stats.tid_map.get(tid) {
+                Some(_entry) => return Ok(()),
+                _ => {},
+            };
+
             let lbpolicy = &fineloadbalancing.lbpolicy;
             let domain_id = lbpolicy.assign_domain_to_function_request(tid, reg.clone());
             if let Some(domain_id) = domain_id {
                 // Capture stats for the domain assignment.
-                let stats = fineloadbalancing.stats.clone();
                 debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, "[finesched] inserting to tid map");
                 stats.tid_map.insert(tid.clone(), domain_id);
 
@@ -285,7 +290,7 @@ impl CpuResourceTracker {
             let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
             scheduled_invocations.fetch_sub(1, Ordering::Relaxed);
 
-            debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, "[finesched] domain released for function request");
+            debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, pending_invocations=%scheduled_invocations.load(Ordering::Relaxed), "[finesched] domain released for function request");
         }
     }
 }

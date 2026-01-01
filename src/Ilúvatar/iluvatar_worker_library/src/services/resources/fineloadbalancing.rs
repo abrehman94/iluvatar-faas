@@ -389,6 +389,7 @@ impl DomainMutableData {
     pub fn acquire_cores(&mut self, requested_cores: u32, assigned_cores: u32) -> bool {
         self.used_cores += requested_cores;
         if self.used_cores <= assigned_cores {
+            debug!( tag=%"cpu_release_issue", lbpolicy=%"consistent_hashing", used_cores=%self.used_cores, "[finesched] domain acquired");
             return true;
         }
 
@@ -431,8 +432,8 @@ impl DomainStruct {
         let mut d = self.mut_data.lock().unwrap();
 
         if d.assigned_to_funcs.len() == 0 {
-            d.assigned_to_funcs.push(func_name.clone());
             if d.acquire_cores(cpus, self.assigned_cores) {
+                d.assigned_to_funcs.push(func_name.clone());
                 return Ok(());
             }
         }
@@ -465,6 +466,7 @@ impl DomainStruct {
         let mut d = self.mut_data.lock().unwrap();
 
         d.used_cores -= cpus;
+        debug!( tag=%"cpu_release_issue", lbpolicy=%"consistent_hashing", domain_id=%self.id, used_cores=%d.used_cores, "[finesched] domain released");
         if d.used_cores == 0 {
             d.assigned_to_funcs.clear();
             debug!( lbpolicy=%"consistent_hashing", domain_id=%self.id, "[finesched] domain released");

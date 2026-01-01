@@ -138,6 +138,8 @@ impl CpuQueueingInvoker {
                     self.spawn_tokio_worker(self.clone(), item, permit);
                     break;
                 }
+                let fut = Self::cpu_wait_on_queue(&self, &INVOKER_CPU_QUEUE_WORKER_TID);
+                let _ = tokio::time::timeout(Duration::from_millis(self.invocation_config.queue_sleep_ms), fut).await;
             }
         }
     }
