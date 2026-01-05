@@ -40,6 +40,7 @@ pub struct CpuQueueingInvoker {
     invocation_config: Arc<InvocationConfig>,
     cmap: WorkerCharMap,
     clock: Clock,
+    cold_starting: AtomicU32,
     running: AtomicU32,
     last_memory_warning: Mutex<Instant>,
     cpu: Arc<CpuResourceTracker>,
@@ -87,6 +88,7 @@ impl CpuQueueingInvoker {
             _cpu_thread: cpu_handle,
             clock: get_global_clock(tid)?,
             running: AtomicU32::new(0),
+            cold_starting: AtomicU32::new(0),
             last_memory_warning: Mutex::new(now()),
             device_tput: DeviceTput::boxed(),
         });
@@ -130,7 +132,7 @@ impl CpuQueueingInvoker {
         while let Some(_peek_item) = self.queue.peek_queue() {
             let item = self.queue.pop_queue();
             loop {
-                if let Some(permit) = self.acquire_resources_to_run(&item) {
+                if let Some(permit) = self.acquire_resources_to_run(&item).await {
                     if !item.lock() {
                         // already acquired
                         break;
@@ -138,8 +140,6 @@ impl CpuQueueingInvoker {
                     self.spawn_tokio_worker(self.clone(), item, permit);
                     break;
                 }
-                let fut = Self::cpu_wait_on_queue(&self, &INVOKER_CPU_QUEUE_WORKER_TID);
-                let _ = tokio::time::timeout(Duration::from_millis(self.invocation_config.queue_sleep_ms), fut).await;
             }
         }
     }
@@ -197,7 +197,7 @@ impl CpuQueueingInvoker {
 
     /// Returns an owned permit if there are sufficient resources to run a function
     /// A return value of [None] means the resources failed to be acquired
-    fn acquire_resources_to_run(&self, item: &Arc<EnqueuedInvocation>) -> Option<Box<dyn Drop + Send>> {
+    async fn acquire_resources_to_run(&self, item: &Arc<EnqueuedInvocation>) -> Option<Box<dyn Drop + Send>> {
         debug!(tid = item.tid, "checking resources");
         #[cfg(feature = "power_cap")]
         if !self.energy.ok_run_fn(&self.cmap, &item.registration.fqdn) {
@@ -205,7 +205,7 @@ impl CpuQueueingInvoker {
             return None;
         }
         let mut ret = vec![];
-        match self.cpu.try_acquire_cores(&item.registration, &item.tid) {
+        match self.cpu.acquire_cores(&item.registration, &item.tid).await {
             Ok(c) => {
                 if c.is_some() {
                     ret.push(c);
@@ -213,16 +213,11 @@ impl CpuQueueingInvoker {
                     return None;
                 }
             },
-            Err(e) => {
-                match e {
-                    tokio::sync::TryAcquireError::Closed => {
-                        error!(
-                            tid = item.tid,
-                            "CPU Resource Monitor `try_acquire_cores` returned a closed error!"
-                        )
-                    },
-                    tokio::sync::TryAcquireError::NoPermits => (),
-                };
+            Err(_) => {
+                error!(
+                    tid = item.tid,
+                    "CPU Resource Monitor `acquire_cores` returned an error!"
+                );
                 return None;
             },
         };
@@ -360,9 +355,13 @@ impl CpuQueueingInvoker {
             .cont_manager
             .acquire_container(&item.registration, &item.tid, Compute::CPU)
         {
-            EventualItem::Future(f) => f.await?,
+            EventualItem::Future(f) => {
+                self.cold_starting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                f.await?
+            },
             EventualItem::Now(n) => n?,
         };
+        self.cold_starting.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.running.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.cpu
             .cgroup_assigned_to_function(ctr_lock.container.cgroup_id(), &item.tid, item.registration.clone());
@@ -385,6 +384,9 @@ impl CpuQueueingInvoker {
         self.running.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.cpu
             .cgroup_released_for_function(ctr_lock.container.cgroup_id(), &item.tid, item.registration.clone());
+        // drop container and return to pool before releasing resource permit
+        // otherwise it leads to unnecassary cold_starts
+        drop(ctr_lock);
         drop(permit);
         self.signal.notify_waiters();
         result
@@ -442,6 +444,10 @@ impl DeviceQueue for CpuQueueingInvoker {
 
     fn running(&self) -> u32 {
         self.running.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn cold_starting(&self) -> u32 {
+        self.cold_starting.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn warm_hit_probability(&self, reg: &Arc<RegisteredFunction>, _iat: f64) -> f64 {

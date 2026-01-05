@@ -228,7 +228,7 @@ impl QueueingDispatcher {
 
     async fn log_queue_info(self: &Arc<Self>, tid: &TransactionId) -> Result<InvokerLoad> {
         let queue_lengths = self.queue_len();
-        info!(tid=tid, num_running_funcs=self.running_funcs(), queue_info=%queue_lengths, "current queue info");
+        info!(tid=tid, num_running_funcs=self.running_funcs(), num_cold_starting_funcs=self.cold_starting_funcs(), queue_info=%queue_lengths, "current queue info");
         Ok(queue_lengths)
     }
 
@@ -1034,6 +1034,11 @@ impl Invoker for QueueingDispatcher {
     /// The number of functions currently running
     fn running_funcs(&self) -> u32 {
         self.que_map.iter().map(|q| q.1.running()).sum()
+    }
+
+    /// The number of functions currently cold_starting
+    fn cold_starting_funcs(&self) -> u32 {
+        self.que_map.iter().map(|q| q.1.cold_starting()).sum()
     }
 
     /// Returns the estimated E2E in seconds time for the fqdn.

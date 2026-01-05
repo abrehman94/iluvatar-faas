@@ -1441,6 +1441,10 @@ impl DeviceQueue for MQFQ {
         self.ctrack.get_inflight() as u32
     }
 
+    fn cold_starting(&self) -> u32 {
+        0 as u32
+    }
+
     fn warm_hit_probability(&self, reg: &Arc<RegisteredFunction>, iat: f64) -> f64 {
         // if flowq doesn't exist or inactive, 0
         // else (active or throttled), but no guarantees

@@ -131,6 +131,7 @@ pub struct GpuQueueingInvoker {
     invocation_config: Arc<InvocationConfig>,
     cmap: WorkerCharMap,
     clock: Clock,
+    cold_starting: AtomicU32,
     running: AtomicU32,
     last_memory_warning: Mutex<Instant>,
     last_gpu_warning: Mutex<Instant>,
@@ -177,6 +178,7 @@ impl GpuQueueingInvoker {
             _gpu_thread: gpu_handle,
             clock: get_global_clock(tid)?,
             running: AtomicU32::new(0),
+            cold_starting: AtomicU32::new(0),
             last_memory_warning: Mutex::new(now()),
             queue: q?,
             last_gpu_warning: Mutex::new(now()),
@@ -314,9 +316,13 @@ impl GpuQueueingInvoker {
                         .cont_manager
                         .acquire_container(&item.registration, &item.tid, Compute::GPU)
                     {
-                        EventualItem::Future(f) => (f.await, true),
+                        EventualItem::Future(f) => {
+                            self.cold_starting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            (f.await, true)
+                        },
                         EventualItem::Now(n) => (n, false),
                     };
+                self.cold_starting.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 match lck {
                     Ok(c) => ctr_lock = Some(c),
                     Err(e) => {
@@ -497,6 +503,10 @@ impl DeviceQueue for GpuQueueingInvoker {
 
     fn running(&self) -> u32 {
         self.running.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn cold_starting(&self) -> u32 {
+        self.cold_starting.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn warm_hit_probability(&self, _reg: &Arc<RegisteredFunction>, _iat: f64) -> f64 {

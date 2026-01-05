@@ -91,6 +91,9 @@ pub trait DeviceQueue: Send + Sync {
     /// Number of invocations currently running.
     fn running(&self) -> u32;
 
+    /// Number of invocations currently cold_starting.
+    fn cold_starting(&self) -> u32;
+
     /// Warm hit probability for the function. Needs most recent IAT.
     fn warm_hit_probability(&self, reg: &Arc<RegisteredFunction>, iat: f64) -> f64;
 

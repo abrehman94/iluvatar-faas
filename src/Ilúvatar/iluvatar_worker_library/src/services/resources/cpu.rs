@@ -137,6 +137,7 @@ impl CpuResourceTracker {
         reg: &Arc<RegisteredFunction>,
         tid: &TransactionId,
     ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::AcquireError> {
+        debug!(cpu_sem =? self.concurrency_semaphore, "CPUResourceMananger");
         if let Some(sem) = &self.concurrency_semaphore {
             if self.assign_domain_to_function_request(tid, reg.clone()).is_ok() {
                 return match sem.clone().acquire_many_owned(reg.cpus).await {
@@ -195,6 +196,7 @@ impl CpuResourceTracker {
     pub fn assign_domain_to_function_request(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Result<()> {
         let fqdn = reg.fqdn.as_str();
         if let Some(fineloadbalancing) = self.fineloadbalancing.as_ref() {
+            let _lock = fineloadbalancing.domain_operation_lock.lock().unwrap();
             let stats = fineloadbalancing.stats.clone();
             match stats.tid_map.get(tid) {
                 Some(_entry) => return Ok(()),
@@ -226,6 +228,7 @@ impl CpuResourceTracker {
     pub fn cgroup_assigned_to_function(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         let fqdn = reg.fqdn.as_str();
         if let Some(fineloadbalancing) = self.fineloadbalancing.as_ref() {
+            let _lock = fineloadbalancing.domain_operation_lock.lock().unwrap();
             let stats = fineloadbalancing.stats.clone();
             let domain_id = match stats.tid_map.get(tid) {
                 Some(entry) => *entry,
@@ -251,6 +254,7 @@ impl CpuResourceTracker {
     pub fn cgroup_released_for_function(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         let fqdn = reg.fqdn.as_str();
         if let Some(fineloadbalancing) = &self.fineloadbalancing {
+            let _lock = fineloadbalancing.domain_operation_lock.lock().unwrap();
             let lbpolicy = &fineloadbalancing.lbpolicy;
             let stats = fineloadbalancing.stats.clone();
             let domain_id = match stats.tid_map.get(tid) {
@@ -274,6 +278,7 @@ impl CpuResourceTracker {
     pub fn insufficient_resources_for_request(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         let fqdn = reg.fqdn.as_str();
         if let Some(fineloadbalancing) = &self.fineloadbalancing {
+            let _lock = fineloadbalancing.domain_operation_lock.lock().unwrap();
             let lbpolicy = &fineloadbalancing.lbpolicy;
             let stats = fineloadbalancing.stats.clone();
             let domain_id = match stats.tid_map.get(tid) {

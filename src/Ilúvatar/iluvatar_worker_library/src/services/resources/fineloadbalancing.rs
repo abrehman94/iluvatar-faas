@@ -50,6 +50,8 @@ pub struct FineLoadBalancingStruct {
     pub preallocated_domains: Arc<PreAllocatedGroups>,
     pub stats: FineLoadBalancingStats,
     pub lbpolicy: LoadBalancingPolicy,
+
+    pub domain_operation_lock: Mutex<bool>,
 }
 pub type FineLoadBalancing = Arc<FineLoadBalancingStruct>;
 pub type FineLoadBalancingWeak = Weak<FineLoadBalancingStruct>;
@@ -97,6 +99,8 @@ impl BuildFineLoadBalancing for FineLoadBalancing {
                 preallocated_domains,
                 stats: Default::default(),
                 lbpolicy,
+
+                domain_operation_lock: Mutex::new(false),
             }
         })
     }
