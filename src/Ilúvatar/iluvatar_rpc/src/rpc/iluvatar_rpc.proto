@@ -42,6 +42,8 @@ message InvokeResponse {
   uint32 compute = 4;
   // The state of the container the invocation was run on
   ContainerState container_state = 5;
+  // The container cpu utilization on the worker for this invocation.
+  uint64 cpu_utilization = 6;
 }
 // Possible states of a container
 enum ContainerState {

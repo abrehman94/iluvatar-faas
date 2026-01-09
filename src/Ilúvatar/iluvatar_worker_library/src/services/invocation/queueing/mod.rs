@@ -6,6 +6,7 @@ use anyhow::Result;
 use iluvatar_library::char_map::{Chars, WorkerCharMap};
 use iluvatar_library::transaction::TransactionId;
 use iluvatar_library::types::Compute;
+use iluvatar_library::types::Utilization;
 use ordered_float::OrderedFloat;
 use parking_lot::Mutex;
 use std::time::Duration;
@@ -189,7 +190,14 @@ impl EnqueuedInvocation {
         *self.started.lock() = false;
     }
 
-    pub fn mark_successful(&self, result: ParsedResult, duration: Duration, compute: Compute, state: ContainerState) {
+    pub fn mark_successful(
+        &self,
+        result: ParsedResult,
+        duration: Duration,
+        compute: Compute,
+        state: ContainerState,
+        cpu_utilization: Utilization,
+    ) {
         let mut result_ptr = self.result_ptr.lock();
         result_ptr.duration = duration;
         result_ptr.exec_time = result.duration_sec;
@@ -200,6 +208,7 @@ impl EnqueuedInvocation {
         result_ptr.worker_result = Some(result);
         result_ptr.compute = compute;
         result_ptr.container_state = state;
+        result_ptr.cpu_utilization = cpu_utilization;
         self.signal();
         debug!(tid = self.tid, "queued invocation completed successfully");
     }

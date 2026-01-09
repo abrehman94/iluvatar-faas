@@ -16,7 +16,7 @@ use iluvatar_library::char_map::{Chars, WorkerCharMap};
 use iluvatar_library::clock::Clock;
 use iluvatar_library::ring_buff::{RingBuffer, Wireable};
 use iluvatar_library::tput_calc::DeviceTput;
-use iluvatar_library::{transaction::TransactionId, types::Compute};
+use iluvatar_library::{transaction::TransactionId, types::Compute, types::Utilization};
 use parking_lot::Mutex;
 use std::fmt::Display;
 use std::{sync::Arc, time::Duration};
@@ -163,6 +163,8 @@ pub struct InvocationResult {
     pub compute: Compute,
     /// The state of the container when the invocation was run
     pub container_state: ContainerState,
+    /// The cpu utilization of the invocation.
+    pub cpu_utilization: Utilization,
 }
 impl InvocationResult {
     pub fn boxed() -> InvocationResultPtr {
@@ -175,6 +177,7 @@ impl InvocationResult {
             worker_result: None,
             compute: Compute::empty(),
             container_state: ContainerState::Error,
+            cpu_utilization: 0,
         }))
     }
 }
@@ -200,7 +203,7 @@ async fn invoke_on_container(
     cmap: &WorkerCharMap,
     clock: &Clock,
     device_tput: &Arc<DeviceTput>,
-) -> Result<(ParsedResult, Duration, Compute, ContainerState)> {
+) -> Result<(ParsedResult, Duration, Compute, ContainerState, Utilization)> {
     let (data, dur, ctr) = invoke_on_container_2(
         reg,
         json_args,
@@ -216,7 +219,7 @@ async fn invoke_on_container(
         device_tput,
     )
     .await?;
-    Ok((data, dur, ctr.compute_type(), ctr.state()))
+    Ok((data, dur, ctr.compute_type(), ctr.state(), ctr.cpu_utilization()))
 }
 
 /// Returns

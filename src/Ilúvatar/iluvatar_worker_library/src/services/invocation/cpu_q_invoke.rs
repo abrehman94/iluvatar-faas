@@ -19,6 +19,7 @@ use iluvatar_library::threading::tokio_spawn_thread;
 use iluvatar_library::tput_calc::DeviceTput;
 use iluvatar_library::{
     threading::tokio_waiter_thread, threading::EventualItem, transaction::TransactionId, types::Compute,
+    types::Utilization,
 };
 use parking_lot::Mutex;
 use std::{
@@ -253,7 +254,9 @@ impl CpuQueueingInvoker {
     #[cfg_attr(feature = "full_spans", tracing::instrument(level="debug", skip(self, item, permit), fields(tid=item.tid)))]
     async fn invocation_worker_thread(&self, item: Arc<EnqueuedInvocation>, permit: Box<dyn Drop + Send>) {
         match self.invoke(&item, Some(permit)).await {
-            Ok((result, duration, compute, state)) => item.mark_successful(result, duration, compute, state),
+            Ok((result, duration, compute, state, cpu_utilization)) => {
+                item.mark_successful(result, duration, compute, state, cpu_utilization)
+            },
             Err(cause) => self.handle_invocation_error(item, cause),
         };
     }
@@ -326,7 +329,9 @@ impl CpuQueueingInvoker {
         )
         .await
         {
-            Ok((result, duration, compute, state)) => item.mark_successful(result, duration, compute, state),
+            Ok((result, duration, compute, state, cpu_utilization)) => {
+                item.mark_successful(result, duration, compute, state, cpu_utilization)
+            },
             Err(e) => self.handle_invocation_error(item.clone(), e),
         };
         Ok(true)
@@ -345,7 +350,7 @@ impl CpuQueueingInvoker {
         &'a self,
         item: &'a Arc<EnqueuedInvocation>,
         permit: Option<Box<dyn Drop + Send>>,
-    ) -> Result<(ParsedResult, Duration, Compute, ContainerState)> {
+    ) -> Result<(ParsedResult, Duration, Compute, ContainerState, Utilization)> {
         debug!(tid = item.tid, "Internal invocation starting");
         // take run time now because we may have to wait to get a container
         let remove_time = self.clock.now_str()?;

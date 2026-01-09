@@ -14,6 +14,7 @@ impl InvokeResponse {
             duration_us: 0,
             compute: Compute::empty().bits(),
             container_state: ContainerState::Error.into(),
+            cpu_utilization: 0,
         }
     }
 }

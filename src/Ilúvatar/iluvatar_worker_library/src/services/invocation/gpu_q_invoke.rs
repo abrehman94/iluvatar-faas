@@ -26,7 +26,7 @@ use iluvatar_library::char_map::{Chars, WorkerCharMap};
 use iluvatar_library::clock::{get_global_clock, now, Clock};
 use iluvatar_library::threading::tokio_spawn_thread;
 use iluvatar_library::tput_calc::DeviceTput;
-use iluvatar_library::types::{Compute, DroppableToken};
+use iluvatar_library::types::{Compute, DroppableToken, Utilization};
 use iluvatar_library::{threading::tokio_waiter_thread, threading::EventualItem, transaction::TransactionId};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -346,8 +346,8 @@ impl GpuQueueingInvoker {
             #[cfg(not(feature = "full_spans"))]
             let fut = self.invoke(ctr_lock.as_ref().unwrap(), &item, start);
             match fut.await {
-                Ok((result, duration, compute, container_state)) => {
-                    item.mark_successful(result, duration, compute, container_state)
+                Ok((result, duration, compute, container_state, cpu_utilization)) => {
+                    item.mark_successful(result, duration, compute, container_state, cpu_utilization)
                 },
                 Err(cause) => {
                     error!(tid=item.tid, error=%cause, "Encountered unknown error while trying to run queued invocation");
@@ -436,7 +436,7 @@ impl GpuQueueingInvoker {
         ctr_lock: &'a ContainerLock,
         item: &'a Arc<EnqueuedInvocation>,
         cold_time_start: Instant,
-    ) -> Result<(ParsedResult, Duration, Compute, ContainerState)> {
+    ) -> Result<(ParsedResult, Duration, Compute, ContainerState, Utilization)> {
         debug!(tid = item.tid, "Internal invocation starting");
         // take run time now because we may have to wait to get a container
         let remove_time = self.clock.now_str()?;

@@ -130,6 +130,7 @@ impl IluvatarWorker for IluvatarWorkerImpl {
                     duration_us: result.duration.as_micros() as u64,
                     compute: result.compute.bits(),
                     container_state: result.container_state.into(),
+                    cpu_utilization: result.cpu_utilization,
                 };
                 Ok(Response::new(reply))
             },

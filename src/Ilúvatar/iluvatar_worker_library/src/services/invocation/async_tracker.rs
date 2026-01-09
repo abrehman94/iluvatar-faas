@@ -65,6 +65,7 @@ impl AsyncHelper {
                 duration_us: entry.duration.as_micros() as u64,
                 compute: entry.compute.bits(),
                 container_state: entry.container_state.into(),
+                cpu_utilization: entry.cpu_utilization,
             });
         }
         Ok(InvokeResponse {
@@ -73,6 +74,7 @@ impl AsyncHelper {
             duration_us: 0,
             compute: iluvatar_library::types::Compute::empty().bits(),
             container_state: ContainerState::Error.into(),
+            cpu_utilization: 0,
         })
     }
 }

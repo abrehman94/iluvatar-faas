@@ -614,7 +614,7 @@ impl MQFQ {
             let container = match fut.await {
                 Ok((result, duration, container)) => {
                     item.invoke
-                        .mark_successful(result, duration, container.compute_type(), container.state());
+                        .mark_successful(result, duration, container.compute_type(), container.state(), 0);
                     Some(container)
                 },
                 Err(cause) => {

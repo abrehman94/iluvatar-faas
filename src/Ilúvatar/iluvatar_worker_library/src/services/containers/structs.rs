@@ -5,7 +5,7 @@ use iluvatar_library::types::ToAny;
 use iluvatar_library::{
     bail_error,
     transaction::TransactionId,
-    types::{Compute, DroppableToken, Isolation, MemSizeMb},
+    types::{Compute, DroppableToken, Isolation, MemSizeMb, Utilization},
 };
 pub use iluvatar_rpc::rpc::ContainerState;
 use std::{sync::Arc, time::Duration};
@@ -45,6 +45,10 @@ pub trait ContainerT: ToAny + Send + Sync {
     fn set_state(&self, state: ContainerState);
     fn container_type(&self) -> Isolation;
     fn compute_type(&self) -> Compute;
+    /// CPU utilization of last invocation.
+    fn cpu_utilization(&self) -> Utilization {
+        0
+    }
     /// Returned with [Some(&GPU)] if the container has extra resources
     fn device_resource(&self) -> ProtectedGpuRef<'_>;
     /// Update amount of device memory the container uses.

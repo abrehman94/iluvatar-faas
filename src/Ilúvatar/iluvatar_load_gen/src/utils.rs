@@ -162,6 +162,7 @@ impl CompletedControllerInvocation {
                 duration_us: 0,
                 compute: Compute::empty().bits(),
                 container_state: ContainerState::Error.into(),
+                cpu_utilization: 0,
             },
             function_output: FunctionExecOutput {
                 body: Body {
@@ -374,7 +375,7 @@ pub async fn worker_prewarm(
         .await;
     match res {
         Ok(s) => Ok((s, dur)),
-        Err(e) => anyhow::bail!("worker prewarm failed because {:?}", e),
+        Err(_e) => Ok(("".to_string(), dur)),
     }
 }
 
@@ -528,7 +529,8 @@ pub fn save_worker_result_csv<P: AsRef<Path> + std::fmt::Debug>(
         },
     };
     let to_write =
-        "success,function_name,was_cold,worker_duration_us,code_duration_sec,e2e_duration_us,tid\n".to_string();
+        "success,function_name,was_cold,worker_duration_us,code_duration_sec,e2e_duration_us,cpu_utilization,tid\n"
+            .to_string();
     match f.write_all(to_write.as_bytes()) {
         Ok(_) => (),
         Err(e) => {
@@ -538,13 +540,14 @@ pub fn save_worker_result_csv<P: AsRef<Path> + std::fmt::Debug>(
 
     for worker_invocation in run_results {
         let to_write = format!(
-            "{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{}\n",
             worker_invocation.worker_response.success,
             worker_invocation.function_name,
             worker_invocation.function_output.body.cold,
             worker_invocation.worker_response.duration_us,
             worker_invocation.function_output.body.latency,
             worker_invocation.client_latency_us,
+            worker_invocation.worker_response.cpu_utilization,
             worker_invocation.tid
         );
         match f.write_all(to_write.as_bytes()) {

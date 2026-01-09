@@ -1,5 +1,4 @@
 use crate::bpf_intf::cpumask;
-use std::vec::Vec;
 
 pub fn set_cpumask(mask: &mut cpumask, core: &u32) {
     let mut bi: u32 = 0;

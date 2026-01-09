@@ -11,13 +11,17 @@ use iluvatar_library::types::{err_val, DroppableToken, ResultErrorVal};
 use iluvatar_library::utils::execute_cmd;
 use iluvatar_library::{
     transaction::TransactionId,
-    types::{Compute, Isolation, MemSizeMb},
+    types::{Compute, Isolation, MemSizeMb, Utilization},
     utils::port::Port,
 };
 use parking_lot::{Mutex, RwLock};
+use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::path::Path;
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 lazy_static::lazy_static! {
     pub static ref DOCKER_INSPECT_TID: TransactionId = "DockerInspectCall".to_string();
@@ -55,6 +59,8 @@ pub struct DockerContainer {
     state: Mutex<ContainerState>,
     pub client: Box<dyn ContainerClient>,
     compute: Compute,
+    last_invoke_cpu_usage_usec: Mutex<u64>,
+    last_invoke_cpu_utilization: Mutex<Utilization>,
     device: RwLock<Option<GPU>>,
     dev_mem_usage: RwLock<(MemSizeMb, bool)>,
     mem_usage: RwLock<MemSizeMb>,
@@ -91,11 +97,62 @@ impl DockerContainer {
             port,
             client,
             compute,
+            last_invoke_cpu_usage_usec: Mutex::new(0),
+            last_invoke_cpu_utilization: Mutex::new(0),
             state: Mutex::new(state),
             device: RwLock::new(device),
             drop_on_remove: Mutex::new(vec![]),
         };
         Ok(r)
+    }
+
+    fn cpu_stat(&self, stat_name: &String) -> u64 {
+        let cpustats_file = format!("/sys/fs/cgroup/system.slice/{}/cpu.stat", self.cgroup_id);
+        let filepath = Path::new(&cpustats_file);
+
+        if filepath.is_file() {
+            let file = match File::open(filepath) {
+                Ok(f) => f,
+                Err(e) => {
+                    error!(container_id=self.container_id, error=%e, cpu_stat=%filepath.display(), "Error opening container cpu_stat file");
+                    return 0;
+                },
+            };
+
+            let buf_reader = BufReader::new(file);
+            for line in buf_reader.lines() {
+                let line = line.unwrap_or("none none".to_string());
+                let splits: Vec<&str> = line.split(" ").collect();
+                if splits[0] == stat_name {
+                    match u64::from_str_radix(splits[1], 10) {
+                        Ok(stat_value) => return stat_value,
+                        Err(e) => {
+                            error!(container_id=self.container_id, stat_name=%splits[0], stat_value=%splits[1], error=%e, cpu_stat=%filepath.display(), "Error converting stat_value to u64");
+                            return 0;
+                        },
+                    }
+                }
+            }
+        } else {
+            error!(container_id=self.container_id, cpu_stat=%filepath.display(), "Error container cpu_stat file does not exist");
+        }
+
+        0
+    }
+
+    fn stats_invoke_start(&self) {
+        *self.last_invoke_cpu_usage_usec.lock() = self.cpu_stat(&"usage_usec".to_string());
+    }
+
+    fn stats_invoke_complete(&self) {
+        let invoke_time = self.last_used.read().elapsed().as_micros() as u64;
+
+        let cpu_usage_usec = self.cpu_stat(&"usage_usec".to_string());
+        let last_invoke_cpu_usage_usec = self.last_invoke_cpu_usage_usec.lock();
+        let cpu_time = cpu_usage_usec - *last_invoke_cpu_usage_usec;
+
+        let mut last_invoke_cpu_utilization = self.last_invoke_cpu_utilization.lock();
+        *last_invoke_cpu_utilization = (cpu_time * 100) / invoke_time;
     }
 }
 
@@ -105,11 +162,16 @@ impl ContainerT for DockerContainer {
     async fn invoke(&self, json_args: &str, tid: &TransactionId) -> Result<(ParsedResult, Duration)> {
         *self.invocations.lock() += 1;
         self.touch();
+        self.stats_invoke_start();
         match self.client.invoke(json_args, tid, &self.container_id).await {
-            Ok(r) => Ok(r),
+            Ok(r) => {
+                self.stats_invoke_complete();
+                Ok(r)
+            },
             Err(e) => {
                 warn!(tid=tid, container_id=%self.container_id(), "Marking container unhealthy");
                 self.mark_unhealthy();
+                self.stats_invoke_complete();
                 Err(e)
             },
         }
@@ -171,6 +233,9 @@ impl ContainerT for DockerContainer {
     }
     fn compute_type(&self) -> Compute {
         self.compute
+    }
+    fn cpu_utilization(&self) -> Utilization {
+        *self.last_invoke_cpu_utilization.lock()
     }
     fn device_resource(&self) -> ProtectedGpuRef<'_> {
         self.device.read()
