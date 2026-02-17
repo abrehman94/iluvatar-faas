@@ -369,10 +369,12 @@ pub fn benchmark_worker(
 
     for invoke in invokes.iter() {
         let parts = invoke.function_name.split('.').collect::<Vec<&str>>();
+        let func_name = parts[0..parts.len() - 2].join(".");
         let d = full_data
             .data
-            .get_mut(parts[0])
+            .get_mut(func_name.as_str())
             .expect("Unable to find function in result hash, but it should have been there");
+
         let invok_lat_f = invoke.client_latency_us as f64;
         let func_exec_us = invoke.function_output.body.latency * 1000000.0;
         let compute = Compute::from_bits_truncate(invoke.worker_response.compute);
