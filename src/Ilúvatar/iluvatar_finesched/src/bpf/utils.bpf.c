@@ -1404,7 +1404,11 @@ static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
     }
 
     info("[task_stats][%s:%d] inserted to dsq(0x%x) ", p->comm, p->pid, dsqid);
-    kick_cpus(&sched_chrs->corebitmask);
+    if (scx_bpf_dsq_nr_queued(dsqid) > bpf_cpumask_weight(&sched_chrs->corebitmask)) {
+      kick_all_cpus();
+    } else {
+      kick_cpus(&sched_chrs->corebitmask);
+    }
     return true;
 }
 
