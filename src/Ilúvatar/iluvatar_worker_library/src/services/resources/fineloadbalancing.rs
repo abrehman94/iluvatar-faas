@@ -725,3 +725,29 @@ impl LoadBalancingPolicyTrait for ConsistentHashingGuardrailsPick {
         self.guardrails.return_domain(tid, reg.clone());
     }
 }
+
+#[cfg(test)]
+mod fineloadbalancing_tests {
+    use super::*;
+
+    #[iluvatar_library::sim_test]
+    fn domain_vector_assignment() {
+        let domain_id: DomainId = 0;
+        let func_name = "test_func".to_string();
+        let cpus: u32 = 1;
+
+        let domains: ArcVec<Domain> = ArcVec::<Domain>::new();
+        let domain = Domain::new(domain_id, cpus);
+        domains.push(domain);
+
+        let domains_ref0 = domains.immutable_clone();
+        let domain = domains_ref0[domain_id].clone();
+        if !domain.can_serve_and_acquire_empty_or_assigned(&func_name, cpus).is_ok() {
+            assert!(false);
+        }
+
+        let domains_ref1 = domains.immutable_clone();
+        let domain = domains_ref1[domain_id].clone();
+        assert_eq!(domain.assigned_funcs()[0], func_name);
+    }
+}
