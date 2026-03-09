@@ -33,3 +33,12 @@ impl<T> Default for ArcVec<T> {
         }
     }
 }
+
+impl<T> Clone for ArcVec<T> {
+    fn clone(&self) -> Self {
+        let data = self.immutable_clone();
+        ArcVec {
+            inner: Mutex::new(data),
+        }
+    }
+}

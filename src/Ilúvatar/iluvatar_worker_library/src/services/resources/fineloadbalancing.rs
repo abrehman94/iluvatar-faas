@@ -420,8 +420,12 @@ impl DomainStruct {
         }
     }
 
-    pub fn id(&self) -> SchedGroupID {
+    pub fn schedgroup_id(&self) -> SchedGroupID {
         self.id as SchedGroupID
+    }
+
+    pub fn domain_id(&self) -> DomainId {
+        self.id as DomainId
     }
 
     pub fn used_cores(&self) -> u32 {
@@ -489,14 +493,14 @@ type Domain = DomainStruct;
 fn dump_domains(domains: &Vec<Arc<Domain>>) -> String {
     let mut dump = "".to_string();
     for domain in domains.iter() {
-        dump += format!("(id: {}, used_cores: {})", domain.id(), domain.used_cores()).as_str();
+        dump += format!("(id: {}, used_cores: {})", domain.domain_id(), domain.used_cores()).as_str();
     }
     dump
 }
 
 fn dump_domain(domain: &Domain) -> String {
     let mut dump = "".to_string();
-    dump += format!("(id: {}, used_cores: {}", domain.id(), domain.used_cores()).as_str();
+    dump += format!("(id: {}, used_cores: {}", domain.domain_id(), domain.used_cores()).as_str();
     dump += ", assigned_to_funcs: {";
     for func in domain.assigned_funcs() {
         dump += format!("{},", func).as_str();
@@ -505,11 +509,84 @@ fn dump_domain(domain: &Domain) -> String {
     dump
 }
 
+struct FuncDomainMapper {
+    domains: ArcVec<Domain>,
+
+    func_domains_map: ArcMap<String, ArcVec<Domain>>,
+    domains_func_map: ArcMap<DomainId, ArcVec<String>>,
+}
+
+impl FuncDomainMapper {
+    pub fn new(domains: ArcVec<Domain>) -> Self {
+        Self {
+            domains,
+
+            func_domains_map: ArcMap::new(),
+            domains_func_map: ArcMap::new(),
+        }
+    }
+
+    pub fn get(&self, func_name: &String) -> Vec<Arc<Domain>> {
+        if self.func_domains_map.get(func_name).is_some() {
+            return self.func_domains_map.get(func_name).unwrap().immutable_clone();
+        }
+
+        self.expand_preferred_set(func_name)
+    }
+
+    pub fn expand_preferred_set(&self, func_name: &String) -> Vec<Arc<Domain>> {
+        let domain_set: Arc<ArcVec<Domain>> = self.func_domains_map.get_or_create(func_name);
+        let domain_id = domain_set
+            .immutable_clone()
+            .iter()
+            .map(|domain| domain.domain_id())
+            .last()
+            .unwrap_or(0);
+
+        let domain = self.pick_next_domain(domain_id);
+
+        if !domain_set
+            .immutable_clone()
+            .iter()
+            .any(|domain_present| domain_present.domain_id() == domain.domain_id())
+        {
+            self.domains_func_map
+                .get_or_create(&domain.domain_id())
+                .push(func_name.clone());
+            domain_set.push_arc(domain);
+        }
+
+        domain_set.immutable_clone()
+    }
+
+    fn pick_next_domain(&self, starting_id: DomainId) -> Arc<Domain> {
+        let domains = self.domains.immutable_clone();
+
+        let total_domains = domains.len();
+        let next_domain_id = |domain_id| (domain_id + 1) % total_domains;
+        let mut domain_id = next_domain_id(starting_id);
+        let mut shared_count = 0;
+
+        loop {
+            let assigned_to_funcs = self.domains_func_map.get_or_create(&domain_id);
+
+            if assigned_to_funcs.immutable_clone().len() == shared_count {
+                return domains[domain_id].clone();
+            }
+
+            if domain_id == starting_id {
+                shared_count += 1;
+            }
+            domain_id = next_domain_id(domain_id);
+        }
+    }
+}
+
 pub struct ConsistentHashing {
     fineloadbalancing: FineLoadBalancingWeak,
 
     domains: ArcVec<Domain>,
-    func_preferred_domains: ArcMap<String, ArcVec<Domain>>,
+    func_to_domain_mapper: FuncDomainMapper,
 }
 
 pub trait SelectDomain {
@@ -523,10 +600,7 @@ impl SelectDomain for ConsistentHashing {
         let requested_cores = reg.cpus;
 
         for domain in domains.iter() {
-            if domain
-                .can_serve_and_acquire_empty_or_assigned(func_name, requested_cores)
-                .is_ok()
-            {
+            if domain.can_serve_and_acquire_append(func_name, requested_cores).is_ok() {
                 debug!( lbpolicy=%"consistent_hashing", domain_assigned=%dump_domain(&domain), "[finesched] assign_domain_to_function_request");
                 return Some(domain.clone());
             }
@@ -550,11 +624,12 @@ impl ConsistentHashing {
         ConsistentHashing {
             fineloadbalancing,
 
+            func_to_domain_mapper: FuncDomainMapper::new(domains.clone()),
             domains,
-            func_preferred_domains: ArcMap::new(),
         }
     }
 
+    #[allow(dead_code)]
     fn least_loaded_domain(&self) -> Arc<Domain> {
         let domains = self.domains.immutable_clone();
 
@@ -568,6 +643,7 @@ impl ConsistentHashing {
         domains[domain_id].clone()
     }
 
+    #[allow(dead_code)]
     fn pick_next_domain(&self, starting_id: DomainId, func_name: &String, cpus: u32) -> Option<Arc<Domain>> {
         let domains = self.domains.immutable_clone();
         let total_domains = domains.len();
@@ -601,40 +677,25 @@ impl ConsistentHashing {
         domains_selection: &dyn SelectDomain,
     ) -> Option<SchedGroupID> {
         let func_name = &reg.fqdn;
-        let requested_cores = reg.cpus;
 
-        let preferred_domains = self.func_preferred_domains.get_or_create(func_name).immutable_clone();
+        let preferred_domains = self.func_to_domain_mapper.get(func_name);
         debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, preferred_domains=%dump_domains(&preferred_domains), "[finesched] assign_domain_to_function_request");
 
         let mut domain;
-
-        if preferred_domains.len() == 0 {
-            domain = self.pick_next_domain(0, func_name, requested_cores);
-        } else {
-            domain = domains_selection.pick_domain_from_set(reg.clone(), &preferred_domains);
-            if domain.is_some() {
-                debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, domain_assigned=%dump_domain(&domain.as_ref().unwrap()), "[finesched] assign_domain_to_function_request");
-                return Some(domain.unwrap().id());
-            }
-
-            domain = self.pick_next_domain(preferred_domains[0].id() as DomainId, func_name, requested_cores);
+        domain = domains_selection.pick_domain_from_set(reg.clone(), &preferred_domains);
+        if domain.is_some() {
+            debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, domain_assigned=%dump_domain(&domain.as_ref().unwrap()), "[finesched] assign_domain_to_function_request");
+            return Some(domain.unwrap().schedgroup_id());
         }
 
-        if domain.is_none() {
-            debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, domain_assigned=%"None", "[finesched] assign_domain_to_function_request");
-            return None;
+        let preferred_domains = self.func_to_domain_mapper.expand_preferred_set(func_name);
+        domain = domains_selection.pick_domain_from_set(reg.clone(), &preferred_domains);
+        if domain.is_some() {
+            debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, domain_assigned=%dump_domain(&domain.as_ref().unwrap()), "[finesched] assign_domain_to_function_request");
+            return Some(domain.unwrap().schedgroup_id());
         }
 
-        let domain = domain.unwrap();
-        let same_as_domain = |ldomain: &&Arc<Domain>| ***ldomain == *domain;
-        if preferred_domains.iter().find(same_as_domain).is_none() {
-            self.func_preferred_domains
-                .get_or_create(func_name)
-                .push_arc(domain.clone());
-        }
-
-        debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, domain_assigned=%dump_domain(&domain), "[finesched] assign_domain_to_function_request");
-        Some(domain.id())
+        None
     }
 
     pub fn return_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
@@ -689,16 +750,13 @@ impl SelectDomain for ConsistentHashingGuardrailsPick {
         let requested_cores = reg.cpus;
         let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
 
-        let domain_set: Vec<SchedGroupID> = domains.iter().map(|domain| domain.id()).collect();
+        let domain_set: Vec<SchedGroupID> = domains.iter().map(|domain| domain.schedgroup_id()).collect();
         let sys_domains = self.consistent_hashing.sys_domains();
 
         let dur_ms = (fineloadbalancing.cmap.get(func_name, Chars::CpuExecTime, Value::Avg) * 1000.0) as u32;
         let domain_id = self.guardrails.guardrails_pick(dur_ms, &domain_set);
         let domain = &sys_domains[domain_id as usize];
-        if domain
-            .can_serve_and_acquire_empty_or_assigned(func_name, requested_cores)
-            .is_ok()
-        {
+        if domain.can_serve_and_acquire_append(func_name, requested_cores).is_ok() {
             return Some(domain.clone());
         }
 
@@ -749,5 +807,73 @@ mod fineloadbalancing_tests {
         let domains_ref1 = domains.immutable_clone();
         let domain = domains_ref1[domain_id].clone();
         assert_eq!(domain.assigned_funcs()[0], func_name);
+    }
+}
+
+#[cfg(test)]
+mod fineloadbalancing_func_domain_mapper_tests {
+    use super::*;
+
+    fn build_func_domain_mapper(domain_count: usize) -> FuncDomainMapper {
+        let domains = ArcVec::<Domain>::new();
+        for domain_id in 0..domain_count {
+            let assigned_cores = 1;
+            let domain = Domain::new(domain_id, assigned_cores);
+            domains.push(domain);
+        }
+
+        FuncDomainMapper::new(domains)
+    }
+
+    #[iluvatar_library::sim_test]
+    fn get_funcs_under_domain_count() {
+        let mapper = build_func_domain_mapper(/*domain_count=*/ 3);
+
+        let funcs = vec!["f0", "f1", "f2"];
+        let funcs: Vec<String> = funcs.iter().map(|f| f.to_string()).collect();
+        let domains = vec![1, 2, 0];
+
+        for (func, domain_id) in funcs.iter().zip(domains) {
+            let domain_set = mapper.get(func);
+            assert!(domain_set.len() == 1);
+            assert_eq!(domain_set[0].domain_id(), domain_id);
+        }
+    }
+
+    #[iluvatar_library::sim_test]
+    fn get_funcs_over_domain_count() {
+        let mapper = build_func_domain_mapper(/*domain_count=*/ 3);
+
+        let funcs = vec!["f0", "f1", "f2", "f3", "f4"];
+        let funcs: Vec<String> = funcs.iter().map(|f| f.to_string()).collect();
+        let domains = vec![1, 2, 0, 1, 2];
+
+        for (func, domain_id) in funcs.iter().zip(domains) {
+            let domain_set = mapper.get(func);
+
+            assert!(domain_set.len() == 1);
+            assert_eq!(domain_set[0].domain_id(), domain_id);
+        }
+    }
+
+    #[iluvatar_library::sim_test]
+    fn expand_preferred_set() {
+        let mapper = build_func_domain_mapper(/*domain_count=*/ 3);
+
+        let func = "f0".to_string();
+        let domain_set = mapper.expand_preferred_set(&func);
+        assert!(domain_set.len() == 1);
+        assert_eq!(domain_set[0].domain_id(), 1);
+
+        let domain_set = mapper.expand_preferred_set(&func);
+        assert!(domain_set.len() == 2);
+        assert_eq!(domain_set[1].domain_id(), 2);
+
+        let domain_set = mapper.expand_preferred_set(&func);
+        assert!(domain_set.len() == 3);
+        assert_eq!(domain_set[2].domain_id(), 0);
+
+        let domain_set = mapper.expand_preferred_set(&func);
+        assert!(domain_set.len() == 3);
     }
 }
