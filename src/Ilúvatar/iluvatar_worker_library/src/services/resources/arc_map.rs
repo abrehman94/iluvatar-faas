@@ -200,8 +200,18 @@ where
         map.insert(key, Arc::new(value))
     }
 
+    pub fn insert_arc(&self, key: K, value: Arc<V>) -> Option<Arc<V>> {
+        let mut map = self.map.lock().unwrap();
+
+        map.insert(key, value)
+    }
+
     pub fn len(&self) -> usize {
         self.map.lock().unwrap().len()
+    }
+
+    pub fn clear(&self) {
+        self.map.lock().unwrap().clear()
     }
 
     pub fn immutable_clone(&self) -> HashMap<K, Arc<V>> {

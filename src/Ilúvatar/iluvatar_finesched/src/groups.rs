@@ -1,10 +1,10 @@
 use dashmap::DashMap;
 use std::sync::Arc;
 
+use crate::hashmaps_safe::SharedMapsRef;
 use crate::CgroupChrs;
 use crate::SchedGroupChrs;
 use crate::SchedGroupID;
-use crate::SharedMapsSafe;
 
 use crate::bpf_intf::*;
 use crate::utils::vec_to_cpumask;
@@ -33,9 +33,8 @@ PreallocatedGroups
 
 // preallocated groups
 // thread safe, can pass around Arc<PreAllocatedGroups>
-#[derive(Debug)]
 pub struct PreAllocatedGroups {
-    sm: Arc<SharedMapsSafe>,
+    sm: SharedMapsRef,
     // caution: do not return any mutable reference to elements (avoids deadlock)
     // this struct is thread safe
     groups: Arc<DashMap<SchedGroupID, SchedGroup>>,
@@ -59,7 +58,7 @@ fn enqprio_name_to_val(prio: &str) -> u32 {
 }
 
 impl PreAllocatedGroups {
-    pub fn new(sm: Arc<SharedMapsSafe>, groups: PreallocGroupsConfig) -> PreAllocatedGroups {
+    pub fn new(sm: SharedMapsRef, groups: PreallocGroupsConfig) -> PreAllocatedGroups {
         // build hashmap of groups
         let gh: DashMap<_, _> = groups
             .groups

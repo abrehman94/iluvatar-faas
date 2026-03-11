@@ -230,6 +230,10 @@ pub struct FineLoadBalancingConfig {
 
     /// verbose logs from bpf skeleton load
     pub bpf_verbose: u8,
+
+    /// verbose logs from bpf skeleton load
+    #[serde(default)]
+    pub testing: u8,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

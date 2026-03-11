@@ -1,12 +1,15 @@
 use crate::services::registration::RegisteredFunction;
 use crate::services::resources::arc_map::ArcMap;
 use crate::services::resources::arc_vec::ArcVec;
+
 use crate::worker_api::worker_config::FineLoadBalancingConfig;
 use anyhow::bail;
 use anyhow::Result;
 use iluvatar_finesched::load_bpf_scheduler_async;
 use iluvatar_finesched::PreAllocatedGroups;
 use iluvatar_finesched::SchedGroupID;
+use iluvatar_finesched::SharedMapsDummy;
+use iluvatar_finesched::SharedMapsRef;
 use iluvatar_finesched::SharedMapsSafe;
 use iluvatar_library::char_map::Chars;
 use iluvatar_library::char_map::Value;
@@ -62,15 +65,23 @@ pub trait BuildFineLoadBalancing {
 
 impl BuildFineLoadBalancing for FineLoadBalancing {
     fn build_arc(config: Arc<FineLoadBalancingConfig>, cmap: WorkerCharMap) -> FineLoadBalancing {
-        let scx_scheduler_sharedmaps = Arc::new(SharedMapsSafe::new());
+        let scx_scheduler_sharedmaps: SharedMapsRef;
+        if config.testing == 0 {
+            scx_scheduler_sharedmaps = Arc::new(SharedMapsSafe::new());
+        } else {
+            scx_scheduler_sharedmaps = Arc::new(SharedMapsDummy::new());
+        }
+
         let preallocated_domains = Arc::new(PreAllocatedGroups::new(
             scx_scheduler_sharedmaps.clone(),
             config.preallocated_groups.clone(),
         ));
 
-        // TODO: Blocks forever if scheduler fails to load. Update logic
-        // to error.
-        load_bpf_scheduler_async(config.bpf_verbose);
+        if config.testing == 0 {
+            // TODO: Blocks forever if scheduler fails to load. Update logic
+            // to error.
+            load_bpf_scheduler_async(config.bpf_verbose);
+        }
 
         Arc::new_cyclic(move |fineloadbalancing_weak| {
             let lbpolicy_name = config.dispatchpolicy.to_lowercase();
@@ -84,6 +95,10 @@ impl BuildFineLoadBalancing for FineLoadBalancing {
                     config.clone(),
                 ))),
                 "consistent_hashing_guardrailspick" => Some(Box::new(ConsistentHashingGuardrailsPick::new(
+                    fineloadbalancing_weak.clone(),
+                    config.clone(),
+                ))),
+                "consistent_hashing_iatrebalance" => Some(Box::new(ConsistentHashingIATRebalance::new(
                     fineloadbalancing_weak.clone(),
                     config.clone(),
                 ))),
@@ -384,6 +399,7 @@ impl LoadBalancingPolicyTrait for Guardrails {
 
 type DomainId = usize;
 
+#[derive(Debug)]
 struct DomainMutableData {
     used_cores: u32,
     assigned_to_funcs: Vec<String>,
@@ -402,6 +418,7 @@ impl DomainMutableData {
     }
 }
 
+#[derive(Debug)]
 pub struct DomainStruct {
     id: DomainId,
     assigned_cores: u32,
@@ -516,6 +533,11 @@ struct FuncDomainMapper {
     domains_func_map: ArcMap<DomainId, ArcVec<String>>,
 }
 
+type RebalanceClosure<'a> = &'a (dyn Fn(
+    ArcMap<String, ArcVec<Domain>>,
+    ArcMap<DomainId, ArcVec<String>>,
+) -> (ArcMap<String, ArcVec<Domain>>, ArcMap<DomainId, ArcVec<String>>));
+
 impl FuncDomainMapper {
     pub fn new(domains: ArcVec<Domain>) -> Self {
         Self {
@@ -580,6 +602,21 @@ impl FuncDomainMapper {
             domain_id = next_domain_id(domain_id);
         }
     }
+
+    pub fn rebalance_domains(&self, rebalance_logic: RebalanceClosure) {
+        let (func_domains_map, domains_func_map) =
+            rebalance_logic(self.func_domains_map.clone(), self.domains_func_map.clone());
+
+        self.func_domains_map.clear();
+        for (key, value) in func_domains_map.immutable_clone().iter() {
+            self.func_domains_map.insert_arc(key.clone(), value.clone());
+        }
+
+        self.domains_func_map.clear();
+        for (key, value) in domains_func_map.immutable_clone().iter() {
+            self.domains_func_map.insert_arc(key.clone(), value.clone());
+        }
+    }
 }
 
 pub struct ConsistentHashing {
@@ -627,6 +664,14 @@ impl ConsistentHashing {
             func_to_domain_mapper: FuncDomainMapper::new(domains.clone()),
             domains,
         }
+    }
+
+    pub fn system_domains(&self) -> Vec<Arc<Domain>> {
+        self.domains.immutable_clone()
+    }
+
+    pub fn rebalance_domains(&self, rebalance_domains: RebalanceClosure) {
+        self.func_to_domain_mapper.rebalance_domains(rebalance_domains)
     }
 
     #[allow(dead_code)]
@@ -781,6 +826,85 @@ impl LoadBalancingPolicyTrait for ConsistentHashingGuardrailsPick {
     fn release_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         self.consistent_hashing.return_domain(tid, reg.clone());
         self.guardrails.return_domain(tid, reg.clone());
+    }
+}
+
+// Consistent hashing with IAT rebalance
+pub struct ConsistentHashingIATRebalance {
+    fineloadbalancing: FineLoadBalancingWeak,
+
+    consistent_hashing: ConsistentHashing,
+}
+
+impl ConsistentHashingIATRebalance {
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+        Self {
+            fineloadbalancing: fineloadbalancing.clone(),
+
+            consistent_hashing: ConsistentHashing::new(fineloadbalancing.clone(), config.clone()),
+        }
+    }
+    #[allow(dead_code)]
+    fn rebalance_domains(&self) {
+        let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
+        let cmap = fineloadbalancing.cmap.clone();
+        let system_domains = self.consistent_hashing.system_domains();
+
+        let total_domains = system_domains.iter().count();
+
+        let iat_rebalance = |func_domains_map: ArcMap<String, ArcVec<Domain>>,
+                             _domains_func_map: ArcMap<DomainId, ArcVec<String>>|
+         -> (ArcMap<String, ArcVec<Domain>>, ArcMap<DomainId, ArcVec<String>>) {
+            let func_domains_map = func_domains_map.immutable_clone();
+            let balanced_func_domains_map: ArcMap<String, ArcVec<Domain>> = ArcMap::new();
+            let balanced_domains_func_map: ArcMap<DomainId, ArcVec<String>> = ArcMap::new();
+
+            let mut ascending_funcs: Vec<String> = vec![];
+            let index_to_domain_id = |index: usize| index % total_domains;
+
+            let mut funcs_iats = vec![];
+            for (func, domains) in func_domains_map.iter() {
+                for _domain in domains.immutable_clone().iter() {
+                    let iat = (cmap.get(func, Chars::IAT, Value::Avg) * 1000.0) as u32;
+                    funcs_iats.push((iat, func.clone()));
+                }
+            }
+            funcs_iats.sort();
+            funcs_iats
+                .iter()
+                .for_each(|(_iat, func)| ascending_funcs.push(func.clone()));
+
+            for (i, func) in ascending_funcs.iter().enumerate() {
+                let domain_id = index_to_domain_id(i);
+                balanced_domains_func_map.get_or_create(&domain_id).push(func.clone());
+                balanced_func_domains_map
+                    .get_or_create(&func)
+                    .push_arc(system_domains[domain_id].clone());
+            }
+
+            (balanced_func_domains_map, balanced_domains_func_map)
+        };
+        self.consistent_hashing.rebalance_domains(&iat_rebalance);
+    }
+}
+
+impl LoadBalancingPolicyTrait for ConsistentHashingIATRebalance {
+    fn assign_domain_to_function_request(
+        &self,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
+        self.rebalance_domains();
+        self.consistent_hashing
+            .pick_domain(tid, reg.clone(), &self.consistent_hashing)
+    }
+
+    fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.consistent_hashing.return_domain(tid, reg.clone());
+    }
+
+    fn release_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.consistent_hashing.return_domain(tid, reg.clone());
     }
 }
 

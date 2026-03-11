@@ -11,6 +11,8 @@ pub use hashmaps::SCHED_GROUP_MAP_PATH;
 pub use hashmaps::SCHED_GROUP_STATS_MAP_PATH;
 
 mod hashmaps_safe;
+pub use hashmaps_safe::SharedMapsDummy;
+pub use hashmaps_safe::SharedMapsRef;
 pub use hashmaps_safe::SharedMapsSafe;
 
 mod bpf_skel;
