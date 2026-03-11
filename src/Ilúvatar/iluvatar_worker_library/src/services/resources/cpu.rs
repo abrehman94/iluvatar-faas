@@ -121,7 +121,7 @@ impl CpuResourceTracker {
                 return match sem.clone().try_acquire_many_owned(reg.cpus) {
                     Ok(p) => Ok(Some(p)),
                     Err(e) => {
-                        self.insufficient_resources_for_request(tid, reg.clone());
+                        self.release_domain_for_request(tid, reg.clone());
                         Err(e)
                     },
                 };
@@ -143,7 +143,7 @@ impl CpuResourceTracker {
                 return match sem.clone().acquire_many_owned(reg.cpus).await {
                     Ok(p) => Ok(Some(p)),
                     Err(e) => {
-                        self.insufficient_resources_for_request(tid, reg.clone());
+                        self.release_domain_for_request(tid, reg.clone());
                         Err(e)
                     },
                 };
@@ -275,7 +275,7 @@ impl CpuResourceTracker {
         }
     }
 
-    pub fn insufficient_resources_for_request(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+    pub fn release_domain_for_request(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         let fqdn = reg.fqdn.as_str();
         if let Some(fineloadbalancing) = &self.fineloadbalancing {
             let _lock = fineloadbalancing.domain_operation_lock.lock().unwrap();
