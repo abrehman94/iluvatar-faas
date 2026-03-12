@@ -362,18 +362,11 @@ impl CpuQueueingInvoker {
         {
             EventualItem::Future(f) => {
                 self.cold_starting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                f.await
+                f.await?
             },
-            EventualItem::Now(n) => n,
+            EventualItem::Now(n) => n?,
         };
-        let ctr_lock = match ctr_lock {
-            Ok(e) => e,
-            Err(e) => {
-                self.cpu
-                    .release_domain_for_request(&item.tid, item.registration.clone());
-                return Err(e);
-            },
-        };
+
         self.cold_starting.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.running.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.cpu

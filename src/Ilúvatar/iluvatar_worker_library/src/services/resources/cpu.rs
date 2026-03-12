@@ -14,6 +14,7 @@ use iluvatar_library::clock::now;
 use iluvatar_library::ring_buff::{RingBuffer, Wireable};
 use iluvatar_library::threading::{is_simulation, tokio_thread};
 use iluvatar_library::transaction::TransactionId;
+use iluvatar_library::types::DroppableMovableTrait;
 use iluvatar_library::{bail_error, threading};
 use parking_lot::{Mutex, RwLock};
 use std::fs::read_to_string;
@@ -28,6 +29,30 @@ use tracing::{debug, error, info};
 lazy_static::lazy_static! {
   pub static ref CPU_CONCUR_WORKER_TID: TransactionId = "CPUConcurrencyMonitor".to_string();
 }
+
+type Callback = Arc<dyn Fn() + Send + Sync>;
+
+pub struct DomainCpuPermit {
+    _cpu_permit: OwnedSemaphorePermit,
+    callback: Callback,
+}
+
+impl DomainCpuPermit {
+    pub fn new(cpu_permit: OwnedSemaphorePermit, callback: Callback) -> Self {
+        DomainCpuPermit {
+            _cpu_permit: cpu_permit,
+            callback,
+        }
+    }
+}
+
+impl Drop for DomainCpuPermit {
+    fn drop(&mut self) {
+        (*self.callback)();
+    }
+}
+
+impl DroppableMovableTrait for DomainCpuPermit {}
 
 /// An invoker that scales concurrency based on system load.
 /// Prioritizes based on container availability.
@@ -136,12 +161,15 @@ impl CpuResourceTracker {
         &self,
         reg: &Arc<RegisteredFunction>,
         tid: &TransactionId,
-    ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::AcquireError> {
+    ) -> Result<Option<DomainCpuPermit>, tokio::sync::AcquireError> {
         debug!(cpu_sem =? self.concurrency_semaphore, "CPUResourceMananger");
         if let Some(sem) = &self.concurrency_semaphore {
             if self.assign_domain_to_function_request(tid, reg.clone()).is_ok() {
                 return match sem.clone().acquire_many_owned(reg.cpus).await {
-                    Ok(p) => Ok(Some(p)),
+                    Ok(p) => {
+                        let release_domain_callback = self.build_release_domain_callback(tid, reg.clone());
+                        Ok(Some(DomainCpuPermit::new(p, release_domain_callback)))
+                    },
                     Err(e) => {
                         self.release_domain_for_request(tid, reg.clone());
                         Err(e)
@@ -276,26 +304,39 @@ impl CpuResourceTracker {
     }
 
     pub fn release_domain_for_request(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
-        let fqdn = reg.fqdn.as_str();
+        let callback = self.build_release_domain_callback(tid, reg);
+        (*callback)();
+    }
+
+    pub fn build_release_domain_callback(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) -> Callback {
         if let Some(fineloadbalancing) = &self.fineloadbalancing {
-            let _lock = fineloadbalancing.domain_operation_lock.lock().unwrap();
-            let lbpolicy = &fineloadbalancing.lbpolicy;
-            let stats = fineloadbalancing.stats.clone();
-            let domain_id = match stats.tid_map.get(tid) {
-                Some(entry) => *entry,
-                None => {
-                    error!(tid=%tid, "[finesched] no domain found for tid in tid_stats map");
-                    return;
-                },
+            let fineloadbalancing = fineloadbalancing.clone();
+            let tid = tid.clone();
+
+            let callback = move || {
+                let fqdn = reg.fqdn.as_str();
+                let _lock = fineloadbalancing.domain_operation_lock.lock().unwrap();
+                let lbpolicy = &fineloadbalancing.lbpolicy;
+                let stats = fineloadbalancing.stats.clone();
+                let domain_id = match stats.tid_map.get(&tid) {
+                    Some(entry) => *entry,
+                    None => {
+                        error!(tid=%tid, "[finesched] no domain found for tid in tid_stats map");
+                        return;
+                    },
+                };
+
+                lbpolicy.release_domain(&tid, reg.clone());
+                stats.tid_map.remove(&tid);
+
+                let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
+                scheduled_invocations.fetch_sub(1, Ordering::Relaxed);
+
+                debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, pending_invocations=%scheduled_invocations.load(Ordering::Relaxed), "[finesched] domain released for function request");
             };
-
-            lbpolicy.release_domain(tid, reg.clone());
-            stats.tid_map.remove(tid);
-
-            let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
-            scheduled_invocations.fetch_sub(1, Ordering::Relaxed);
-
-            debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, pending_invocations=%scheduled_invocations.load(Ordering::Relaxed), "[finesched] domain released for function request");
+            Arc::new(callback)
+        } else {
+            Arc::new(|| {})
         }
     }
 }
