@@ -267,6 +267,8 @@ async fn invoke_on_container_2(
         Chars::GpuMemoryUsage,
         data.gpu_allocation_mb as f64,
     );
+    cmap.update(&reg.fqdn, Chars::CPUtil, ctr_lock.container.cpu_utilization() as f64);
+
     device_tput.add_tput(time);
     if compute == Compute::GPU {
         ctr_lock.container.set_device_memory(data.gpu_allocation_mb);

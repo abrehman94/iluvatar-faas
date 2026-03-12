@@ -102,6 +102,11 @@ impl BuildFineLoadBalancing for FineLoadBalancing {
                     fineloadbalancing_weak.clone(),
                     config.clone(),
                 ))),
+                "consistent_hashing_cpuutilrebalance" => Some(Box::new(ConsistentHashingCPUUtilizationRebalance::new(
+                    fineloadbalancing_weak.clone(),
+                    config.clone(),
+                ))),
+
                 "domain_zero" => Some(Box::new(DomainZero::new(fineloadbalancing_weak.clone()))),
                 _ => None,
             };
@@ -397,7 +402,7 @@ impl LoadBalancingPolicyTrait for Guardrails {
 //      return_cpus_and_release(domain, f_r.name, f_r.cpus)
 //
 
-type DomainId = usize;
+pub type DomainId = usize;
 
 #[derive(Debug)]
 struct DomainMutableData {
@@ -829,31 +834,32 @@ impl LoadBalancingPolicyTrait for ConsistentHashingGuardrailsPick {
     }
 }
 
-// Consistent hashing with IAT rebalance
-pub struct ConsistentHashingIATRebalance {
-    fineloadbalancing: FineLoadBalancingWeak,
+// Consistent hashing with Custom rebalance
+type CustomRebalanceValue = Arc<dyn Fn(&String) -> u32 + Sync + Send>;
 
+struct ConsistentHashingCustomRebalance {
+    rebalance_value: CustomRebalanceValue,
     consistent_hashing: ConsistentHashing,
 }
 
-impl ConsistentHashingIATRebalance {
-    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+impl ConsistentHashingCustomRebalance {
+    pub fn new(
+        fineloadbalancing: FineLoadBalancingWeak,
+        config: Arc<FineLoadBalancingConfig>,
+        rebalance_value: CustomRebalanceValue,
+    ) -> Self {
         Self {
-            fineloadbalancing: fineloadbalancing.clone(),
-
+            rebalance_value,
             consistent_hashing: ConsistentHashing::new(fineloadbalancing.clone(), config.clone()),
         }
     }
-    #[allow(dead_code)]
-    fn rebalance_domains(&self) {
-        let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
-        let cmap = fineloadbalancing.cmap.clone();
-        let system_domains = self.consistent_hashing.system_domains();
 
+    fn rebalance_domains(&self) {
+        let system_domains = self.consistent_hashing.system_domains();
         let total_domains = system_domains.iter().count();
 
-        let iat_rebalance = |func_domains_map: ArcMap<String, ArcVec<Domain>>,
-                             _domains_func_map: ArcMap<DomainId, ArcVec<String>>|
+        let custom_rebalance = |func_domains_map: ArcMap<String, ArcVec<Domain>>,
+                                _domains_func_map: ArcMap<DomainId, ArcVec<String>>|
          -> (ArcMap<String, ArcVec<Domain>>, ArcMap<DomainId, ArcVec<String>>) {
             let func_domains_map = func_domains_map.immutable_clone();
             let balanced_func_domains_map: ArcMap<String, ArcVec<Domain>> = ArcMap::new();
@@ -862,17 +868,17 @@ impl ConsistentHashingIATRebalance {
             let mut ascending_funcs: Vec<String> = vec![];
             let index_to_domain_id = |index: usize| index % total_domains;
 
-            let mut funcs_iats = vec![];
+            let mut funcs_values = vec![];
             for (func, domains) in func_domains_map.iter() {
                 for _domain in domains.immutable_clone().iter() {
-                    let iat = (cmap.get(func, Chars::IAT, Value::Avg) * 1000.0) as u32;
-                    funcs_iats.push((iat, func.clone()));
+                    let value = (*self.rebalance_value)(func);
+                    funcs_values.push((value, func.clone()));
                 }
             }
-            funcs_iats.sort();
-            funcs_iats
+            funcs_values.sort();
+            funcs_values
                 .iter()
-                .for_each(|(_iat, func)| ascending_funcs.push(func.clone()));
+                .for_each(|(_value, func)| ascending_funcs.push(func.clone()));
 
             for (i, func) in ascending_funcs.iter().enumerate() {
                 let domain_id = index_to_domain_id(i);
@@ -884,11 +890,11 @@ impl ConsistentHashingIATRebalance {
 
             (balanced_func_domains_map, balanced_domains_func_map)
         };
-        self.consistent_hashing.rebalance_domains(&iat_rebalance);
+        self.consistent_hashing.rebalance_domains(&custom_rebalance);
     }
 }
 
-impl LoadBalancingPolicyTrait for ConsistentHashingIATRebalance {
+impl LoadBalancingPolicyTrait for ConsistentHashingCustomRebalance {
     fn assign_domain_to_function_request(
         &self,
         tid: &TransactionId,
@@ -905,6 +911,96 @@ impl LoadBalancingPolicyTrait for ConsistentHashingIATRebalance {
 
     fn release_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         self.consistent_hashing.return_domain(tid, reg.clone());
+    }
+}
+
+// Consistent hashing with IAT rebalance
+pub struct ConsistentHashingIATRebalance {
+    consistenthashing_customrebalance: ConsistentHashingCustomRebalance,
+}
+
+impl ConsistentHashingIATRebalance {
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+        let fineloadbalancing_weak = fineloadbalancing.clone();
+        let iat_for_func = move |func: &String| -> u32 {
+            let fineloadbalancing = fineloadbalancing_weak.upgrade().unwrap();
+            let cmap = fineloadbalancing.cmap.clone();
+
+            (cmap.get(func, Chars::IAT, Value::Avg) * 1000.0) as u32
+        };
+
+        Self {
+            consistenthashing_customrebalance: ConsistentHashingCustomRebalance::new(
+                fineloadbalancing.clone(),
+                config.clone(),
+                Arc::new(iat_for_func),
+            ),
+        }
+    }
+}
+
+impl LoadBalancingPolicyTrait for ConsistentHashingIATRebalance {
+    fn assign_domain_to_function_request(
+        &self,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
+        self.consistenthashing_customrebalance
+            .assign_domain_to_function_request(tid, reg.clone())
+    }
+
+    fn invoke_is_complete(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.consistenthashing_customrebalance
+            .invoke_is_complete(cgroup_id, tid, reg.clone());
+    }
+
+    fn release_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.consistenthashing_customrebalance.release_domain(tid, reg.clone());
+    }
+}
+
+// Consistent hashing with CPU Utilization rebalance
+pub struct ConsistentHashingCPUUtilizationRebalance {
+    consistenthashing_customrebalance: ConsistentHashingCustomRebalance,
+}
+
+impl ConsistentHashingCPUUtilizationRebalance {
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+        let fineloadbalancing_weak = fineloadbalancing.clone();
+        let cpuutil_for_func = move |func: &String| -> u32 {
+            let fineloadbalancing = fineloadbalancing_weak.upgrade().unwrap();
+            let cmap = fineloadbalancing.cmap.clone();
+
+            (cmap.get(func, Chars::CPUtil, Value::Avg) * 1000.0) as u32
+        };
+
+        Self {
+            consistenthashing_customrebalance: ConsistentHashingCustomRebalance::new(
+                fineloadbalancing.clone(),
+                config.clone(),
+                Arc::new(cpuutil_for_func),
+            ),
+        }
+    }
+}
+
+impl LoadBalancingPolicyTrait for ConsistentHashingCPUUtilizationRebalance {
+    fn assign_domain_to_function_request(
+        &self,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
+        self.consistenthashing_customrebalance
+            .assign_domain_to_function_request(tid, reg.clone())
+    }
+
+    fn invoke_is_complete(&self, cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.consistenthashing_customrebalance
+            .invoke_is_complete(cgroup_id, tid, reg.clone());
+    }
+
+    fn release_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.consistenthashing_customrebalance.release_domain(tid, reg.clone());
     }
 }
 

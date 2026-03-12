@@ -128,6 +128,9 @@ pub enum Chars {
     /// E2E time for a CPU cold start.
     /// Recorded by invoke_on_container_2
     CpuColdTime,
+    /// CPU utilization
+    /// Recorded by ?
+    CPUtil,
     /// Running avg of _all_ times on GPU for invocations.
     /// Recorded by invoke_on_container_2
     GpuExecTime,

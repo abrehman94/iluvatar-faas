@@ -3,6 +3,7 @@ pub mod utils;
 
 use crate::utils::build_test_services;
 use iluvatar_finesched::SchedGroup;
+use iluvatar_finesched::SchedGroupID;
 use iluvatar_library::char_map::Chars;
 use iluvatar_library::transaction::{gen_tid, TEST_TID};
 use iluvatar_library::types::{Compute, Isolation};
@@ -31,8 +32,13 @@ fn cpu_reg() -> RegisterRequest {
 mod fineloadbalancing_chlb_iat_rebalance_tests {
     use super::*;
 
-    #[iluvatar_library::sim_test]
-    async fn rebalance_test() {
+    async fn rebalance_test_for(
+        lbpolicy: &String,
+        value_type: Chars,
+        values: Vec<f64>,
+        first_time_domains: Vec<SchedGroupID>,
+        rebalanced_expected_domains: Vec<SchedGroupID>,
+    ) {
         let (_log, _cfg, _cm, _invoker, reg, cmap, _gpu) = build_test_services(None, None, None).await;
 
         let scheduling_group = SchedGroup {
@@ -40,7 +46,7 @@ mod fineloadbalancing_chlb_iat_rebalance_tests {
             ..Default::default()
         };
         let mut config = FineLoadBalancingConfig::default();
-        config.dispatchpolicy = "consistent_hashing_IATRebalance".to_string();
+        config.dispatchpolicy = lbpolicy.clone();
         config.testing = 1;
         config.preallocated_groups.groups = vec![
             scheduling_group.clone(),
@@ -50,17 +56,13 @@ mod fineloadbalancing_chlb_iat_rebalance_tests {
 
         let loadbalancing = FineLoadBalancing::build_arc(Arc::new(config), cmap.clone());
 
-        let iats = vec![2.0, 1.0, 3.0, 4.0];
-        let first_time_domains = vec![1, 1, 2, 1];
-        let rebalanced_expected_domains = vec![1, 0, 2, 0];
-
         let mut func_regs: Vec<Arc<RegisteredFunction>> = vec![];
-        for iat in iats.iter() {
+        for value in values.iter() {
             let func_reg = reg
                 .register(cpu_reg(), &TEST_TID)
                 .await
                 .unwrap_or_else(|e| panic!("Registration failed: {}", e));
-            cmap.update(&func_reg.fqdn, Chars::IAT, *iat);
+            cmap.update(&func_reg.fqdn, value_type, *value);
             func_regs.insert(func_regs.len(), func_reg.clone());
         }
 
@@ -89,5 +91,29 @@ mod fineloadbalancing_chlb_iat_rebalance_tests {
 
             assert_eq!(domain_id, expected_domain_id);
         }
+    }
+
+    #[iluvatar_library::sim_test]
+    async fn iat_rebalance_test() {
+        rebalance_test_for(
+            &"consistent_hashing_IATRebalance".to_string(),
+            Chars::IAT,
+            /*values=*/ vec![2.0, 1.0, 3.0, 4.0],
+            /*first_time_domains=*/ vec![1, 1, 2, 1],
+            /*rebalanced_expected_domains=*/ vec![1, 0, 2, 0],
+        )
+        .await;
+    }
+
+    #[iluvatar_library::sim_test]
+    async fn cpuutil_rebalance_test() {
+        rebalance_test_for(
+            &"consistent_hashing_cpuutilRebalance".to_string(),
+            Chars::CPUtil,
+            /*values=*/ vec![2.0, 1.0, 3.0, 4.0],
+            /*first_time_domains=*/ vec![1, 1, 2, 1],
+            /*rebalanced_expected_domains=*/ vec![1, 0, 2, 0],
+        )
+        .await;
     }
 }
