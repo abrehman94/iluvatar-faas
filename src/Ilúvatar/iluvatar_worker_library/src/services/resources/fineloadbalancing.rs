@@ -573,13 +573,9 @@ impl FuncDomainMapper {
             .last()
             .unwrap_or(0);
 
-        let domain = self.pick_next_domain(domain_id);
-
-        if !domain_set
-            .immutable_clone()
-            .iter()
-            .any(|domain_present| domain_present.domain_id() == domain.domain_id())
-        {
+        let domain_set_clone = domain_set.immutable_clone();
+        if domain_set_clone.len() < self.domains.immutable_clone().len() {
+            let domain = self.pick_next_domain(domain_id, domain_set_clone);
             self.domains_func_map
                 .get_or_create(&domain.domain_id())
                 .push(func_name.clone());
@@ -589,10 +585,15 @@ impl FuncDomainMapper {
         domain_set.immutable_clone()
     }
 
-    fn pick_next_domain(&self, starting_id: DomainId) -> Arc<Domain> {
+    fn pick_next_domain(&self, starting_id: DomainId, excluding_set: Vec<Arc<Domain>>) -> Arc<Domain> {
         let domains = self.domains.immutable_clone();
 
         let total_domains = domains.len();
+        let not_in_excluding_set = |domain_id| {
+            !excluding_set
+                .iter()
+                .any(|excluded_domain| excluded_domain.domain_id() == domain_id)
+        };
         let next_domain_id = |domain_id| (domain_id + 1) % total_domains;
         let mut domain_id = next_domain_id(starting_id);
         let mut shared_count = 0;
@@ -600,7 +601,7 @@ impl FuncDomainMapper {
         loop {
             let assigned_to_funcs = self.domains_func_map.get_or_create(&domain_id);
 
-            if assigned_to_funcs.immutable_clone().len() == shared_count {
+            if assigned_to_funcs.immutable_clone().len() < shared_count && not_in_excluding_set(domain_id) {
                 return domains[domain_id].clone();
             }
 
@@ -1126,7 +1127,7 @@ mod fineloadbalancing_func_domain_mapper_tests {
     }
 
     #[iluvatar_library::sim_test]
-    fn expand_preferred_set() {
+    fn expand_preferred_set_single_func() {
         let mapper = build_func_domain_mapper(/*domain_count=*/ 3);
 
         let func = "f0".to_string();
@@ -1144,5 +1145,33 @@ mod fineloadbalancing_func_domain_mapper_tests {
 
         let domain_set = mapper.expand_preferred_set(&func);
         assert!(domain_set.len() == 3);
+    }
+
+    #[iluvatar_library::sim_test]
+    fn expand_preferred_set_multi_func() {
+        let mapper = build_func_domain_mapper(/*domain_count=*/ 3);
+
+        let func0 = "f0".to_string();
+        let domain_set = mapper.expand_preferred_set(&func0);
+        assert!(domain_set.len() == 1);
+        assert_eq!(domain_set[0].domain_id(), 1);
+
+        let func1 = "f1".to_string();
+        let domain_set = mapper.expand_preferred_set(&func1);
+        assert!(domain_set.len() == 1);
+        assert_eq!(domain_set[0].domain_id(), 2);
+
+        let domain_set = mapper.expand_preferred_set(&func1);
+        assert!(domain_set.len() == 2);
+        assert_eq!(domain_set[1].domain_id(), 0);
+
+        let func2 = "f2".to_string();
+        let domain_set = mapper.expand_preferred_set(&func2);
+        assert!(domain_set.len() == 1);
+        assert_eq!(domain_set[0].domain_id(), 1);
+
+        let domain_set = mapper.expand_preferred_set(&func1);
+        assert!(domain_set.len() == 3);
+        assert_eq!(domain_set[2].domain_id(), 1);
     }
 }
