@@ -878,9 +878,19 @@ impl ConsistentHashingCustomRebalance {
                 funcs_values.push((value, func.clone()));
             }
             funcs_values.sort();
-            funcs_values
-                .iter()
-                .for_each(|(_value, func)| ascending_funcs.push(func.clone()));
+            if funcs_values.len() > total_domains {
+                funcs_values[0..total_domains]
+                    .iter()
+                    .for_each(|(_value, func)| ascending_funcs.push(func.clone()));
+                funcs_values[total_domains..]
+                    .iter()
+                    .rev()
+                    .for_each(|(_value, func)| ascending_funcs.push(func.clone()));
+            } else {
+                funcs_values
+                    .iter()
+                    .for_each(|(_value, func)| ascending_funcs.push(func.clone()));
+            }
 
             for (i, func) in ascending_funcs.iter().enumerate() {
                 let domain_id = index_to_domain_id(i);

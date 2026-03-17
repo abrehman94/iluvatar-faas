@@ -29,7 +29,7 @@ fn cpu_reg() -> RegisterRequest {
 }
 
 #[cfg(test)]
-mod fineloadbalancing_chlb_iat_rebalance_tests {
+mod fineloadbalancing_chlb_rebalance_tests {
     use super::*;
 
     async fn rebalance_test_for(
@@ -98,9 +98,9 @@ mod fineloadbalancing_chlb_iat_rebalance_tests {
         rebalance_test_for(
             &"consistent_hashing_IATRebalance".to_string(),
             Chars::IAT,
-            /*values=*/ vec![2.0, 1.0, 3.0, 4.0],
-            /*first_time_domains=*/ vec![1, 1, 2, 1],
-            /*rebalanced_expected_domains=*/ vec![1, 0, 2, 0],
+            /*values=*/ vec![2.0, 1.0, 3.0, 4.0, 5.0],
+            /*first_time_domains=*/ vec![1, 1, 2, 1, 1],
+            /*rebalanced_expected_domains=*/ vec![1, 0, 2, 1, 0],
         )
         .await;
     }
