@@ -20,6 +20,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
+use tokio::sync::Notify;
 use tracing::debug;
 use tracing::error;
 
@@ -55,6 +56,7 @@ pub struct FineLoadBalancingStruct {
     pub lbpolicy: LoadBalancingPolicy,
 
     pub domain_operation_lock: Mutex<bool>,
+    pub domain_release_signal: Arc<Notify>,
 }
 pub type FineLoadBalancing = Arc<FineLoadBalancingStruct>;
 pub type FineLoadBalancingWeak = Weak<FineLoadBalancingStruct>;
@@ -128,6 +130,7 @@ impl BuildFineLoadBalancing for FineLoadBalancing {
                 lbpolicy,
 
                 domain_operation_lock: Mutex::new(false),
+                domain_release_signal: Arc::new(Notify::new()),
             }
         })
     }

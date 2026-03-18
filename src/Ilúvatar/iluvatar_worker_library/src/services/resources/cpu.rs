@@ -175,6 +175,8 @@ impl CpuResourceTracker {
                         Err(e)
                     },
                 };
+            } else {
+                self.await_domain_release_or_timeout().await;
             }
         }
         Ok(None)
@@ -299,6 +301,7 @@ impl CpuResourceTracker {
             let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
             scheduled_invocations.fetch_sub(1, Ordering::Relaxed);
 
+            fineloadbalancing.domain_release_signal.notify_waiters();
             debug!( tid=%tid, fqdn=%fqdn, cgroup_id=%cgroup_id, domain_id=%domain_id, "[finesched] domain released for function cgroup");
         }
     }
@@ -312,6 +315,7 @@ impl CpuResourceTracker {
         if let Some(fineloadbalancing) = &self.fineloadbalancing {
             let fineloadbalancing = fineloadbalancing.clone();
             let tid = tid.clone();
+            let domain_release_signal = fineloadbalancing.domain_release_signal.clone();
 
             let callback = move || {
                 let fqdn = reg.fqdn.as_str();
@@ -332,11 +336,22 @@ impl CpuResourceTracker {
                 let scheduled_invocations = &stats.domain_map.get_or_create(&domain_id).scheduled_invocations;
                 scheduled_invocations.fetch_sub(1, Ordering::Relaxed);
 
+                domain_release_signal.notify_waiters();
                 debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, pending_invocations=%scheduled_invocations.load(Ordering::Relaxed), "[finesched] domain released for function request");
             };
             Arc::new(callback)
         } else {
             Arc::new(|| {})
+        }
+    }
+
+    async fn await_domain_release_or_timeout(&self) {
+        if let Some(fineloadbalancing) = &self.fineloadbalancing {
+            let fineloadbalancing = fineloadbalancing.clone();
+            let domain_release_signal = fineloadbalancing.domain_release_signal.clone();
+
+            let sleep_t = 200;
+            let _ = tokio::time::timeout(Duration::from_millis(sleep_t), domain_release_signal.notified_owned()).await;
         }
     }
 }
