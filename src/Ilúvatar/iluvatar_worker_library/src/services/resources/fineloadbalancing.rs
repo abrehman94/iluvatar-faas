@@ -846,6 +846,9 @@ impl LoadBalancingPolicyTrait for ConsistentHashingGuardrailsPick {
 type CustomRebalanceValue = Arc<dyn Fn(&String) -> u32 + Sync + Send>;
 
 struct ConsistentHashingCustomRebalance {
+    rebalance_since_request: AtomicU32,
+    rebalance_since_request_limit: AtomicU32,
+
     rebalance_value: CustomRebalanceValue,
     consistent_hashing: ConsistentHashing,
 }
@@ -856,7 +859,13 @@ impl ConsistentHashingCustomRebalance {
         config: Arc<FineLoadBalancingConfig>,
         rebalance_value: CustomRebalanceValue,
     ) -> Self {
+        let domains_config = &config.preallocated_groups.groups;
+        let domain_count = domains_config.len() as u32;
+
         Self {
+            rebalance_since_request: AtomicU32::new(0),
+            rebalance_since_request_limit: AtomicU32::new(2 * domain_count),
+
             rebalance_value,
             consistent_hashing: ConsistentHashing::new(fineloadbalancing.clone(), config.clone()),
         }
@@ -916,7 +925,12 @@ impl LoadBalancingPolicyTrait for ConsistentHashingCustomRebalance {
         tid: &TransactionId,
         reg: Arc<RegisteredFunction>,
     ) -> Option<SchedGroupID> {
-        self.rebalance_domains();
+        if self.rebalance_since_request.fetch_add(1, Ordering::Relaxed)
+            >= self.rebalance_since_request_limit.load(Ordering::Relaxed)
+        {
+            self.rebalance_domains();
+            self.rebalance_since_request.store(0, Ordering::Relaxed);
+        }
         self.consistent_hashing
             .pick_domain(tid, reg.clone(), &self.consistent_hashing)
     }

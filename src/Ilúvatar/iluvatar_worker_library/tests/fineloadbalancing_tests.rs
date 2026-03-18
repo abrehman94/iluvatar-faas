@@ -88,7 +88,6 @@ mod fineloadbalancing_chlb_rebalance_tests {
             loadbalancing.stats.tid_map.insert(TEST_TID.to_string(), domain_id);
             loadbalancing.lbpolicy.release_domain(&TEST_TID, func_reg.clone());
             loadbalancing.stats.tid_map.remove(&TEST_TID);
-
             assert_eq!(domain_id, expected_domain_id);
         }
     }
@@ -98,9 +97,9 @@ mod fineloadbalancing_chlb_rebalance_tests {
         rebalance_test_for(
             &"consistent_hashing_IATRebalance".to_string(),
             Chars::IAT,
-            /*values=*/ vec![2.0, 1.0, 3.0, 4.0, 5.0],
-            /*first_time_domains=*/ vec![1, 1, 2, 1, 1],
-            /*rebalanced_expected_domains=*/ vec![1, 0, 2, 1, 0],
+            /*values=*/ vec![2.0, 1.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            /*first_time_domains=*/ vec![1, 2, 0, 1, 2, 0, 1],
+            /*rebalanced_expected_domains=*/ vec![1, 0, 2, 2, 1, 0, 0],
         )
         .await;
     }
@@ -110,9 +109,9 @@ mod fineloadbalancing_chlb_rebalance_tests {
         rebalance_test_for(
             &"consistent_hashing_cpuutilRebalance".to_string(),
             Chars::CPUtil,
-            /*values=*/ vec![2.0, 1.0, 3.0, 4.0],
-            /*first_time_domains=*/ vec![1, 1, 2, 1],
-            /*rebalanced_expected_domains=*/ vec![1, 0, 2, 0],
+            /*values=*/ vec![2.0, 1.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            /*first_time_domains=*/ vec![1, 2, 0, 1, 2, 0, 1],
+            /*rebalanced_expected_domains=*/ vec![1, 0, 2, 2, 1, 0, 0],
         )
         .await;
     }
@@ -120,11 +119,11 @@ mod fineloadbalancing_chlb_rebalance_tests {
     #[iluvatar_library::sim_test]
     async fn iatcpuutil_rebalance_test() {
         let lbpolicy = &"consistent_hashing_iatcpuutilRebalance".to_string();
-        let iats = vec![10.0, 20.0, 30.0, 400.0];
-        let cpu_utils = vec![10.0, 1000.0, 200.0, 500.0];
-        // hybrid values [1100.0, 21.0, 155.0, 802.0]
-        let first_time_domains = vec![1, 1, 2, 1];
-        let rebalanced_expected_domains = vec![0, 0, 1, 2];
+        let iats = vec![10.0, 20.0, 30.0, 400.0, 500.0, 600.0];
+        let cpu_utils = vec![10.0, 1000.0, 200.0, 500.0, 10.0, 20.0];
+        // hybrid values [1100.0, 21.0, 155.0, 802.0, 50100.0, 30050.0]
+        let first_time_domains = vec![1, 2, 0, 1, 2, 0];
+        let rebalanced_expected_domains = vec![2, 0, 1, 2, 0, 1];
 
         let (_log, _cfg, _cm, _invoker, reg, cmap, _gpu) = build_test_services(None, None, None).await;
 
@@ -184,12 +183,14 @@ mod fineloadbalancing_chlb_rebalance_tests {
     #[iluvatar_library::sim_test]
     async fn iatenergy_rebalance_test() {
         let lbpolicy = &"consistent_hashing_iatenergyRebalance".to_string();
-        let iats = vec![10.0, 20.0, 30.0, 400.0];
-        let cpu_utils = vec![10.0, 1000.0, 200.0, 500.0];
-        let durs = vec![10.0, 1000.0, 200.0, 500.0];
-        // hybrid values [110000.0, 1000020000.0, 40030000.0, 250400000.0]
-        let first_time_domains = vec![1, 1, 2, 1];
-        let rebalanced_expected_domains = vec![0, 0, 1, 2];
+        let iats = vec![10.0, 20.0, 30.0, 400.0, 500.0, 600.0];
+        let cpu_utils = vec![10.0, 1000.0, 200.0, 500.0, 450.0, 250.0];
+        let durs = vec![10.0, 1000.0, 200.0, 500.0, 300.0, 120.0];
+        // hybrid values [110000.0, 1000020000.0, 40030000.0, 250400000.0, 135500000.0, 30600000.0]
+        // [(110000.0, 0), (30600000.0, 5), (40030000.0, 2), (135500000.0, 4), (250400000.0, 3), (1000020000.0, 1)]
+
+        let first_time_domains = vec![1, 2, 0, 1, 2, 0];
+        let rebalanced_expected_domains = vec![0, 0, 2, 1, 2, 1];
 
         let (_log, _cfg, _cm, _invoker, reg, cmap, _gpu) = build_test_services(None, None, None).await;
 
