@@ -648,11 +648,29 @@ impl SelectDomain for ConsistentHashing {
     fn pick_domain_from_set(&self, reg: Arc<RegisteredFunction>, domains: &Vec<Arc<Domain>>) -> Option<Arc<Domain>> {
         let func_name = &reg.fqdn;
         let requested_cores = reg.cpus;
-
-        for domain in domains.iter() {
+        let acquire_domain = |domain: &Arc<Domain>| {
             if domain.can_serve_and_acquire_append(func_name, requested_cores).is_ok() {
                 debug!( lbpolicy=%"consistent_hashing", domain_assigned=%dump_domain(&domain), "[finesched] assign_domain_to_function_request");
                 return Some(domain.clone());
+            }
+            None
+        };
+
+        let least_loaded_domain = domains
+            .iter()
+            .map(|domain| domain.used_cores())
+            .enumerate()
+            .map(|(i, used_cores)| (used_cores, i))
+            .min()
+            .unwrap();
+        let least_loaded_domain = &domains[least_loaded_domain.1];
+        if let Some(domain) = acquire_domain(least_loaded_domain) {
+            return Some(domain);
+        }
+
+        for domain in domains.iter() {
+            if let Some(domain) = acquire_domain(domain) {
+                return Some(domain);
             }
         }
 
