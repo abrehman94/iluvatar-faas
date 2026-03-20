@@ -344,7 +344,7 @@ static bool __noinline is_docker_schedcgroup(struct task_struct *p) {
     return match_prefix(DOCKER_CGROUP_PREFIX, cgrp_path, MAX_PATH);
 }
 
-static SchedGroupChrs_t *__noinline get_cgroup_chrs_for_p(struct task_struct *p) {
+static __noinline SchedGroupChrs_t * get_cgroup_chrs_for_p(struct task_struct *p) {
 
     char *cg_name = get_schedcgroup_name(p);
     if (cg_name == NULL) {
@@ -363,6 +363,19 @@ out_no_chrs:
     info("[warn][cgroup_chrs] no cgroup_chrs found for task %d - %s cgname: %s", p->pid, p->comm,
          cg_name);
     return NULL;
+}
+
+
+static __noinline u64 task_cgroup_exec_time(struct task_struct *p) {
+  CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
+  if (!cgrp_chrs) {
+    return 0;
+  }
+
+  info("[task_stats][%s:%d] p->cgroup->workerdur %llu ", p->comm, p->pid,
+       cgrp_chrs->workerdur);
+
+  return cgrp_chrs->workerdur;
 }
 
 static cgroup_ctx_t *__noinline get_cgroup_ctx_for_p(struct task_struct *p) {
@@ -568,7 +581,12 @@ static __noinline void task_stats_stop_running(struct task_struct *p) {
 
             // prioritize tasks that consume less cpu time
             // and sleep often
-            tctx->vtime += cpu_time / sleep_freq_avg;
+            // tctx->vtime += cpu_time / sleep_freq_avg;
+
+            // prioritize tasks of shorter functions 
+            u64 func_exec_time = task_cgroup_exec_time( p );
+            tctx->vtime += cpu_time * (func_exec_time+1);
+
 
             // every nth enqueue reset to current time to
             // preserve fairness
