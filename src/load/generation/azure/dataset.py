@@ -1,7 +1,7 @@
 import os
 import os.path
-import pandas as pd
 import numpy as np
+import pandas as pd
 from math import ceil
 import argparse
 import multiprocessing as mp
@@ -113,7 +113,8 @@ def join_day_one(
         invocations.index = invocations["HashFunction"]
         sums = invocations[buckets].sum(axis=1)
         invocations["total_invocations"] = sums
-        invocations = invocations[sums > 1]  # action must be invoked at least twice
+        # action must be invoked at least twice
+        invocations = invocations[sums > 1]
         invocations = invocations.drop_duplicates("HashFunction")
 
         if iats:
@@ -121,7 +122,8 @@ def join_day_one(
         if ecfds:
             invocations = insert_ecdfs(invocations, debug)
 
-        joined = invocations.join(durations, how="inner", lsuffix="", rsuffix="_durs")
+        joined = invocations.join(
+            durations, how="inner", lsuffix="", rsuffix="_durs")
 
         file = os.path.join(datapath, mem_fnames_file)
         memory = pd.read_csv(file)
@@ -239,7 +241,8 @@ def real_trace_row(func_name, row, min_start=0, min_end=1440):
             trace.append((func_name, start + start_ms))
         else:
             every = (secs_p_min * milis_p_sec) / invocs
-            trace += [(func_name, int(start + i * every)) for i in range(invocs)]
+            trace += [(func_name, int(start + i * every))
+                      for i in range(invocs)]
 
     return trace, (func_name, cold_dur, warm_dur, mem, float(row["IAT_mean"]))
 
@@ -327,7 +330,8 @@ if __name__ == "__main__":
         action="store_true",
         help="Overwrite an existing trace that has the same number of functions",
     )
-    argparser.add_argument("--debug", action="store_true", help="Enable debug printing")
+    argparser.add_argument("--debug", action="store_true",
+                           help="Enable debug printing")
     args = argparser.parse_args()
     store = args.out_folder
 
