@@ -248,3 +248,57 @@ mod fineloadbalancing_chlb_rebalance_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod fineloadbalancing_guardrails_tests {
+    use super::*;
+
+    #[iluvatar_library::sim_test]
+    async fn pick_from_system_domains_test() {
+        let lbpolicy = &"guardrails".to_string();
+        let durs = vec![0.001, 0.001, 10.0, 0.001];
+
+        let expected_domains = vec![0, 0, 0, 1];
+
+        let (_log, _cfg, _cm, _invoker, reg, cmap, _gpu) = build_test_services(None, None, None).await;
+
+        let scheduling_group = SchedGroup {
+            cores: vec![1],
+            ..Default::default()
+        };
+        let mut config = FineLoadBalancingConfig::default();
+        config.dispatchpolicy = lbpolicy.clone();
+        config.testing = 1;
+        config.preallocated_groups.groups = vec![
+            scheduling_group.clone(),
+            scheduling_group.clone(),
+            scheduling_group.clone(),
+        ];
+        config.guardrails_log_base_c = 2;
+        config.guardrails_tightness = 1;
+
+        let loadbalancing = FineLoadBalancing::build_arc(Arc::new(config), cmap.clone());
+
+        let mut func_regs: Vec<Arc<RegisteredFunction>> = vec![];
+        for dur in durs.iter() {
+            let func_reg = reg
+                .register(cpu_reg(), &TEST_TID)
+                .await
+                .unwrap_or_else(|e| panic!("Registration failed: {}", e));
+            cmap.update(&func_reg.fqdn, Chars::CpuWarmTime, *dur);
+            func_regs.insert(func_regs.len(), func_reg.clone());
+        }
+
+        for (func_reg, expected_domain_id) in func_regs.iter().zip(expected_domains) {
+            let domain_id = loadbalancing
+                .lbpolicy
+                .assign_domain_to_function_request(&TEST_TID, func_reg.clone())
+                .unwrap();
+            loadbalancing.stats.tid_map.insert(TEST_TID.to_string(), domain_id);
+            loadbalancing.lbpolicy.release_domain(&TEST_TID, func_reg.clone());
+            loadbalancing.stats.tid_map.remove(&TEST_TID);
+
+            assert_eq!(domain_id, expected_domain_id);
+        }
+    }
+}

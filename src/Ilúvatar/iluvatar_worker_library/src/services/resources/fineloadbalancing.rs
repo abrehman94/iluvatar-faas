@@ -52,6 +52,7 @@ pub struct FineLoadBalancingStruct {
     pub cmap: WorkerCharMap,
 
     pub preallocated_domains: Arc<PreAllocatedGroups>,
+    pub system_domains: ArcVec<Domain>,
     pub stats: FineLoadBalancingStats,
     pub lbpolicy: LoadBalancingPolicy,
 
@@ -85,35 +86,48 @@ impl BuildFineLoadBalancing for FineLoadBalancing {
             load_bpf_scheduler_async(config.bpf_verbose);
         }
 
+        let domains_config = &config.preallocated_groups.groups;
+        let domain_count = domains_config.len();
+        let system_domains = ArcVec::<Domain>::new();
+        for domain_id in 0..domain_count {
+            let assigned_cores = domains_config[domain_id].cores.len() as u32;
+            let domain = Domain::new(domain_id, assigned_cores);
+            system_domains.push(domain);
+        }
+
         Arc::new_cyclic(move |fineloadbalancing_weak| {
             let lbpolicy_name = config.dispatchpolicy.to_lowercase();
             let lbpolicy: Option<LoadBalancingPolicy> = match lbpolicy_name.as_str() {
-                "guardrails" => Some(Box::new(Guardrails::new(
+                "guardrails" => Some(Box::new(GuardrailsPickOnSystemDomains::new(
                     fineloadbalancing_weak.clone(),
                     config.clone(),
                 ))),
                 "consistent_hashing" => Some(Box::new(ConsistentHashing::new(
                     fineloadbalancing_weak.clone(),
-                    config.clone(),
+                    system_domains.clone(),
                 ))),
                 "consistent_hashing_guardrailspick" => Some(Box::new(ConsistentHashingGuardrailsPick::new(
                     fineloadbalancing_weak.clone(),
                     config.clone(),
+                    system_domains.clone(),
                 ))),
                 "consistent_hashing_iatrebalance" => Some(Box::new(ConsistentHashingIATRebalance::new(
                     fineloadbalancing_weak.clone(),
-                    config.clone(),
+                    system_domains.clone(),
                 ))),
                 "consistent_hashing_cpuutilrebalance" => Some(Box::new(ConsistentHashingCPUUtilizationRebalance::new(
                     fineloadbalancing_weak.clone(),
-                    config.clone(),
+                    system_domains.clone(),
                 ))),
-                "consistent_hashing_iatcpuutilrebalance" => Some(Box::new(
-                    ConsistentHashingIATCPUUtilizationRebalance::new(fineloadbalancing_weak.clone(), config.clone()),
-                )),
+                "consistent_hashing_iatcpuutilrebalance" => {
+                    Some(Box::new(ConsistentHashingIATCPUUtilizationRebalance::new(
+                        fineloadbalancing_weak.clone(),
+                        system_domains.clone(),
+                    )))
+                },
                 "consistent_hashing_iatenergyrebalance" => Some(Box::new(ConsistentHashingIATEnergyRebalance::new(
                     fineloadbalancing_weak.clone(),
-                    config.clone(),
+                    system_domains.clone(),
                 ))),
 
                 "domain_zero" => Some(Box::new(DomainZero::new(fineloadbalancing_weak.clone()))),
@@ -126,6 +140,7 @@ impl BuildFineLoadBalancing for FineLoadBalancing {
                 cmap,
 
                 preallocated_domains,
+                system_domains,
                 stats: Default::default(),
                 lbpolicy,
 
@@ -188,22 +203,16 @@ pub struct Guardrails {
     tightness: u32,  // g
     log_base_c: u32, // c, execution time cutoff in ms > 2
 
-    sys_domain_set: Vec<SchedGroupID>,
     rank_stats_map: ArcMap<GRRankID, GRRankStats>,
 }
 
 impl Guardrails {
     pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
-        let domains_config = &config.preallocated_groups.groups;
-        let domain_count = domains_config.len();
-        let sys_domain_set: Vec<SchedGroupID> = (0..domain_count).map(|domain_id| domain_id as SchedGroupID).collect();
-
         Guardrails {
             fineloadbalancing,
 
             tightness: config.guardrails_tightness,
             log_base_c: config.guardrails_log_base_c,
-            sys_domain_set,
             rank_stats_map: ArcMap::new(),
         }
     }
@@ -330,9 +339,11 @@ impl LoadBalancingPolicyTrait for Guardrails {
     ) -> Option<SchedGroupID> {
         let fqdn = reg.fqdn.as_str();
         let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
+        let system_domains = fineloadbalancing.system_domains.immutable_clone();
+        let domain_set: Vec<SchedGroupID> = system_domains.iter().map(|domain| domain.schedgroup_id()).collect();
 
         let execution_dur_ms = (fineloadbalancing.cmap.get(fqdn, Chars::CpuExecTime, Value::Avg) * 1000.0) as u32;
-        let domain_id = self.guardrails_pick(execution_dur_ms, &self.sys_domain_set);
+        let domain_id = self.guardrails_pick(execution_dur_ms, &domain_set);
 
         debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, "[finesched][guardrails] picked domain");
 
@@ -349,69 +360,6 @@ impl LoadBalancingPolicyTrait for Guardrails {
 }
 
 // Consistent hashing
-//
-// Pseudo code
-//
-// domain:
-//      assigned_cores
-//      used_cores
-//      assigned_to_funcs[]
-//
-// can_serve_and_acquire_empty_or_assigned( domain, func_name, cpus ): // empty or assigned
-//      if domain.assigned_to_funcs.len() == 0:
-//          domain.assigned_to_funcs.append( func_name )
-//          domain.used_cores += cpus
-//          return true
-//
-//      for assigned_to_func in assigned_to_funcs:
-//          if func_name == assigned_to_func:
-//              if domain.used_cores += cpus <= domain.assigned_cores:
-//                  return true
-//              domain.used_cores -= cpus
-//      return false
-//
-// can_serve_and_acquire_append( domain, func_name, cpus ): // append
-//      if domain.used_cores += cpus <= domain.assigned_cores:
-//          domain.assigned_to_funcs.append( func_name )
-//          return true
-//      return false
-//
-// return_cpus_and_release( domain, func_name, cpus):
-//      domain.used_cores -= cpus
-//      if domain.used_cores == 0:
-//          domain.assigned_to_funcs.drain()
-//
-// pick_next_domain( starting_id, func_name, cpus ):
-//
-//      for domain in starting_id..end:
-//          if can_serve_and_acquire_empty_or_assigned(domain, func_name, cpus):
-//              return domain.id
-//
-//      domain = least_loaded( domains )
-//      if can_serve_and_acquire_append( domain, func_name, cpus ):
-//          return domain.id
-//
-//      return starting_id
-//
-// assign_domain_to_request( f_r ):
-//      preferred_domains = domains_map[f_r.name]
-//      for domain in preferred_domains:
-//          if can_serve_and_acquire_empty_or_assigned(domain, f_r.cpus):
-//              return domain.id
-//
-//      if empty(preferred_domains):
-//          domain = pick_next_domain( 0, f_r.name, f_r.cpus )
-//      else:
-//          domain = pick_next_domain( preferred_domains[0], f_r.name, f_r.cpus )
-//
-//      preferred_domains.append( domain )
-//      return domain.id
-//
-// request_is_complete( f_r ):
-//      domain = assigned_domains_map[f_r.id]
-//      return_cpus_and_release(domain, f_r.name, f_r.cpus)
-//
-
 pub type DomainId = usize;
 
 #[derive(Debug)]
@@ -458,6 +406,10 @@ impl DomainStruct {
 
     pub fn domain_id(&self) -> DomainId {
         self.id as DomainId
+    }
+
+    pub fn available(&self) -> bool {
+        self.mut_data.lock().unwrap().used_cores < self.assigned_cores
     }
 
     pub fn used_cores(&self) -> u32 {
@@ -638,7 +590,6 @@ impl FuncDomainMapper {
 pub struct ConsistentHashing {
     fineloadbalancing: FineLoadBalancingWeak,
 
-    domains: ArcVec<Domain>,
     func_to_domain_mapper: FuncDomainMapper,
 }
 
@@ -682,71 +633,16 @@ impl SelectDomain for ConsistentHashing {
 }
 
 impl ConsistentHashing {
-    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
-        let domains = ArcVec::<Domain>::new();
-        let domains_config = &config.preallocated_groups.groups;
-        let domain_count = domains_config.len();
-        for domain_id in 0..domain_count {
-            let assigned_cores = domains_config[domain_id].cores.len() as u32;
-            let domain = Domain::new(domain_id, assigned_cores);
-            domains.push(domain);
-        }
-
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, domains: ArcVec<Domain>) -> Self {
         ConsistentHashing {
             fineloadbalancing,
 
             func_to_domain_mapper: FuncDomainMapper::new(domains.clone()),
-            domains,
         }
-    }
-
-    pub fn system_domains(&self) -> Vec<Arc<Domain>> {
-        self.domains.immutable_clone()
     }
 
     pub fn rebalance_domains(&self, rebalance_domains: RebalanceClosure) {
         self.func_to_domain_mapper.rebalance_domains(rebalance_domains)
-    }
-
-    #[allow(dead_code)]
-    fn least_loaded_domain(&self) -> Arc<Domain> {
-        let domains = self.domains.immutable_clone();
-
-        let to_used_cores_index_pair = |pair: (usize, &Arc<Domain>)| {
-            let (index, domain) = pair;
-            (domain.used_cores(), index)
-        };
-
-        let (_used_cores, domain_id) = domains.iter().enumerate().map(to_used_cores_index_pair).min().unwrap();
-
-        domains[domain_id].clone()
-    }
-
-    #[allow(dead_code)]
-    fn pick_next_domain(&self, starting_id: DomainId, func_name: &String, cpus: u32) -> Option<Arc<Domain>> {
-        let domains = self.domains.immutable_clone();
-        let total_domains = domains.len();
-        let next_domain_id = |domain_id| (domain_id + 1) % total_domains;
-        let mut domain_id = next_domain_id(starting_id);
-        while domain_id != starting_id {
-            let domain = domains[domain_id].clone();
-            if domain.can_serve_and_acquire_empty_or_assigned(func_name, cpus).is_ok() {
-                return Some(domain);
-            }
-
-            domain_id = next_domain_id(domain_id);
-        }
-
-        let domain = self.least_loaded_domain();
-        if domain.can_serve_and_acquire_append(func_name, cpus).is_ok() {
-            return Some(domain);
-        }
-
-        None
-    }
-
-    pub fn sys_domains(&self) -> Vec<Arc<Domain>> {
-        self.domains.immutable_clone()
     }
 
     pub fn pick_domain(
@@ -778,9 +674,10 @@ impl ConsistentHashing {
     }
 
     pub fn return_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
-        let stats = self.fineloadbalancing.upgrade().unwrap().stats.clone();
+        let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
+        let stats = fineloadbalancing.stats.clone();
         let domain_id = *stats.tid_map.get(tid).unwrap() as DomainId;
-        let domain = &self.domains.immutable_clone()[domain_id];
+        let domain = &fineloadbalancing.system_domains.immutable_clone()[domain_id];
         domain.return_cpus_and_release(reg.cpus);
     }
 }
@@ -812,11 +709,15 @@ pub struct ConsistentHashingGuardrailsPick {
 }
 
 impl ConsistentHashingGuardrailsPick {
-    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+    pub fn new(
+        fineloadbalancing: FineLoadBalancingWeak,
+        config: Arc<FineLoadBalancingConfig>,
+        domains: ArcVec<Domain>,
+    ) -> Self {
         Self {
             fineloadbalancing: fineloadbalancing.clone(),
 
-            consistent_hashing: ConsistentHashing::new(fineloadbalancing.clone(), config.clone()),
+            consistent_hashing: ConsistentHashing::new(fineloadbalancing.clone(), domains),
             guardrails: Guardrails::new(fineloadbalancing.clone(), config.clone()),
         }
     }
@@ -830,7 +731,7 @@ impl SelectDomain for ConsistentHashingGuardrailsPick {
         let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
 
         let domain_set: Vec<SchedGroupID> = domains.iter().map(|domain| domain.schedgroup_id()).collect();
-        let sys_domains = self.consistent_hashing.sys_domains();
+        let sys_domains = fineloadbalancing.system_domains.immutable_clone();
 
         let dur_ms = (fineloadbalancing.cmap.get(func_name, Chars::CpuExecTime, Value::Avg) * 1000.0) as u32;
         let domain_id = self.guardrails.guardrails_pick(dur_ms, &domain_set);
@@ -867,6 +768,8 @@ impl LoadBalancingPolicyTrait for ConsistentHashingGuardrailsPick {
 type CustomRebalanceValue = Arc<dyn Fn(&String) -> u32 + Sync + Send>;
 
 struct ConsistentHashingCustomRebalance {
+    fineloadbalancing: FineLoadBalancingWeak,
+
     rebalance_since_request: AtomicU32,
     rebalance_since_request_limit: AtomicU32,
 
@@ -877,23 +780,25 @@ struct ConsistentHashingCustomRebalance {
 impl ConsistentHashingCustomRebalance {
     pub fn new(
         fineloadbalancing: FineLoadBalancingWeak,
-        config: Arc<FineLoadBalancingConfig>,
+        domains: ArcVec<Domain>,
         rebalance_value: CustomRebalanceValue,
     ) -> Self {
-        let domains_config = &config.preallocated_groups.groups;
-        let domain_count = domains_config.len() as u32;
+        let domain_count = domains.immutable_clone().len() as u32;
 
         Self {
+            fineloadbalancing: fineloadbalancing.clone(),
+
             rebalance_since_request: AtomicU32::new(0),
             rebalance_since_request_limit: AtomicU32::new(2 * domain_count),
 
             rebalance_value,
-            consistent_hashing: ConsistentHashing::new(fineloadbalancing.clone(), config.clone()),
+            consistent_hashing: ConsistentHashing::new(fineloadbalancing.clone(), domains),
         }
     }
 
     fn rebalance_domains(&self) {
-        let system_domains = self.consistent_hashing.system_domains();
+        let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
+        let system_domains = fineloadbalancing.system_domains.immutable_clone();
         let total_domains = system_domains.iter().count();
 
         let custom_rebalance = |func_domains_map: ArcMap<String, ArcVec<Domain>>,
@@ -971,7 +876,7 @@ pub struct ConsistentHashingIATRebalance {
 }
 
 impl ConsistentHashingIATRebalance {
-    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, domains: ArcVec<Domain>) -> Self {
         let fineloadbalancing_weak = fineloadbalancing.clone();
         let iat_for_func = move |func: &String| -> u32 {
             let fineloadbalancing = fineloadbalancing_weak.upgrade().unwrap();
@@ -983,7 +888,7 @@ impl ConsistentHashingIATRebalance {
         Self {
             consistenthashing_customrebalance: ConsistentHashingCustomRebalance::new(
                 fineloadbalancing.clone(),
-                config.clone(),
+                domains,
                 Arc::new(iat_for_func),
             ),
         }
@@ -1016,7 +921,7 @@ pub struct ConsistentHashingCPUUtilizationRebalance {
 }
 
 impl ConsistentHashingCPUUtilizationRebalance {
-    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, domains: ArcVec<Domain>) -> Self {
         let fineloadbalancing_weak = fineloadbalancing.clone();
         let cpuutil_for_func = move |func: &String| -> u32 {
             let fineloadbalancing = fineloadbalancing_weak.upgrade().unwrap();
@@ -1028,7 +933,7 @@ impl ConsistentHashingCPUUtilizationRebalance {
         Self {
             consistenthashing_customrebalance: ConsistentHashingCustomRebalance::new(
                 fineloadbalancing.clone(),
-                config.clone(),
+                domains,
                 Arc::new(cpuutil_for_func),
             ),
         }
@@ -1061,7 +966,7 @@ pub struct ConsistentHashingIATCPUUtilizationRebalance {
 }
 
 impl ConsistentHashingIATCPUUtilizationRebalance {
-    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, domains: ArcVec<Domain>) -> Self {
         let fineloadbalancing_weak = fineloadbalancing.clone();
         let cpuutil_for_func = move |func: &String| -> u32 {
             let fineloadbalancing = fineloadbalancing_weak.upgrade().unwrap();
@@ -1076,7 +981,7 @@ impl ConsistentHashingIATCPUUtilizationRebalance {
         Self {
             consistenthashing_customrebalance: ConsistentHashingCustomRebalance::new(
                 fineloadbalancing.clone(),
-                config.clone(),
+                domains,
                 Arc::new(cpuutil_for_func),
             ),
         }
@@ -1109,7 +1014,7 @@ pub struct ConsistentHashingIATEnergyRebalance {
 }
 
 impl ConsistentHashingIATEnergyRebalance {
-    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, domains: ArcVec<Domain>) -> Self {
         let fineloadbalancing_weak = fineloadbalancing.clone();
         let iatenergy_for_func = move |func: &String| -> u32 {
             let fineloadbalancing = fineloadbalancing_weak.upgrade().unwrap();
@@ -1127,7 +1032,7 @@ impl ConsistentHashingIATEnergyRebalance {
         Self {
             consistenthashing_customrebalance: ConsistentHashingCustomRebalance::new(
                 fineloadbalancing.clone(),
-                config.clone(),
+                domains,
                 Arc::new(iatenergy_for_func),
             ),
         }
@@ -1151,6 +1056,65 @@ impl LoadBalancingPolicyTrait for ConsistentHashingIATEnergyRebalance {
 
     fn release_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
         self.consistenthashing_customrebalance.release_domain(tid, reg.clone());
+    }
+}
+
+// Guardrails pick on system domains
+pub struct GuardrailsPickOnSystemDomains {
+    fineloadbalancing: FineLoadBalancingWeak,
+
+    guardrails: Guardrails,
+}
+
+impl GuardrailsPickOnSystemDomains {
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+        Self {
+            fineloadbalancing: fineloadbalancing.clone(),
+
+            guardrails: Guardrails::new(fineloadbalancing.clone(), config.clone()),
+        }
+    }
+}
+
+impl LoadBalancingPolicyTrait for GuardrailsPickOnSystemDomains {
+    fn assign_domain_to_function_request(
+        &self,
+        _tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
+        let func_name = &reg.fqdn;
+        let requested_cores = reg.cpus;
+        let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
+        let system_domains = fineloadbalancing.system_domains.immutable_clone();
+        let any_domain_available = |domains: &Vec<Arc<Domain>>| domains.iter().any(|domain| domain.available());
+
+        let domain_set: Vec<SchedGroupID> = system_domains.iter().map(|domain| domain.schedgroup_id()).collect();
+
+        let dur_ms = (fineloadbalancing.cmap.get(func_name, Chars::CpuWarmTime, Value::Avg) * 1000.0) as u32;
+
+        while any_domain_available(&system_domains) {
+            let domain_id = self.guardrails.guardrails_pick(dur_ms, &domain_set);
+            let domain = &system_domains[domain_id as usize];
+            if domain.can_serve_and_acquire_append(func_name, requested_cores).is_ok() {
+                return Some(domain_id);
+            }
+        }
+
+        None
+    }
+
+    fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.release_domain(tid, reg);
+    }
+
+    fn release_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
+        let stats = fineloadbalancing.stats.clone();
+        let domain_id = *stats.tid_map.get(tid).unwrap() as DomainId;
+        let domain = &fineloadbalancing.system_domains.immutable_clone()[domain_id];
+        domain.return_cpus_and_release(reg.cpus);
+
+        self.guardrails.return_domain(tid, reg.clone());
     }
 }
 
