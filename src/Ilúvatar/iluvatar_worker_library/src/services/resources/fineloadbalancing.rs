@@ -101,6 +101,32 @@ impl BuildFineLoadBalancing for FineLoadBalancing {
                 "guardrails" => Some(Box::new(GuardrailsPickOnSystemDomains::new(
                     fineloadbalancing_weak.clone(),
                     config.clone(),
+                    GuardrailsPickOnSystemDomainsValueType::DURATION,
+                ))),
+                "guardrails_iat" => Some(Box::new(GuardrailsPickOnSystemDomains::new(
+                    fineloadbalancing_weak.clone(),
+                    config.clone(),
+                    GuardrailsPickOnSystemDomainsValueType::IAT,
+                ))),
+                "guardrails_cpuutil" => Some(Box::new(GuardrailsPickOnSystemDomains::new(
+                    fineloadbalancing_weak.clone(),
+                    config.clone(),
+                    GuardrailsPickOnSystemDomainsValueType::CPUTIL,
+                ))),
+                "guardrails_energy" => Some(Box::new(GuardrailsPickOnSystemDomains::new(
+                    fineloadbalancing_weak.clone(),
+                    config.clone(),
+                    GuardrailsPickOnSystemDomainsValueType::ENERGY,
+                ))),
+                "guardrails_iatenergy" => Some(Box::new(GuardrailsPickOnSystemDomains::new(
+                    fineloadbalancing_weak.clone(),
+                    config.clone(),
+                    GuardrailsPickOnSystemDomainsValueType::IATENERGY,
+                ))),
+                "guardrails_iatcpuutil" => Some(Box::new(GuardrailsPickOnSystemDomains::new(
+                    fineloadbalancing_weak.clone(),
+                    config.clone(),
+                    GuardrailsPickOnSystemDomainsValueType::IATCPUUTIL,
                 ))),
                 "consistent_hashing" => Some(Box::new(ConsistentHashing::new(
                     fineloadbalancing_weak.clone(),
@@ -1060,18 +1086,71 @@ impl LoadBalancingPolicyTrait for ConsistentHashingIATEnergyRebalance {
 }
 
 // Guardrails pick on system domains
+pub enum GuardrailsPickOnSystemDomainsValueType {
+    DURATION,
+    IAT,
+    CPUTIL,
+    ENERGY,
+    IATENERGY,
+    IATCPUUTIL,
+}
+
 pub struct GuardrailsPickOnSystemDomains {
     fineloadbalancing: FineLoadBalancingWeak,
 
+    value_type: GuardrailsPickOnSystemDomainsValueType,
     guardrails: Guardrails,
 }
 
 impl GuardrailsPickOnSystemDomains {
-    pub fn new(fineloadbalancing: FineLoadBalancingWeak, config: Arc<FineLoadBalancingConfig>) -> Self {
+    pub fn new(
+        fineloadbalancing: FineLoadBalancingWeak,
+        config: Arc<FineLoadBalancingConfig>,
+        value_type: GuardrailsPickOnSystemDomainsValueType,
+    ) -> Self {
         Self {
             fineloadbalancing: fineloadbalancing.clone(),
 
+            value_type,
             guardrails: Guardrails::new(fineloadbalancing.clone(), config.clone()),
+        }
+    }
+
+    fn value(&self, func_name: &String) -> u32 {
+        let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
+        let cmap = fineloadbalancing.cmap.clone();
+
+        match self.value_type {
+            GuardrailsPickOnSystemDomainsValueType::DURATION => {
+                (cmap.get(func_name, Chars::CpuWarmTime, Value::Avg) * 1000.0) as u32
+            },
+            GuardrailsPickOnSystemDomainsValueType::IAT => {
+                (cmap.get(func_name, Chars::IAT, Value::Avg) * 1000.0) as u32
+            },
+            GuardrailsPickOnSystemDomainsValueType::CPUTIL => {
+                (cmap.get(func_name, Chars::CPUtil, Value::Avg) * 1000.0) as u32
+            },
+            GuardrailsPickOnSystemDomainsValueType::ENERGY => {
+                let dur = cmap.get(func_name, Chars::CpuWarmTime, Value::Avg) * 1000.0;
+                let cpu_util = cmap.get(func_name, Chars::CPUtil, Value::Avg);
+
+                (cpu_util * dur) as u32
+            },
+            GuardrailsPickOnSystemDomainsValueType::IATENERGY => {
+                let iat = cmap.get(func_name, Chars::IAT, Value::Avg) * 1000.0;
+                let dur = cmap.get(func_name, Chars::CpuWarmTime, Value::Avg) * 1000.0;
+                let cpu_util = cmap.get(func_name, Chars::CPUtil, Value::Avg);
+
+                let energy = cpu_util * dur;
+
+                (iat + energy) as u32
+            },
+            GuardrailsPickOnSystemDomainsValueType::IATCPUUTIL => {
+                let iat = cmap.get(func_name, Chars::IAT, Value::Avg) * 1000.0;
+                let cpu_util = cmap.get(func_name, Chars::CPUtil, Value::Avg);
+
+                ((iat + 1000.0) / cpu_util) as u32
+            },
         }
     }
 }
@@ -1079,7 +1158,7 @@ impl GuardrailsPickOnSystemDomains {
 impl LoadBalancingPolicyTrait for GuardrailsPickOnSystemDomains {
     fn assign_domain_to_function_request(
         &self,
-        _tid: &TransactionId,
+        tid: &TransactionId,
         reg: Arc<RegisteredFunction>,
     ) -> Option<SchedGroupID> {
         let func_name = &reg.fqdn;
@@ -1090,12 +1169,13 @@ impl LoadBalancingPolicyTrait for GuardrailsPickOnSystemDomains {
 
         let domain_set: Vec<SchedGroupID> = system_domains.iter().map(|domain| domain.schedgroup_id()).collect();
 
-        let dur_ms = (fineloadbalancing.cmap.get(func_name, Chars::CpuWarmTime, Value::Avg) * 1000.0) as u32;
+        let value = self.value(func_name);
 
         while any_domain_available(&system_domains) {
-            let domain_id = self.guardrails.guardrails_pick(dur_ms, &domain_set);
+            let domain_id = self.guardrails.guardrails_pick(value, &domain_set);
             let domain = &system_domains[domain_id as usize];
             if domain.can_serve_and_acquire_append(func_name, requested_cores).is_ok() {
+                debug!( tid=%tid, lbpolicy=%"guardrails_onsystemdomains", fqdn=%func_name, value=%value, domain_assigned=%dump_domain(&domain.as_ref()), "[finesched] assign_domain_to_function_request");
                 return Some(domain_id);
             }
         }
