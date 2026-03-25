@@ -431,12 +431,10 @@ void BPF_STRUCT_OPS(finesched_dispatch, s32 cpu, struct task_struct *prev) {
 
     dsq_id = cpu_to_domain_highpriority_dsqid(cpu);
     tasks_leftover = tasks_leftover - move_from_custom_queue_to_local_dsq(dsq_id, tasks_leftover);
-
-    tasks_leftover = tasks_leftover - move_from_per_cpu_custom_to_local_dsq(cpu, tasks_leftover);
-
     tasks_leftover = tasks_leftover - worksteal_from_neighbors_domain_queue(
                                           /*from_highpriority_queue=*/true, cpu, tasks_leftover);
 
+    move_from_per_cpu_custom_to_local_dsq(cpu, 1);
     move_from_custom_queue_to_local_dsq(DSQ_GLOBAL_Q_ID, 1);
 }
 
