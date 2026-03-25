@@ -253,13 +253,7 @@ mod fineloadbalancing_chlb_rebalance_tests {
 mod fineloadbalancing_guardrails_tests {
     use super::*;
 
-    #[iluvatar_library::sim_test]
-    async fn pick_from_system_domains_test() {
-        let lbpolicy = &"guardrails".to_string();
-        let durs = vec![0.001, 0.001, 10.0, 0.001];
-
-        let expected_domains = vec![0, 0, 0, 1];
-
+    async fn test_domains(lbpolicy: &String, durs: Vec<f64>, expected_domains: Vec<SchedGroupID>) {
         let (_log, _cfg, _cm, _invoker, reg, cmap, _gpu) = build_test_services(None, None, None).await;
 
         let scheduling_group = SchedGroup {
@@ -300,5 +294,23 @@ mod fineloadbalancing_guardrails_tests {
 
             assert_eq!(domain_id, expected_domain_id);
         }
+    }
+
+    #[iluvatar_library::sim_test]
+    async fn pick_from_system_domains_test() {
+        let lbpolicy = &"guardrails".to_string();
+        let durs = vec![0.001, 0.001, 10.0, 0.001];
+        let expected_domains = vec![0, 0, 0, 1];
+
+        test_domains(lbpolicy, durs, expected_domains).await;
+    }
+
+    #[iluvatar_library::sim_test]
+    async fn pick_from_system_domains_nocpubound_test() {
+        let lbpolicy = &"guardrailsnocpubound".to_string();
+        let durs = vec![0.001, 0.001, 10.0, 0.001];
+        let expected_domains = vec![0, 0, 0, 1];
+
+        test_domains(lbpolicy, durs, expected_domains).await;
     }
 }

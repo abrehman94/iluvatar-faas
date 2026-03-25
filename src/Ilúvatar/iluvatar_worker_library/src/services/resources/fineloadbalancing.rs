@@ -98,6 +98,10 @@ impl BuildFineLoadBalancing for FineLoadBalancing {
         Arc::new_cyclic(move |fineloadbalancing_weak| {
             let lbpolicy_name = config.dispatchpolicy.to_lowercase();
             let lbpolicy: Option<LoadBalancingPolicy> = match lbpolicy_name.as_str() {
+                "guardrailsnocpubound" => Some(Box::new(Guardrails::new(
+                    fineloadbalancing_weak.clone(),
+                    config.clone(),
+                ))),
                 "guardrails" => Some(Box::new(GuardrailsPickOnSystemDomains::new(
                     fineloadbalancing_weak.clone(),
                     config.clone(),
@@ -368,7 +372,7 @@ impl LoadBalancingPolicyTrait for Guardrails {
         let system_domains = fineloadbalancing.system_domains.immutable_clone();
         let domain_set: Vec<SchedGroupID> = system_domains.iter().map(|domain| domain.schedgroup_id()).collect();
 
-        let execution_dur_ms = (fineloadbalancing.cmap.get(fqdn, Chars::CpuExecTime, Value::Avg) * 1000.0) as u32;
+        let execution_dur_ms = (fineloadbalancing.cmap.get(fqdn, Chars::CpuWarmTime, Value::Avg) * 1000.0) as u32;
         let domain_id = self.guardrails_pick(execution_dur_ms, &domain_set);
 
         debug!( tid=%tid, fqdn=%fqdn, domain_id=%domain_id, "[finesched][guardrails] picked domain");
