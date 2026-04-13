@@ -63,7 +63,7 @@ enum consts {
 
     RESERVED_GID_SWITCH_BACK = 101,
 
-    DEFAULT_TS = (20 * NSEC_PER_MSEC),
+    DEFAULT_TS = (1 * NSEC_PER_MSEC),
     MIN_TS = (1 * NSEC_PER_MSEC),
 
     TASK_LIFETIME_THRESHOLD = 50, // tasks older then 50*10ms -> 500ms are too

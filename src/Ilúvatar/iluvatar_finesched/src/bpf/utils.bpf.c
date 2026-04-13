@@ -367,9 +367,11 @@ out_no_chrs:
 
 
 static __noinline u64 task_cgroup_exec_time_weight(struct task_struct *p) {
+  u64 weight_upper_bound = 500000000; // delay in ns 
+
   CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
   if (!cgrp_chrs) {
-    return 100;
+    return weight_upper_bound;
   }
 
   info("[task_stats][%s:%d] p->cgroup->workerdur %llu ", p->comm, p->pid,
@@ -379,7 +381,19 @@ static __noinline u64 task_cgroup_exec_time_weight(struct task_struct *p) {
   u64 upper_threshold_ms = 5000; 
   func_exec_time_ms = MIN( func_exec_time_ms, upper_threshold_ms );
   
-  return (func_exec_time_ms*100)/upper_threshold_ms + 1;
+  return (func_exec_time_ms*weight_upper_bound)/upper_threshold_ms + 1;
+}
+
+static __noinline u64 task_cgroup_exec_time(struct task_struct *p) {
+  CgroupChrs_t *cgrp_chrs = get_cgroup_chrs_for_p(p);
+  if (!cgrp_chrs) {
+    return 1;
+  }
+
+  info("[task_stats][%s:%d] p->cgroup->workerdur %llu ", p->comm, p->pid,
+       cgrp_chrs->workerdur);
+  
+  return cgrp_chrs->workerdur + 1;
 }
 
 static cgroup_ctx_t *__noinline get_cgroup_ctx_for_p(struct task_struct *p) {
@@ -585,11 +599,11 @@ static __noinline void task_stats_stop_running(struct task_struct *p) {
 
             // prioritize tasks that consume less cpu time
             // and sleep often
-            // tctx->vtime += cpu_time / sleep_freq_avg;
+            tctx->vtime += cpu_time / sleep_freq_avg;
 
             // prioritize tasks of shorter functions 
-            u64 func_exec_time_weight = task_cgroup_exec_time_weight( p );
-            tctx->vtime += cpu_time * func_exec_time_weight; 
+            // u64 func_exec_time = task_cgroup_exec_time( p );
+            // tctx->vtime += cpu_time * func_exec_time; 
 
 
             // every nth enqueue reset to current time to
