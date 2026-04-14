@@ -132,9 +132,14 @@ impl BuildFineLoadBalancing for FineLoadBalancing {
                     config.clone(),
                     GuardrailsPickOnSystemDomainsValueType::IATCPUUTIL,
                 ))),
+                "iat_consistent_hashing" => Some(Box::new(IATConsistentHashing::new(
+                    fineloadbalancing_weak.clone(),
+                    config.clone(),
+                    system_domains.clone(),
+                ))),
                 "consistent_hashing" => Some(Box::new(ConsistentHashing::new(
                     fineloadbalancing_weak.clone(),
-                    system_domains.clone(),
+                    FuncDomainMapper::new(system_domains.clone()),
                 ))),
                 "consistent_hashing_guardrailspick" => Some(Box::new(ConsistentHashingGuardrailsPick::new(
                     fineloadbalancing_weak.clone(),
@@ -523,6 +528,19 @@ fn dump_domain(domain: &Domain) -> String {
     dump
 }
 
+pub trait DomainMapperTrait {
+    fn get(&self, reg: Arc<RegisteredFunction>) -> Vec<Arc<Domain>>;
+    fn expand_preferred_set(&self, reg: Arc<RegisteredFunction>) -> Vec<Arc<Domain>>;
+    fn rebalance_domains(&self, rebalance_logic: RebalanceClosure);
+}
+
+type DomainMapper = Arc<dyn DomainMapperTrait + Sync + Send>;
+
+type RebalanceClosure<'a> = &'a (dyn Fn(
+    ArcMap<String, ArcVec<Domain>>,
+    ArcMap<DomainId, ArcVec<String>>,
+) -> (ArcMap<String, ArcVec<Domain>>, ArcMap<DomainId, ArcVec<String>>));
+
 struct FuncDomainMapper {
     domains: ArcVec<Domain>,
 
@@ -530,48 +548,14 @@ struct FuncDomainMapper {
     domains_func_map: ArcMap<DomainId, ArcVec<String>>,
 }
 
-type RebalanceClosure<'a> = &'a (dyn Fn(
-    ArcMap<String, ArcVec<Domain>>,
-    ArcMap<DomainId, ArcVec<String>>,
-) -> (ArcMap<String, ArcVec<Domain>>, ArcMap<DomainId, ArcVec<String>>));
-
 impl FuncDomainMapper {
-    pub fn new(domains: ArcVec<Domain>) -> Self {
-        Self {
+    pub fn new(domains: ArcVec<Domain>) -> DomainMapper {
+        Arc::new(Self {
             domains,
 
             func_domains_map: ArcMap::new(),
             domains_func_map: ArcMap::new(),
-        }
-    }
-
-    pub fn get(&self, func_name: &String) -> Vec<Arc<Domain>> {
-        if self.func_domains_map.get(func_name).is_some() {
-            return self.func_domains_map.get(func_name).unwrap().immutable_clone();
-        }
-
-        self.expand_preferred_set(func_name)
-    }
-
-    pub fn expand_preferred_set(&self, func_name: &String) -> Vec<Arc<Domain>> {
-        let domain_set: Arc<ArcVec<Domain>> = self.func_domains_map.get_or_create(func_name);
-        let domain_id = domain_set
-            .immutable_clone()
-            .iter()
-            .map(|domain| domain.domain_id())
-            .last()
-            .unwrap_or(0);
-
-        let domain_set_clone = domain_set.immutable_clone();
-        if domain_set_clone.len() < self.domains.immutable_clone().len() {
-            let domain = self.pick_next_domain(domain_id, domain_set_clone);
-            self.domains_func_map
-                .get_or_create(&domain.domain_id())
-                .push(func_name.clone());
-            domain_set.push_arc(domain);
-        }
-
-        domain_set.immutable_clone()
+        })
     }
 
     fn pick_next_domain(&self, starting_id: DomainId, excluding_set: Vec<Arc<Domain>>) -> Arc<Domain> {
@@ -600,8 +584,41 @@ impl FuncDomainMapper {
             domain_id = next_domain_id(domain_id);
         }
     }
+}
 
-    pub fn rebalance_domains(&self, rebalance_logic: RebalanceClosure) {
+impl DomainMapperTrait for FuncDomainMapper {
+    fn get(&self, reg: Arc<RegisteredFunction>) -> Vec<Arc<Domain>> {
+        let func_name = &reg.fqdn;
+        if self.func_domains_map.get(func_name).is_some() {
+            return self.func_domains_map.get(func_name).unwrap().immutable_clone();
+        }
+
+        self.expand_preferred_set(reg)
+    }
+
+    fn expand_preferred_set(&self, reg: Arc<RegisteredFunction>) -> Vec<Arc<Domain>> {
+        let func_name = &reg.fqdn;
+        let domain_set: Arc<ArcVec<Domain>> = self.func_domains_map.get_or_create(func_name);
+        let domain_id = domain_set
+            .immutable_clone()
+            .iter()
+            .map(|domain| domain.domain_id())
+            .last()
+            .unwrap_or(0);
+
+        let domain_set_clone = domain_set.immutable_clone();
+        if domain_set_clone.len() < self.domains.immutable_clone().len() {
+            let domain = self.pick_next_domain(domain_id, domain_set_clone);
+            self.domains_func_map
+                .get_or_create(&domain.domain_id())
+                .push(func_name.clone());
+            domain_set.push_arc(domain);
+        }
+
+        domain_set.immutable_clone()
+    }
+
+    fn rebalance_domains(&self, rebalance_logic: RebalanceClosure) {
         let (func_domains_map, domains_func_map) =
             rebalance_logic(self.func_domains_map.clone(), self.domains_func_map.clone());
 
@@ -617,10 +634,106 @@ impl FuncDomainMapper {
     }
 }
 
+type BucketID = usize;
+struct IATDomainMapper {
+    fineloadbalancing: FineLoadBalancingWeak,
+    domains: ArcVec<Domain>,
+
+    bucket_size: usize,
+    bucket_domains_map: ArcMap<BucketID, ArcVec<Domain>>,
+    domains_bucket_map: ArcMap<DomainId, ArcVec<BucketID>>,
+}
+
+impl IATDomainMapper {
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, domains: ArcVec<Domain>, bucket_size: usize) -> DomainMapper {
+        Arc::new(Self {
+            fineloadbalancing,
+            domains,
+
+            bucket_size,
+            bucket_domains_map: ArcMap::new(),
+            domains_bucket_map: ArcMap::new(),
+        })
+    }
+
+    fn pick_next_domain(&self, starting_id: DomainId, excluding_set: Vec<Arc<Domain>>) -> Arc<Domain> {
+        let domains = self.domains.immutable_clone();
+
+        let total_domains = domains.len();
+        let not_in_excluding_set = |domain_id| {
+            !excluding_set
+                .iter()
+                .any(|excluded_domain| excluded_domain.domain_id() == domain_id)
+        };
+        let next_domain_id = |domain_id| (domain_id + 1) % total_domains;
+        let mut domain_id = next_domain_id(starting_id);
+        let mut shared_count = 0;
+
+        loop {
+            let assigned_to_buckets = self.domains_bucket_map.get_or_create(&domain_id);
+
+            if assigned_to_buckets.immutable_clone().len() < shared_count && not_in_excluding_set(domain_id) {
+                return domains[domain_id].clone();
+            }
+
+            if domain_id == starting_id {
+                shared_count += 1;
+            }
+            domain_id = next_domain_id(domain_id);
+        }
+    }
+
+    fn bucket(&self, func_name: &String) -> BucketID {
+        let fineloadbalancing = self.fineloadbalancing.upgrade().unwrap();
+        let iat_ms = fineloadbalancing.cmap.get(func_name, Chars::IAT, Value::Avg) * 1000.0;
+        let bucket_size = self.bucket_size as f64;
+
+        (iat_ms / bucket_size) as BucketID
+    }
+}
+
+impl DomainMapperTrait for IATDomainMapper {
+    fn get(&self, reg: Arc<RegisteredFunction>) -> Vec<Arc<Domain>> {
+        let func_name = &reg.fqdn;
+        let bucket = self.bucket(func_name);
+
+        if self.bucket_domains_map.get(&bucket).is_some() {
+            return self.bucket_domains_map.get(&bucket).unwrap().immutable_clone();
+        }
+
+        self.expand_preferred_set(reg)
+    }
+
+    fn expand_preferred_set(&self, reg: Arc<RegisteredFunction>) -> Vec<Arc<Domain>> {
+        let func_name = &reg.fqdn;
+        let bucket = self.bucket(func_name);
+        let system_domain_count = self.domains.immutable_clone().len();
+
+        let domain_set: Arc<ArcVec<Domain>> = self.bucket_domains_map.get_or_create(&bucket);
+        let domain_id = domain_set
+            .immutable_clone()
+            .iter()
+            .map(|domain| domain.domain_id())
+            .last()
+            .unwrap_or(system_domain_count - 1);
+
+        let domain_set_clone = domain_set.immutable_clone();
+        if domain_set_clone.len() < system_domain_count {
+            let domain = self.pick_next_domain(domain_id, domain_set_clone);
+            self.domains_bucket_map.get_or_create(&domain.domain_id()).push(bucket);
+            domain_set.push_arc(domain);
+        }
+
+        domain_set.immutable_clone()
+    }
+
+    fn rebalance_domains(&self, _rebalance_logic: RebalanceClosure) {}
+}
+
 pub struct ConsistentHashing {
     fineloadbalancing: FineLoadBalancingWeak,
 
-    func_to_domain_mapper: FuncDomainMapper,
+    domain_mapper: DomainMapper,
 }
 
 pub trait SelectDomain {
@@ -663,16 +776,16 @@ impl SelectDomain for ConsistentHashing {
 }
 
 impl ConsistentHashing {
-    pub fn new(fineloadbalancing: FineLoadBalancingWeak, domains: ArcVec<Domain>) -> Self {
+    pub fn new(fineloadbalancing: FineLoadBalancingWeak, domain_mapper: DomainMapper) -> Self {
         ConsistentHashing {
             fineloadbalancing,
 
-            func_to_domain_mapper: FuncDomainMapper::new(domains.clone()),
+            domain_mapper,
         }
     }
 
     pub fn rebalance_domains(&self, rebalance_domains: RebalanceClosure) {
-        self.func_to_domain_mapper.rebalance_domains(rebalance_domains)
+        self.domain_mapper.rebalance_domains(rebalance_domains)
     }
 
     pub fn pick_domain(
@@ -683,7 +796,7 @@ impl ConsistentHashing {
     ) -> Option<SchedGroupID> {
         let func_name = &reg.fqdn;
 
-        let preferred_domains = self.func_to_domain_mapper.get(func_name);
+        let preferred_domains = self.domain_mapper.get(reg.clone());
         debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, preferred_domains=%dump_domains(&preferred_domains), "[finesched] assign_domain_to_function_request");
 
         let mut domain;
@@ -693,7 +806,7 @@ impl ConsistentHashing {
             return Some(domain.unwrap().schedgroup_id());
         }
 
-        let preferred_domains = self.func_to_domain_mapper.expand_preferred_set(func_name);
+        let preferred_domains = self.domain_mapper.expand_preferred_set(reg.clone());
         domain = domains_selection.pick_domain_from_set(reg.clone(), &preferred_domains);
         if domain.is_some() {
             debug!( tid=%tid, lbpolicy=%"consistent_hashing", fqdn=%func_name, domain_assigned=%dump_domain(&domain.as_ref().unwrap()), "[finesched] assign_domain_to_function_request");
@@ -747,7 +860,10 @@ impl ConsistentHashingGuardrailsPick {
         Self {
             fineloadbalancing: fineloadbalancing.clone(),
 
-            consistent_hashing: ConsistentHashing::new(fineloadbalancing.clone(), domains),
+            consistent_hashing: ConsistentHashing::new(
+                fineloadbalancing.clone(),
+                FuncDomainMapper::new(domains.clone()),
+            ),
             guardrails: Guardrails::new(fineloadbalancing.clone(), config.clone()),
         }
     }
@@ -794,6 +910,44 @@ impl LoadBalancingPolicyTrait for ConsistentHashingGuardrailsPick {
     }
 }
 
+struct IATConsistentHashing {
+    consistent_hashing: ConsistentHashing,
+}
+
+impl IATConsistentHashing {
+    pub fn new(
+        fineloadbalancing: FineLoadBalancingWeak,
+        config: Arc<FineLoadBalancingConfig>,
+        domains: ArcVec<Domain>,
+    ) -> Self {
+        let iat_to_domain_mapper =
+            IATDomainMapper::new(fineloadbalancing.clone(), domains.clone(), config.iat_bucket_size);
+
+        Self {
+            consistent_hashing: ConsistentHashing::new(fineloadbalancing.clone(), iat_to_domain_mapper),
+        }
+    }
+}
+
+impl LoadBalancingPolicyTrait for IATConsistentHashing {
+    fn assign_domain_to_function_request(
+        &self,
+        tid: &TransactionId,
+        reg: Arc<RegisteredFunction>,
+    ) -> Option<SchedGroupID> {
+        self.consistent_hashing
+            .pick_domain(tid, reg.clone(), &self.consistent_hashing)
+    }
+
+    fn invoke_is_complete(&self, _cgroup_id: &str, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.consistent_hashing.return_domain(tid, reg.clone());
+    }
+
+    fn release_domain(&self, tid: &TransactionId, reg: Arc<RegisteredFunction>) {
+        self.consistent_hashing.return_domain(tid, reg.clone());
+    }
+}
+
 // Consistent hashing with Custom rebalance
 type CustomRebalanceValue = Arc<dyn Fn(&String) -> u32 + Sync + Send>;
 
@@ -822,7 +976,10 @@ impl ConsistentHashingCustomRebalance {
             rebalance_since_request_limit: AtomicU32::new(2 * domain_count),
 
             rebalance_value,
-            consistent_hashing: ConsistentHashing::new(fineloadbalancing.clone(), domains),
+            consistent_hashing: ConsistentHashing::new(
+                fineloadbalancing.clone(),
+                FuncDomainMapper::new(domains.clone()),
+            ),
         }
     }
 
@@ -1232,7 +1389,7 @@ mod fineloadbalancing_tests {
 mod fineloadbalancing_func_domain_mapper_tests {
     use super::*;
 
-    fn build_func_domain_mapper(domain_count: usize) -> FuncDomainMapper {
+    fn build_func_domain_mapper(domain_count: usize) -> DomainMapper {
         let domains = ArcVec::<Domain>::new();
         for domain_id in 0..domain_count {
             let assigned_cores = 1;
@@ -1248,11 +1405,19 @@ mod fineloadbalancing_func_domain_mapper_tests {
         let mapper = build_func_domain_mapper(/*domain_count=*/ 3);
 
         let funcs = vec!["f0", "f1", "f2"];
-        let funcs: Vec<String> = funcs.iter().map(|f| f.to_string()).collect();
+        let funcs: Vec<Arc<RegisteredFunction>> = funcs
+            .iter()
+            .map(|func_name| {
+                Arc::new(RegisteredFunction {
+                    fqdn: func_name.to_string(),
+                    ..Default::default()
+                })
+            })
+            .collect();
         let domains = vec![1, 2, 0];
 
         for (func, domain_id) in funcs.iter().zip(domains) {
-            let domain_set = mapper.get(func);
+            let domain_set = mapper.get(func.clone());
             assert!(domain_set.len() == 1);
             assert_eq!(domain_set[0].domain_id(), domain_id);
         }
@@ -1263,11 +1428,19 @@ mod fineloadbalancing_func_domain_mapper_tests {
         let mapper = build_func_domain_mapper(/*domain_count=*/ 3);
 
         let funcs = vec!["f0", "f1", "f2", "f3", "f4"];
-        let funcs: Vec<String> = funcs.iter().map(|f| f.to_string()).collect();
+        let funcs: Vec<Arc<RegisteredFunction>> = funcs
+            .iter()
+            .map(|func_name| {
+                Arc::new(RegisteredFunction {
+                    fqdn: func_name.to_string(),
+                    ..Default::default()
+                })
+            })
+            .collect();
         let domains = vec![1, 2, 0, 1, 2];
 
         for (func, domain_id) in funcs.iter().zip(domains) {
-            let domain_set = mapper.get(func);
+            let domain_set = mapper.get(func.clone());
 
             assert!(domain_set.len() == 1);
             assert_eq!(domain_set[0].domain_id(), domain_id);
@@ -1278,20 +1451,23 @@ mod fineloadbalancing_func_domain_mapper_tests {
     fn expand_preferred_set_single_func() {
         let mapper = build_func_domain_mapper(/*domain_count=*/ 3);
 
-        let func = "f0".to_string();
-        let domain_set = mapper.expand_preferred_set(&func);
+        let func = Arc::new(RegisteredFunction {
+            fqdn: "f0".to_string(),
+            ..Default::default()
+        });
+        let domain_set = mapper.expand_preferred_set(func.clone());
         assert!(domain_set.len() == 1);
         assert_eq!(domain_set[0].domain_id(), 1);
 
-        let domain_set = mapper.expand_preferred_set(&func);
+        let domain_set = mapper.expand_preferred_set(func.clone());
         assert!(domain_set.len() == 2);
         assert_eq!(domain_set[1].domain_id(), 2);
 
-        let domain_set = mapper.expand_preferred_set(&func);
+        let domain_set = mapper.expand_preferred_set(func.clone());
         assert!(domain_set.len() == 3);
         assert_eq!(domain_set[2].domain_id(), 0);
 
-        let domain_set = mapper.expand_preferred_set(&func);
+        let domain_set = mapper.expand_preferred_set(func.clone());
         assert!(domain_set.len() == 3);
     }
 
@@ -1299,26 +1475,35 @@ mod fineloadbalancing_func_domain_mapper_tests {
     fn expand_preferred_set_multi_func() {
         let mapper = build_func_domain_mapper(/*domain_count=*/ 3);
 
-        let func0 = "f0".to_string();
-        let domain_set = mapper.expand_preferred_set(&func0);
+        let func0 = Arc::new(RegisteredFunction {
+            fqdn: "f0".to_string(),
+            ..Default::default()
+        });
+        let domain_set = mapper.expand_preferred_set(func0.clone());
         assert!(domain_set.len() == 1);
         assert_eq!(domain_set[0].domain_id(), 1);
 
-        let func1 = "f1".to_string();
-        let domain_set = mapper.expand_preferred_set(&func1);
+        let func1 = Arc::new(RegisteredFunction {
+            fqdn: "f1".to_string(),
+            ..Default::default()
+        });
+        let domain_set = mapper.expand_preferred_set(func1.clone());
         assert!(domain_set.len() == 1);
         assert_eq!(domain_set[0].domain_id(), 2);
 
-        let domain_set = mapper.expand_preferred_set(&func1);
+        let domain_set = mapper.expand_preferred_set(func1.clone());
         assert!(domain_set.len() == 2);
         assert_eq!(domain_set[1].domain_id(), 0);
 
-        let func2 = "f2".to_string();
-        let domain_set = mapper.expand_preferred_set(&func2);
+        let func2 = Arc::new(RegisteredFunction {
+            fqdn: "f2".to_string(),
+            ..Default::default()
+        });
+        let domain_set = mapper.expand_preferred_set(func2.clone());
         assert!(domain_set.len() == 1);
         assert_eq!(domain_set[0].domain_id(), 1);
 
-        let domain_set = mapper.expand_preferred_set(&func1);
+        let domain_set = mapper.expand_preferred_set(func1.clone());
         assert!(domain_set.len() == 3);
         assert_eq!(domain_set[2].domain_id(), 1);
     }

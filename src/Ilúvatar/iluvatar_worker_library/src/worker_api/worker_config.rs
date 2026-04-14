@@ -228,6 +228,9 @@ pub struct FineLoadBalancingConfig {
     /// Guardrails log_base_c [2..].
     pub guardrails_log_base_c: u32,
 
+    #[serde(default)]
+    pub iat_bucket_size: usize,
+
     /// verbose logs from bpf skeleton load
     pub bpf_verbose: u8,
 
