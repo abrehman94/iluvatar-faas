@@ -5,6 +5,7 @@ char DOCKER_CGROUP_PREFIX[MAX_PATH] = "docker/";
 
 ////////////////////////////
 // Custom Kfuncs Declarations
+u64 scx_bpf_task_ip(struct task_struct *p) __ksym;
 void scx_bpf_switch_to_scx(struct task_struct *p) __ksym;
 void scx_bpf_switch_to_normal(struct task_struct *p) __ksym;
 u32 bpf_cpumask_first_and(const struct cpumask *src1, const struct cpumask *src2) __ksym;
@@ -535,6 +536,34 @@ static __noinline void task_stats_task_roundtrip_since_last_wakeup(struct task_s
     }
 }
 
+static __noinline u64 task_stats_task_ip_variance(struct task_struct *p) {
+    if (!p) {
+        return 0;
+    }
+
+    struct task_context *tctx = try_lookup_task_ctx(p);
+    if (!tctx) {
+        return 0;
+    }
+
+    u64 task_ip = scx_bpf_task_ip(p);
+    u64 sample_count = tctx->ip_sample_count + 1;
+
+    u64 mean_prev = tctx->ip_mean;
+    u64 mean = ((tctx->ip_mean*tctx->ip_sample_count)+task_ip) / sample_count;
+    
+    u64 squares_update = (s64)(((s64)task_ip - (s64)mean)*((s64)task_ip - (s64)mean_prev));
+    u64 variance = ((tctx->ip_variance*tctx->ip_sample_count)+squares_update) / sample_count;
+
+    tctx->ip_mean = mean;
+    tctx->ip_variance = variance;
+    tctx->ip_sample_count = sample_count > 1 ? 1 : sample_count;
+
+    info("[task_stats][%s:%d] eip(0x%llx) mean(0x%llx) variance(0x%llx) sample_count(0x%llx)", p->comm, p->pid, task_ip, mean, variance, sample_count);
+
+    return variance;
+}
+
 static __noinline void task_stats_task_wokenup(struct task_struct *p) {
     if (!p) {
         return;
@@ -599,7 +628,7 @@ static __noinline void task_stats_stop_running(struct task_struct *p) {
 
             // prioritize tasks that consume less cpu time
             // and sleep often
-            tctx->vtime += cpu_time / sleep_freq_avg;
+            tctx->vtime += (cpu_time*tctx->busypolling_factor) / sleep_freq_avg;
 
             // prioritize tasks of shorter functions 
             // u64 func_exec_time = task_cgroup_exec_time( p );
@@ -620,6 +649,10 @@ static __noinline void task_stats_stop_running(struct task_struct *p) {
             info("[task_stats][%s:%d] tctx->cpu_time_avg %llu ", p->comm, p->pid,
                  tctx->cpu_time_avg);
         }
+        
+
+        u64 ip_variance = task_stats_task_ip_variance(p);
+        tctx->busypolling_factor = ip_variance > BUSYPOLLING_IP_VARIANCE_THRESHOLD ? 1 : 3;
     }
 }
 
@@ -1434,9 +1467,11 @@ static __noinline bool enqueue_to_assigned_domain_queue(struct task_struct *p,
         }
 
         last_max_vtime = MAX(tctx->vtime, last_max_vtime);
+        timeslice = timeslice / tctx->busypolling_factor;
+
         scx_bpf_dsq_insert_vtime(p, dsqid, timeslice, tctx->vtime, 0);
-        info("[task_stats][%s:%d] inserted to dsq(0x%x) vtime: %llu ", p->comm, p->pid, dsqid,
-             tctx->vtime);
+        info("[task_stats][%s:%d] inserted to dsq(0x%x) vtime: %llu timeslice: %llu ", p->comm, p->pid, dsqid,
+             tctx->vtime, timeslice);
     }
 
     info("[task_stats][%s:%d] inserted to dsq(0x%x) ", p->comm, p->pid, dsqid);

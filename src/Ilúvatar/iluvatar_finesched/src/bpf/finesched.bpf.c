@@ -137,6 +137,11 @@ struct task_context {
 
     bool is_worker;
     bool use_specified_cpus;
+
+    u64 ip_mean;
+    u64 ip_variance;
+    u64 ip_sample_count;
+    u64 busypolling_factor;
 };
 
 // Per-CPU task context:
